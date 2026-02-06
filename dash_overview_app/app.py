@@ -1155,9 +1155,11 @@ def create_app(bundle):
 
         yticks = []
         ylabels = []
+        n_traces = len(data["traces"])
         for idx, tr in enumerate(data["traces"]):
             cidx = int(tr["cell"])
-            yoff = idx * y_step
+            # Keep Cell 1 at the top without flipping waveform orientation.
+            yoff = (n_traces - 1 - idx) * y_step
             yplot = tr["y"] + yoff
             cell_trace = go.Scattergl(
                 x=tr["x"],
