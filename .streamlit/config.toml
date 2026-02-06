@@ -1,0 +1,5 @@
+[server]
+# Default is 200 (MB). Increase if you routinely view long traces / many cells.
+# Note: larger values can slow the app and increase browser memory usage.
+maxMessageSize = 500
+
