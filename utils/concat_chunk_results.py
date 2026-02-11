@@ -195,6 +195,7 @@ def main():
     mc_denoised_traces = np.zeros((n_rois_total, T_actual))
     weighted_mc_traces = np.zeros((n_rois_total, T_actual))
     weighted_mc_denoised_traces = np.zeros((n_rois_total, T_actual))
+    weighted_mc_denoised_traces_cleaned = np.zeros((n_rois_total, T_actual))
     
     has_raw = False
     has_mc = False
@@ -227,6 +228,7 @@ def main():
         original_roi_indices = chunk_results['original_roi_indices']
         bbox = chunk_results['bbox']
         y_min, y_max, x_min, x_max = bbox
+        has_cleaned_chunk = ('weighted_mc_denoised_traces_cleaned' in chunk_results)
         
         print(f"Merging chunk {chunk_idx} with ROIs {original_roi_indices}")
         
@@ -267,6 +269,22 @@ def main():
             # Mean and weighted traces
             _assign_trace(mc_denoised_traces, orig_idx, chunk_results['mc_denoised_traces'][local_idx], label='mc_denoised_traces', chunk_idx=chunk_idx)
             _assign_trace(weighted_mc_denoised_traces, orig_idx, chunk_results['weighted_mc_denoised_traces'][local_idx], label='weighted_mc_denoised_traces', chunk_idx=chunk_idx)
+            if has_cleaned_chunk:
+                _assign_trace(
+                    weighted_mc_denoised_traces_cleaned,
+                    orig_idx,
+                    chunk_results['weighted_mc_denoised_traces_cleaned'][local_idx],
+                    label='weighted_mc_denoised_traces_cleaned',
+                    chunk_idx=chunk_idx,
+                )
+            else:
+                _assign_trace(
+                    weighted_mc_denoised_traces_cleaned,
+                    orig_idx,
+                    chunk_results['weighted_mc_denoised_traces'][local_idx],
+                    label='weighted_mc_denoised_traces_cleaned(fallback)',
+                    chunk_idx=chunk_idx,
+                )
             
             if chunk_results['raw_traces'] is not None:
                 has_raw = True
@@ -381,6 +399,7 @@ def main():
             'mc_denoised_traces': mc_denoised_traces,
             'weighted_mc_traces': weighted_mc_traces,
             'weighted_mc_denoised_traces': weighted_mc_denoised_traces,
+            'weighted_mc_denoised_traces_cleaned': weighted_mc_denoised_traces_cleaned,
             'weights': weights,
             'ROIs': original_ROIs,
             'reg_shifts': reg_shifts,

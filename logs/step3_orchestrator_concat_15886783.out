@@ -1,0 +1,6 @@
+Starting Python: utils/run_step3_chunk_demix_concat.py
+Workdir: /ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline
+Args: --pipeline-workdir /ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline --dilation 10 --demix-mem-gb 64 --max-chunks-parallel 1 --strict --log-prefix STEP3 --data-file /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/movReg_denoised_masked.tif
+Current working directory: /ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline
+Python executable: /ems/elsc-labs/adam-y/qixin.yang/anaconda3/envs/caiman/bin/python
+Python 3.6.13

@@ -20,6 +20,7 @@ TRACE_KEYS_ALL = [
     "mc_denoised_traces",
     "weighted_mc_traces",
     "weighted_mc_denoised_traces",
+    "weighted_mc_denoised_traces_cleaned",
     "volpy_trace",
     "volpy_sub_trace",
 ]
@@ -206,14 +207,42 @@ def load_stitched_bundle(paths=None, main_folder=None, frame_rate_override=None)
             sources_raw[k] = np.concatenate(per_sess, axis=0).astype(np.float32, copy=False)
 
     shift_concat = []
-    for r, t_s in zip(results_list, session_lengths):
+    shift_xy_concat = []
+    has_shift_xy = False
+    for r, pth, t_s in zip(results_list, paths, session_lengths):
         sd = np.asarray(r["shift_distances"], dtype=np.float32).ravel()
         if sd.size > t_s:
             sd = sd[:t_s]
         elif sd.size < t_s:
             sd = np.concatenate([sd, np.full((t_s - sd.size,), np.nan, dtype=np.float32)])
         shift_concat.append(sd)
+
+        reg_xy = None
+        if "reg_shifts" in r:
+            reg_xy = np.asarray(r["reg_shifts"], dtype=np.float32)
+        else:
+            mc_params = os.path.join(os.path.dirname(pth), "motion_correction_params.npy")
+            if os.path.exists(mc_params):
+                try:
+                    mc_obj = np.load(mc_params, allow_pickle=True).item()
+                    if isinstance(mc_obj, dict) and "reg_shifts" in mc_obj:
+                        reg_xy = np.asarray(mc_obj["reg_shifts"], dtype=np.float32)
+                except Exception:
+                    reg_xy = None
+
+        if reg_xy is not None and reg_xy.ndim == 2 and reg_xy.shape[1] >= 2:
+            xy = reg_xy[:, :2]
+            if xy.shape[0] > t_s:
+                xy = xy[:t_s, :]
+            elif xy.shape[0] < t_s:
+                pad = np.full((t_s - xy.shape[0], 2), np.nan, dtype=np.float32)
+                xy = np.concatenate([xy, pad], axis=0)
+            has_shift_xy = True
+        else:
+            xy = np.full((t_s, 2), np.nan, dtype=np.float32)
+        shift_xy_concat.append(xy.astype(np.float32, copy=False))
     shift_distances = np.concatenate(shift_concat).astype(np.float32, copy=False)
+    shift_xy = np.concatenate(shift_xy_concat, axis=0).astype(np.float32, copy=False)
 
     mean_img_raw_list = [np.asarray(r["mean_img_raw"], dtype=np.float32) for r in results_list]
     mean_img_mc_list = [np.asarray(r["mean_img_mc"], dtype=np.float32) for r in results_list]
@@ -303,6 +332,7 @@ def load_stitched_bundle(paths=None, main_folder=None, frame_rate_override=None)
         "trace_keys_all": list(TRACE_KEYS_ALL),
         "sources_raw": sources_raw,
         "shift_distances": shift_distances,
+        "shift_xy": shift_xy if has_shift_xy else None,
         "mean_img_raw_list": mean_img_raw_list,
         "mean_img_mc_list": mean_img_mc_list,
         "mean_img_mc_denoised_list": mean_img_mc_denoised_list,
@@ -338,7 +368,7 @@ def save_annotations_compatible(
 
     baseline_cfg = baseline_cfg or {"enabled": False}
     baseline_enabled = bool(baseline_cfg.get("enabled", False))
-    baseline_percentile = float(baseline_cfg.get("percentile", 5.0))
+    baseline_percentile = float(baseline_cfg.get("percentile", 50.0))
     baseline_window_s = float(baseline_cfg.get("window_s", 60.0))
     baseline_smooth = str(baseline_cfg.get("smooth", "median"))
 

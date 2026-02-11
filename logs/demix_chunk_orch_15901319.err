@@ -1,0 +1,23 @@
+WARNING:root:Changing key fr in group data from None to 500
+WARNING:root:Changing key fnames in group data from None to ['/ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_4/movReg_denoised.tif']
+WARNING:root:Changing key ROIs in group data from None to [[[False False False ... False False False]
+  [False False False ... False False False]
+  [False False False ... False False False]
+  ...
+  [False False False ... False False False]
+  [False False False ... False False False]
+  [False False False ... False False False]]]
+WARNING:root:Changing key index in group data from None to [0]
+WARNING:root:Changing key context_size in group volspike from 35 to 12
+WARNING:root:Changing key censor_size in group volspike from 12 to 8
+WARNING:root:Changing key flip_signal in group volspike from True to False
+WARNING:root:Changing key hp_freq_pb in group volspike from 0.3333333333333333 to 3
+WARNING:root:Changing key hp_freq in group volspike from 1 to 20
+WARNING:root:Changing key threshold in group volspike from 3 to 5
+WARNING:root:Changing key n_iter in group volspike from 2 to 3
+WARNING:root:Changing key distance in group volspike from 3 to 200
+WARNING:root:No parameter template_size found!
+WARNING:root:Selecting top 100 spikes for template
+WARNING:root:Selecting top 100 spikes for template
+WARNING:root:Selecting top 100 spikes for template
+WARNING:root:Selecting top 100 spikes for template

@@ -55,7 +55,8 @@ import tifffile
 import pickle
 import logging
 import argparse
-from scipy.ndimage import median_filter
+from scipy.ndimage import binary_dilation, label, median_filter
+from scipy.sparse.linalg import svds
 
 # ----------------- CLI ARGUMENT -----------------
 parser = argparse.ArgumentParser(description='Run VolPy + demixing on a chunked TIF movie file.')
@@ -117,9 +118,9 @@ visualize_ROI = False
 flip_signal = False
 hp_freq_pb = 3
 hp_freq = 20
-clip = 500
+clip = 100
 threshold_method = 'adaptive_threshold'
-min_spikes = 20
+min_spikes = 10
 pnorm = 0.5
 threshold = 5
 do_plot = False
@@ -129,7 +130,7 @@ weight_update = 'ridge'
 n_iter = 3
 method = 'spikepursuit'
 distance = 200
-template_size = 10
+template_size = 20
 
 opts_dict = {
     'fnames': fnames,
@@ -227,6 +228,251 @@ def compute_weighted_traces(video_file, weights, *, n_frames=None):
     return traces
 
 
+def _disk_footprint(radius):
+    r = int(max(0, int(radius)))
+    if r <= 0:
+        return np.ones((1, 1), dtype=bool)
+    yy, xx = np.ogrid[-r : r + 1, -r : r + 1]
+    return (xx * xx + yy * yy) <= (r * r)
+
+
+def _largest_connected_component(mask):
+    m = np.asarray(mask, dtype=bool)
+    if not np.any(m):
+        return m
+    lbl, n = label(m)
+    if n <= 1:
+        return m
+    areas = np.bincount(lbl.ravel())
+    areas[0] = 0
+    keep = int(np.argmax(areas))
+    return lbl == keep
+
+
+def _weights_to_cell_maps(weights, n_cells, h, w):
+    """Convert VolPy weights into (N, H, W) maps when possible."""
+    wt = np.asarray(weights)
+    p = int(h * w)
+    n_cells = int(n_cells)
+
+    if wt.ndim == 3:
+        if wt.shape[0] == n_cells and wt.shape[1] == h and wt.shape[2] == w:
+            return wt.astype(np.float32, copy=False)
+        if wt.shape[0] == h and wt.shape[1] == w and wt.shape[2] == n_cells:
+            return np.moveaxis(wt, -1, 0).astype(np.float32, copy=False)
+        return None
+
+    if wt.ndim == 2:
+        if wt.shape[0] == n_cells and wt.shape[1] == p:
+            return wt.reshape(n_cells, h, w).astype(np.float32, copy=False)
+        if wt.shape[1] == n_cells and wt.shape[0] == p:
+            return wt.T.reshape(n_cells, h, w).astype(np.float32, copy=False)
+        return None
+
+    if wt.ndim == 1 and n_cells == 1 and wt.size == p:
+        return wt.reshape(1, h, w).astype(np.float32, copy=False)
+
+    return None
+
+
+def _build_signal_mask_from_weight(
+    weight_map,
+    roi_fallback,
+    *,
+    min_pixels=20,
+    percentiles=(70.0, 60.0, 50.0),
+):
+    """Adaptive positive-weight mask with ROI fallback."""
+    wm = np.asarray(weight_map, dtype=np.float32)
+    roi_fb = np.asarray(roi_fallback, dtype=bool)
+    pos = np.isfinite(wm) & (wm > 0)
+
+    if np.any(pos):
+        vals = wm[pos]
+        for pct in percentiles:
+            thr = float(np.percentile(vals, float(pct)))
+            cand = np.isfinite(wm) & (wm >= thr) & (wm > 0)
+            cand = _largest_connected_component(cand)
+            if int(np.count_nonzero(cand)) >= int(min_pixels):
+                return cand, True
+        # If positive-weight support exists but is sparse, keep largest positive component.
+        cand = _largest_connected_component(pos)
+        if np.any(cand):
+            return cand, True
+
+    return roi_fb, False
+
+
+def clean_weighted_traces_background(
+    weighted_traces,
+    video_file,
+    rois,
+    weights,
+    fr,
+    context_size,
+    censor_size,
+    nPC_bg,
+    ridge_bg,
+    *,
+    median_window_s=30.0,
+):
+    """VolPy-style background denoising for weighted traces.
+
+    Fit background on a 30s median-smoothed trace, subtract fitted background from
+    the original (non-filtered) weighted trace.
+    """
+    wtr = np.asarray(weighted_traces, dtype=np.float32)
+    if wtr.ndim == 1:
+        wtr = wtr[np.newaxis, :]
+
+    rois = np.asarray(rois).astype(bool)
+    if rois.ndim == 2:
+        rois = rois[np.newaxis, ...]
+    if rois.ndim != 3:
+        raise ValueError(f"Unexpected ROIs shape: {rois.shape}")
+
+    n_cells, t_len_full = int(wtr.shape[0]), int(wtr.shape[1])
+    if n_cells != int(rois.shape[0]):
+        raise ValueError(
+            f"weighted_traces n_cells ({n_cells}) does not match rois ({rois.shape[0]})"
+        )
+    h, w = int(rois.shape[1]), int(rois.shape[2])
+    weight_maps = _weights_to_cell_maps(weights, n_cells=n_cells, h=h, w=w)
+    if weight_maps is None:
+        print(
+            "[WARN] Could not map VolPy weights to (N,H,W); using ROI masks for background cleaning.",
+            flush=True,
+        )
+
+    key = slice(0, int(t_len_full))
+    video = tifffile.imread(video_file, key=key).astype(np.float32, copy=False)
+    if video.ndim != 3:
+        raise ValueError(f"Expected 3D movie in {video_file}, got shape {video.shape}")
+    t_use = int(min(int(video.shape[0]), t_len_full))
+    if int(video.shape[0]) != t_len_full:
+        print(
+            f"[WARN] weighted trace length ({t_len_full}) vs video frames ({video.shape[0]}) mismatch; "
+            f"using first {t_use} frames for cleaning and leaving remaining samples unchanged.",
+            flush=True,
+        )
+    if t_use < 2:
+        print("[WARN] Too few frames for background cleaning; returning original traces.", flush=True)
+        return wtr.astype(np.float32, copy=False)
+    wtr_fit = wtr[:, :t_use]
+    video = video[:t_use]
+
+    cleaned = wtr.astype(np.float32, copy=True)
+    ctx = int(max(1, int(context_size)))
+    censor = int(max(0, int(censor_size)))
+    npc = int(max(1, int(nPC_bg)))
+    alpha = float(max(0.0, float(nPC_bg) * float(ridge_bg)))
+
+    win = int(round(float(median_window_s) * float(fr)))
+    win = max(3, win)
+    if win % 2 == 0:
+        win += 1
+
+    ctx_foot = np.ones((ctx, ctx), dtype=bool)
+    censor_foot = _disk_footprint(censor)
+    n_weight_masks = 0
+
+    for ci in range(n_cells):
+        t_raw = wtr_fit[ci].astype(np.float32, copy=False)
+        t_fit = median_filter(t_raw, size=int(win)).astype(np.float32, copy=False)
+
+        roi = rois[ci]
+        if not np.any(roi):
+            print(f"[WARN] Cell {ci}: empty ROI; keeping original weighted trace.", flush=True)
+            continue
+
+        if weight_maps is not None:
+            signal_mask, used_weight = _build_signal_mask_from_weight(
+                weight_maps[ci],
+                roi,
+                min_pixels=20,
+                percentiles=(70.0, 60.0, 50.0),
+            )
+            if used_weight:
+                n_weight_masks += 1
+        else:
+            signal_mask = roi
+
+        bwexp = binary_dilation(signal_mask, structure=ctx_foot)
+        xinds = np.where(np.any(bwexp, axis=1))[0]
+        yinds = np.where(np.any(bwexp, axis=0))[0]
+        if xinds.size == 0 or yinds.size == 0:
+            print(f"[WARN] Cell {ci}: empty context crop; keeping original weighted trace.", flush=True)
+            continue
+
+        x0, x1 = int(xinds[0]), int(xinds[-1])
+        y0, y1 = int(yinds[0]), int(yinds[-1])
+        sig_crop = signal_mask[x0 : x1 + 1, y0 : y1 + 1]
+        notbw = ~binary_dilation(sig_crop, structure=censor_foot)
+        if not np.any(notbw):
+            print(
+                f"[WARN] Cell {ci}: no background pixels after censoring; keeping original weighted trace.",
+                flush=True,
+            )
+            continue
+
+        data_bg = video[:, x0 : x1 + 1, y0 : y1 + 1][:, notbw]
+        if data_bg.ndim != 2:
+            data_bg = data_bg.reshape(int(video.shape[0]), -1)
+        p_bg = int(data_bg.shape[1])
+        if p_bg < (npc + 1):
+            print(
+                f"[WARN] Cell {ci}: too few bg pixels ({p_bg}) for nPC_bg={npc}; keeping original weighted trace.",
+                flush=True,
+            )
+            continue
+        if int(data_bg.shape[0]) <= npc:
+            print(
+                f"[WARN] Cell {ci}: too few frames ({data_bg.shape[0]}) for nPC_bg={npc}; keeping original weighted trace.",
+                flush=True,
+            )
+            continue
+
+        data_bg = data_bg.astype(np.float32, copy=False)
+        data_bg = data_bg - np.mean(data_bg, axis=0, keepdims=True).astype(np.float32, copy=False)
+
+        k = int(min(npc, min(data_bg.shape) - 1))
+        if k < 1:
+            print(f"[WARN] Cell {ci}: invalid SVD rank for background; keeping original weighted trace.", flush=True)
+            continue
+
+        try:
+            Ub, _, _ = svds(data_bg, k=k)
+            Ub = Ub.astype(np.float32, copy=False)
+            if Ub.shape[0] != t_use:
+                print(
+                    f"[WARN] Cell {ci}: Ub/time mismatch ({Ub.shape[0]} vs {t_use}); keeping original weighted trace.",
+                    flush=True,
+                )
+                continue
+            UtU = np.matmul(Ub.T, Ub).astype(np.float64, copy=False)
+            if alpha > 0.0:
+                UtU += np.eye(int(UtU.shape[0]), dtype=np.float64) * float(alpha)
+            Uty = np.matmul(Ub.T.astype(np.float64, copy=False), t_fit.astype(np.float64, copy=False))
+            try:
+                coef = np.linalg.solve(UtU, Uty)
+            except np.linalg.LinAlgError:
+                coef = np.linalg.lstsq(UtU, Uty, rcond=None)[0]
+            bg_hat = np.matmul(Ub.astype(np.float64, copy=False), coef).astype(np.float32, copy=False)
+            cleaned[ci, :t_use] = (t_raw - bg_hat).astype(np.float32, copy=False)
+        except Exception as e:
+            print(
+                f"[WARN] Cell {ci}: background denoising failed ({e!r}); keeping original weighted trace.",
+                flush=True,
+            )
+            continue
+
+    print(
+        f"[INFO] Background cleaner used weight-derived support for {n_weight_masks}/{n_cells} cells.",
+        flush=True,
+    )
+    return cleaned.astype(np.float32, copy=False)
+
+
 def calculate_mean_image(video_file, *, n_frames=None):
     key = None
     if n_frames is not None:
@@ -273,6 +519,18 @@ print("weights shape (fixed):", np.shape(weights))
 T_ref = int(volpy_trace.shape[-1])
 mc_denoised_traces = compute_mean_traces(mc_denoised_video_file, ROIselect, n_frames=T_ref)
 weighted_mc_denoised_traces = compute_weighted_traces(mc_denoised_video_file, weights, n_frames=T_ref)
+weighted_mc_denoised_traces_cleaned = clean_weighted_traces_background(
+    weighted_mc_denoised_traces,
+    mc_denoised_video_file,
+    ROIselect,
+    weights,
+    fr,
+    context_size,
+    censor_size,
+    nPC_bg,
+    ridge_bg,
+    median_window_s=30.0,
+)
 
 if has_raw:
     raw_traces = compute_mean_traces(raw_video_file, ROIselect, n_frames=T_ref)
@@ -294,6 +552,10 @@ else:
 
 print("mc_denoised_traces shape:", mc_denoised_traces.shape)
 print("weighted_mc_denoised_traces shape:", weighted_mc_denoised_traces.shape)
+print(
+    "weighted_mc_denoised_traces_cleaned shape:",
+    weighted_mc_denoised_traces_cleaned.shape,
+)
 
 # ----------------- MEAN IMAGES -----------------
 mean_image_mc_denoised = calculate_mean_image(mc_denoised_video_file, n_frames=T_ref)
@@ -342,6 +604,7 @@ with open(output_file, 'wb') as file:
         'mc_denoised_traces': mc_denoised_traces,
         'weighted_mc_traces': weighted_mc_traces,
         'weighted_mc_denoised_traces': weighted_mc_denoised_traces,
+        'weighted_mc_denoised_traces_cleaned': weighted_mc_denoised_traces_cleaned,
         # ROIs (chunk coordinates)
         'ROIs': ROIselect,
         # Motion correction

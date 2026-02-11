@@ -24,6 +24,7 @@ from demix_io import (
     roi_contours,
     save_annotations_compatible,
 )
+from signal_ops import highpass_filter_trace, make_bad_mask
 from trace_store import TraceStore
 
 
@@ -56,6 +57,43 @@ def _sanitize_epochs(epochs, eps=1e-9):
         else:
             merged.append((lo, hi))
     return merged
+
+
+def _build_params_per_cell(n_cells, frame_rate, saved_params_dict):
+    base = {
+        i: {
+            "hp_hz": 20.0,
+            "mad_k": 4.5,
+            "min_isi_ms": max(2.0, 1000.0 / max(1.0, float(frame_rate))),
+        }
+        for i in range(int(n_cells))
+    }
+    if isinstance(saved_params_dict, dict):
+        for k, v in saved_params_dict.items():
+            try:
+                ki = int(k)
+            except Exception:
+                continue
+            if ki in base and isinstance(v, dict):
+                base[ki].update(v)
+    return base
+
+
+def _find_spike_peaks_simple(y, threshold):
+    arr = np.asarray(y, dtype=np.float32).reshape(-1)
+    if arr.size < 3:
+        return np.array([], dtype=int)
+    finite = np.isfinite(arr)
+    if np.count_nonzero(finite) < 3:
+        return np.array([], dtype=int)
+    mid = arr[1:-1]
+    is_peak = (
+        np.isfinite(mid)
+        & (mid > threshold)
+        & (mid > arr[:-2])
+        & (mid >= arr[2:])
+    )
+    return np.flatnonzero(is_peak).astype(int) + 1
 
 
 def make_image_figure(bundle, session_idx, kind, cell_indices=None):
@@ -242,11 +280,27 @@ def create_app(bundle):
             dcc.Store(id="bad-span-mode-store", data=False),
             dcc.Store(id="pending-span-store", data=None),
             dcc.Store(id="remove-baseline-store", data=False),
+            dcc.Store(id="motion-regression-store", data=False),
+            dcc.Store(id="show-motion-fit-store", data=False),
+            dcc.Store(id="motion-fit-refresh-store", data=0),
             dcc.Store(id="full-trace-mode-store", data=False),
             dcc.Store(id="hovered-cell-store", data=None),
             dcc.Store(id="sync-highlight-held-store", data=False),
             dcc.Store(id="roi-centroids-store", data=roi_centroids_xy),
             dcc.Store(id="image-shape-store", data={"h": int(img_h), "w": int(img_w)}),
+            dcc.Store(id="show-spikes-store", data=False),
+            dcc.Store(
+                id="spikes-store",
+                data=[list(map(int, s)) for s in (bundle["initial_spikes_verified_array"] or [])],
+            ),
+            dcc.Store(
+                id="spike-params-store",
+                data=_build_params_per_cell(
+                    n_cells,
+                    bundle["frame_rate"],
+                    bundle["initial_params_per_cell"],
+                ),
+            ),
             html.Div(
                 [
                     html.Div(
@@ -540,6 +594,99 @@ def create_app(bundle):
                                 value=20.0,
                                 style={"width": "100%"},
                             ),
+                            html.H4("Motion Regression", style={"marginTop": "12px", "marginBottom": "6px"}),
+                            html.Button(
+                                "Display fitted motion noise",
+                                id="toggle-motion-fit-btn",
+                                n_clicks=0,
+                                style={"width": "100%", "marginTop": "6px"},
+                            ),
+                            html.Button(
+                                "Remove motion noise",
+                                id="toggle-motion-regression-btn",
+                                n_clicks=0,
+                                style={"width": "100%"},
+                            ),
+                            html.Div("Pre-motion baseline window (s, 0=off)", style={"marginTop": "6px"}),
+                            dcc.Input(
+                                id="motion-prebaseline-window-input",
+                                type="number",
+                                min=0,
+                                step=1,
+                                value=30,
+                                style={"width": "100%"},
+                            ),
+                            html.Div("Chunk frames", style={"marginTop": "6px"}),
+                            dcc.Input(
+                                id="motion-chunk-frames-input",
+                                type="number",
+                                min=1,
+                                step=100,
+                                value=5000,
+                                style={"width": "100%"},
+                            ),
+                            html.Div("Overlap frames", style={"marginTop": "6px"}),
+                            dcc.Input(
+                                id="motion-overlap-frames-input",
+                                type="number",
+                                min=0,
+                                step=50,
+                                value=0,
+                                style={"width": "100%"},
+                            ),
+                            html.Div("Ridge lambda (0=OLS)", style={"marginTop": "6px"}),
+                            dcc.Input(
+                                id="motion-ridge-lambda-input",
+                                type="number",
+                                min=0,
+                                step=0.01,
+                                value=0.0,
+                                style={"width": "100%"},
+                            ),
+                            html.Div("Motion components (Ub)", style={"marginTop": "6px"}),
+                            dcc.Input(
+                                id="motion-n-components-input",
+                                type="number",
+                                min=1,
+                                step=1,
+                                value=5,
+                                style={"width": "100%"},
+                            ),
+                            html.Div("Shift smoothing frames (0=off)", style={"marginTop": "6px"}),
+                            dcc.Input(
+                                id="motion-shift-smooth-input",
+                                type="number",
+                                min=0,
+                                step=1,
+                                value=0,
+                                style={"width": "100%"},
+                            ),
+                            html.H4("Spike Detection", style={"marginTop": "12px", "marginBottom": "6px"}),
+                            html.Div("MAD threshold multiplier"),
+                            dcc.Input(
+                                id="spike-mad-k-input",
+                                type="number",
+                                min=0.5,
+                                step=0.1,
+                                value=4.5,
+                                style={"width": "100%"},
+                            ),
+                            html.Button(
+                                "Spike Detection",
+                                id="run-spike-detect-btn",
+                                n_clicks=0,
+                                style={"width": "100%", "marginTop": "6px"},
+                            ),
+                            html.Button(
+                                "Display spikes: OFF",
+                                id="clear-spikes-btn",
+                                n_clicks=0,
+                                style={"width": "100%", "marginTop": "6px"},
+                            ),
+                            html.Div(
+                                id="spike-detect-status",
+                                style={"marginTop": "6px", "fontSize": "12px"},
+                            ),
                             html.H4("Save", style={"marginTop": "12px", "marginBottom": "6px"}),
                             dcc.Input(
                                 id="save-filename-input",
@@ -713,6 +860,108 @@ def create_app(bundle):
         if trig == "restore-good-cells-btn":
             return list(bundle["initial_good_cells"])
         raise PreventUpdate
+
+    @app.callback(
+        Output("show-spikes-store", "data"),
+        Output("clear-spikes-btn", "children"),
+        Input("clear-spikes-btn", "n_clicks"),
+        State("show-spikes-store", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_spike_display(_n_clicks, enabled):
+        mode = not bool(enabled)
+        return mode, f"Display spikes: {'ON' if mode else 'OFF'}"
+
+    @app.callback(
+        Output("spikes-store", "data"),
+        Output("spike-params-store", "data"),
+        Output("spike-detect-status", "children"),
+        Input("run-spike-detect-btn", "n_clicks"),
+        State("trace-source-dropdown", "value"),
+        State("spike-mad-k-input", "value"),
+        State("cell-checklist", "value"),
+        State("bad-epochs-store", "data"),
+        State("spikes-store", "data"),
+        State("spike-params-store", "data"),
+        prevent_initial_call=True,
+    )
+    def run_spike_detection(
+        _n_clicks,
+        source_key,
+        mad_k_val,
+        selected_cells,
+        bad_epochs,
+        spikes_store,
+        params_store,
+    ):
+        source_key = source_key or default_source
+        if source_key not in bundle["sources_raw"]:
+            raise PreventUpdate
+        mad_k = max(0.1, _safe_float(mad_k_val, 4.5))
+        hp_hz = 20.0
+
+        cells_target = sorted(set(int(i) for i in (selected_cells or []) if 0 <= int(i) < n_cells))
+        if len(cells_target) == 0:
+            cells_target = list(range(n_cells))
+
+        out_spikes = [list(map(int, s)) for s in (spikes_store or [[] for _ in range(n_cells)])]
+        if len(out_spikes) != n_cells:
+            out_spikes = [[] for _ in range(n_cells)]
+
+        out_params = params_store if isinstance(params_store, dict) else {}
+        if not isinstance(out_params, dict):
+            out_params = {}
+
+        source = bundle["sources_raw"][source_key]
+        t_axis = bundle["t"]
+        bad_mask_global = make_bad_mask(t_axis, _sanitize_epochs(bad_epochs or []))
+
+        total_spikes = 0
+        for ci in cells_target:
+            trace = source[:, ci].astype(np.float32, copy=False)
+            hp = highpass_filter_trace(
+                trace,
+                bundle["frame_rate"],
+                cutoff_hz=hp_hz,
+                bad_mask=bad_mask_global,
+            )
+            if np.any(bad_mask_global):
+                hp = hp.copy()
+                hp[bad_mask_global] = np.nan
+
+            med = np.nanmedian(hp)
+            mad = np.nanmedian(np.abs(hp - med))
+            sigma = 1.4826 * mad
+            if (not np.isfinite(med)) or (not np.isfinite(sigma)) or sigma <= 0:
+                peaks = np.array([], dtype=int)
+            else:
+                thr = med + mad_k * sigma
+                peaks = _find_spike_peaks_simple(hp, thr)
+                if np.any(bad_mask_global) and peaks.size > 0:
+                    peaks = peaks[~bad_mask_global[peaks]]
+
+            out_spikes[ci] = list(map(int, peaks.tolist()))
+            total_spikes += len(out_spikes[ci])
+            cur = out_params.get(ci, out_params.get(str(ci), {}))
+            if not isinstance(cur, dict):
+                cur = {}
+            cur = dict(cur)
+            cur.update(
+                {
+                    "mad_k": float(mad_k),
+                    "hp_hz": float(hp_hz),
+                    "source_key": str(source_key),
+                }
+            )
+            out_params[int(ci)] = cur
+            if str(ci) in out_params:
+                del out_params[str(ci)]
+
+        msg = (
+            f"Spike detection done for {len(cells_target)} cell(s) "
+            f"with MAD x {mad_k:.2f} (HP {hp_hz:.1f} Hz). Total spikes: {total_spikes}."
+        )
+        return out_spikes, out_params, msg
 
     app.clientside_callback(
         """
@@ -1057,6 +1306,50 @@ def create_app(bundle):
         return False, "Remove baseline drift: OFF"
 
     @app.callback(
+        Output("motion-regression-store", "data"),
+        Output("show-motion-fit-store", "data"),
+        Output("motion-fit-refresh-store", "data"),
+        Output("toggle-motion-regression-btn", "children"),
+        Output("toggle-motion-fit-btn", "children"),
+        Input("toggle-motion-fit-btn", "n_clicks"),
+        Input("toggle-motion-regression-btn", "n_clicks"),
+        State("motion-regression-store", "data"),
+        State("motion-fit-refresh-store", "data"),
+        prevent_initial_call=True,
+    )
+    def handle_motion_buttons(_show_clicks, _remove_clicks, motion_enabled, refresh_nonce):
+        trig = ctx.triggered_id
+        nonce = int(_safe_float(refresh_nonce, 0))
+        if trig == "toggle-motion-fit-btn":
+            # Always recompute fitted noise from raw traces with current params.
+            return (
+                False,  # preview mode: no subtraction applied
+                True,   # show fitted noise
+                nonce + 1,
+                "Remove motion noise: OFF",
+                "Display fitted motion noise (shown)",
+            )
+        if trig == "toggle-motion-regression-btn":
+            # Toggle subtraction on/off. OFF must restore original traces.
+            next_mode = not bool(motion_enabled)
+            if next_mode:
+                return (
+                    True,
+                    False,
+                    nonce,
+                    "Remove motion noise: ON",
+                    "Display fitted motion noise",
+                )
+            return (
+                False,
+                False,
+                nonce,
+                "Remove motion noise: OFF",
+                "Display fitted motion noise",
+            )
+        raise PreventUpdate
+
+    @app.callback(
         Output("trace-graph", "figure"),
         Output("window-label", "children"),
         Output("trace-graph", "style"),
@@ -1073,7 +1366,18 @@ def create_app(bundle):
         Input("baseline-window-input", "value"),
         Input("display-baseline-check", "value"),
         Input("remove-baseline-store", "data"),
+        Input("motion-regression-store", "data"),
+        Input("motion-prebaseline-window-input", "value"),
+        Input("motion-chunk-frames-input", "value"),
+        Input("motion-overlap-frames-input", "value"),
+        Input("motion-ridge-lambda-input", "value"),
+        Input("motion-n-components-input", "value"),
+        Input("motion-shift-smooth-input", "value"),
+        Input("show-motion-fit-store", "data"),
+        Input("motion-fit-refresh-store", "data"),
         Input("full-trace-mode-store", "data"),
+        Input("spikes-store", "data"),
+        Input("show-spikes-store", "data"),
     )
     def build_trace_figure(
         source_key,
@@ -1089,7 +1393,18 @@ def create_app(bundle):
         baseline_window_s,
         display_baseline_vals,
         remove_baseline_drift,
+        motion_regression_enabled,
+        motion_prebaseline_window_s,
+        motion_chunk_frames,
+        motion_overlap_frames,
+        motion_ridge_lambda,
+        motion_n_components,
+        motion_shift_smooth_frames,
+        show_motion_fit,
+        motion_fit_refresh_nonce,
         full_trace_mode,
+        spikes_store,
+        show_spikes_store,
     ):
         source_key = source_key or default_source
         if source_key not in bundle["sources_raw"]:
@@ -1103,6 +1418,17 @@ def create_app(bundle):
         hp_cutoff = max(0.1, _safe_float(highpass_cutoff_hz, 20.0))
         baseline_window_s = max(1.0, _safe_float(baseline_window_s, 30.0))
         remove_baseline_drift = bool(remove_baseline_drift)
+        motion_regression_enabled = bool(motion_regression_enabled)
+        motion_prebaseline_window_s = max(0.0, _safe_float(motion_prebaseline_window_s, 30.0))
+        motion_chunk_frames = max(1, int(_safe_float(motion_chunk_frames, 5000)))
+        motion_overlap_frames = max(0, int(_safe_float(motion_overlap_frames, 0)))
+        motion_ridge_lambda = max(0.0, _safe_float(motion_ridge_lambda, 0.0))
+        motion_n_components = max(1, int(_safe_float(motion_n_components, 5)))
+        motion_shift_smooth_frames = max(0, int(_safe_float(motion_shift_smooth_frames, 0)))
+        show_motion_fit = bool(show_motion_fit)
+        motion_fit_refresh_nonce = int(_safe_float(motion_fit_refresh_nonce, 0))
+        if motion_overlap_frames >= motion_chunk_frames:
+            motion_overlap_frames = max(0, motion_chunk_frames - 1)
         full_trace_mode = bool(full_trace_mode)
         show_baseline_requested = ("show" in (display_baseline_vals or [])) and (not remove_baseline_drift)
         show_baseline = show_baseline_requested and (not hp_enabled)
@@ -1113,6 +1439,13 @@ def create_app(bundle):
         resampler_target = max(20000, int(round(30.0 * float(bundle["frame_rate"]))))
 
         bad_epochs_clean = _sanitize_epochs(bad_epochs or [])
+        spikes_by_cell = [[] for _ in range(n_cells)]
+        if isinstance(spikes_store, (list, tuple)):
+            for ci in range(min(n_cells, len(spikes_store))):
+                try:
+                    spikes_by_cell[ci] = list(map(int, spikes_store[ci]))
+                except Exception:
+                    spikes_by_cell[ci] = []
         data = trace_store.get_window_data(
             source_key=source_key,
             cells=cells,
@@ -1130,6 +1463,17 @@ def create_app(bundle):
                 "smooth": "median",
             },
             highpass_cfg={"enabled": hp_enabled, "cutoff_hz": hp_cutoff},
+            motion_regression_cfg={
+                "enabled": motion_regression_enabled,
+                "pre_baseline_window_s": motion_prebaseline_window_s,
+                "chunk_frames": motion_chunk_frames,
+                "overlap_frames": motion_overlap_frames,
+                "ridge_lambda": motion_ridge_lambda,
+                "n_components": motion_n_components,
+                "shift_smooth_frames": motion_shift_smooth_frames,
+                "show_fitted": show_motion_fit,
+                "refresh_nonce": motion_fit_refresh_nonce,
+            },
             target_points=0,
             hide_bad_epochs=True,
         )
@@ -1155,6 +1499,7 @@ def create_app(bundle):
 
         yticks = []
         ylabels = []
+        spikes_visible = 0
         n_traces = len(data["traces"])
         for idx, tr in enumerate(data["traces"]):
             cidx = int(tr["cell"])
@@ -1186,6 +1531,51 @@ def create_app(bundle):
                     fig.add_trace(cell_trace, row=1, col=1)
             else:
                 fig.add_trace(cell_trace, row=1, col=1)
+
+            # Overlay spike markers (global indices mapped into current display window).
+            if bool(show_spikes_store) and cidx < len(spikes_by_cell) and len(spikes_by_cell[cidx]) > 0:
+                spk_idx = np.asarray(spikes_by_cell[cidx], dtype=int)
+                spk_idx = spk_idx[(spk_idx >= 0) & (spk_idx < bundle["t"].shape[0])]
+                if spk_idx.size > 0:
+                    spk_idx = spk_idx[(spk_idx >= int(data["i0"])) & (spk_idx < int(data["i1"]))]
+                    if spk_idx.size > 0:
+                        spk_t = bundle["t"][spk_idx].astype(np.float32, copy=False)
+                        x_src = np.asarray(tr["x"], dtype=np.float32)
+                        y_src = np.asarray(tr["y"], dtype=np.float32)
+                        valid = np.isfinite(x_src) & np.isfinite(y_src)
+                        if np.count_nonzero(valid) >= 2:
+                            x_valid = x_src[valid]
+                            y_valid = y_src[valid]
+                            xmin = float(x_valid[0])
+                            xmax = float(x_valid[-1])
+                            in_rng = (spk_t >= xmin) & (spk_t <= xmax)
+                            if np.any(in_rng):
+                                spk_t_plot = spk_t[in_rng]
+                                spk_y_plot = np.interp(spk_t_plot, x_valid, y_valid).astype(np.float32) + yoff
+                                spikes_visible += int(spk_t_plot.size)
+                                fig.add_trace(
+                                    go.Scattergl(
+                                        x=spk_t_plot,
+                                        y=spk_y_plot,
+                                        mode="markers",
+                                        marker={
+                                            "size": 6,
+                                            "symbol": "circle",
+                                            "color": bundle["colors"][cidx],
+                                            "line": {"color": "#000000", "width": 0.7},
+                                        },
+                                        customdata=np.full(spk_t_plot.size, cidx + 1, dtype=int),
+                                        hovertemplate=(
+                                            "Spike<br>Cell %{customdata}<br>Time=%{x:.3f}"
+                                            "<extra></extra>"
+                                        ),
+                                        name=f"Spikes {cidx + 1}",
+                                        showlegend=False,
+                                    ),
+                                    row=1,
+                                    col=1,
+                                )
+
             if show_baseline and tr.get("baseline_y") is not None:
                 bx = tr.get("baseline_x", tr["x"])
                 baseline_trace = go.Scattergl(
@@ -1212,6 +1602,32 @@ def create_app(bundle):
                         fig.add_trace(baseline_trace, row=1, col=1)
                 else:
                     fig.add_trace(baseline_trace, row=1, col=1)
+            if show_motion_fit and tr.get("motion_fit_y") is not None:
+                mx = tr.get("motion_fit_x", tr["x"])
+                motion_fit_trace = go.Scattergl(
+                    x=mx,
+                    y=tr["motion_fit_y"] + yoff,
+                    mode="lines",
+                    line={"width": 2.2, "color": "#555555"},
+                    name=f"Motion fit {cidx + 1}",
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+                if use_resampler:
+                    try:
+                        fig.add_trace(
+                            motion_fit_trace,
+                            row=1,
+                            col=1,
+                            hf_x=mx,
+                            hf_y=tr["motion_fit_y"] + yoff,
+                            max_n_samples=resampler_target,
+                        )
+                    except Exception:
+                        use_resampler = False
+                        fig.add_trace(motion_fit_trace, row=1, col=1)
+                else:
+                    fig.add_trace(motion_fit_trace, row=1, col=1)
             yticks.append(yoff + label_lift)
             ylabels.append(f"Cell {cidx + 1}")
 
@@ -1343,12 +1759,21 @@ def create_app(bundle):
             lbl += " | Baseline: hidden (high-pass ON)"
         if hp_enabled:
             lbl += f" | High-pass: {hp_cutoff:.1f} Hz"
+        lbl += f" | Motion regression: {data.get('motion_info', 'OFF')}"
+        if show_motion_fit:
+            lbl += " | Fitted noise: shown"
+        else:
+            lbl += " | Fitted noise: hidden"
         if full_trace_mode:
             lbl += " | Full trace mode: ON"
             if use_resampler:
                 lbl += " | Resampler: ON"
             else:
                 lbl += " | Resampler: OFF"
+        if bool(show_spikes_store):
+            lbl += f" | Spikes shown: {spikes_visible}"
+        else:
+            lbl += " | Spikes shown: OFF"
         if len(cells) == 0:
             lbl += " | No cells selected"
         return fig, lbl, graph_style
@@ -1359,17 +1784,28 @@ def create_app(bundle):
         State("save-filename-input", "value"),
         State("bad-epochs-store", "data"),
         State("cell-checklist", "value"),
+        State("spikes-store", "data"),
+        State("spike-params-store", "data"),
         prevent_initial_call=True,
     )
-    def save_annotations(_n_clicks, filename, bad_epochs, selected_cells):
+    def save_annotations(_n_clicks, filename, bad_epochs, selected_cells, spikes_store, params_store):
         try:
+            spikes_verified_array = [[] for _ in range(n_cells)]
+            if isinstance(spikes_store, (list, tuple)):
+                for ci in range(min(n_cells, len(spikes_store))):
+                    try:
+                        spikes_verified_array[ci] = list(map(int, spikes_store[ci]))
+                    except Exception:
+                        spikes_verified_array[ci] = []
+
+            params_per_cell = params_store if isinstance(params_store, dict) else {}
             paths = save_annotations_compatible(
                 bundle=bundle,
                 filename=(filename or "volpy_demix_results_annotated.pickle").strip(),
                 bad_epochs=_sanitize_epochs(bad_epochs or []),
                 good_cells=list(selected_cells or []),
-                spikes_verified_array=bundle["initial_spikes_verified_array"],
-                params_per_cell=bundle["initial_params_per_cell"],
+                spikes_verified_array=spikes_verified_array,
+                params_per_cell=params_per_cell,
                 baseline_cfg=bundle["initial_baseline_cfg"],
             )
             if not paths:

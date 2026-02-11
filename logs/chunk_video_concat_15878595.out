@@ -1,0 +1,167 @@
+Starting Python: utils/chunk_video_by_ROI.py
+Workdir: /ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline
+Args: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/movReg_denoised_masked.tif --dilation 10
+Current working directory: /ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline
+Python executable: /ems/elsc-labs/adam-y/qixin.yang/anaconda3/envs/caiman/bin/python
+Python 3.6.13
+Input file: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/movReg_denoised_masked.tif
+Data folder: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc
+Dilation: 10 pixels
+Group distance: 0 pixels
+Include MC video (movReg.tif): False
+Include raw video (*movie.tif): False
+Loading ROIs from: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/manual_ROIs.npz
+ROIs shape: (23, 102, 147), 23 ROIs
+Reading video: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/movReg_denoised_masked.tif
+Video shape: (599000, 102, 147) (pages=599000)
+Processing 23 ROIs independently
+
+--- Processing chunk 0/22 with ROIs [0] ---
+  Bounding box: y=[7:41], x=[119:147]
+  Chunk size: 34 x 28 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_0/manual_ROIs.npz, shape=(1, 34, 28)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_0/movReg_denoised.tif
+
+--- Processing chunk 1/22 with ROIs [1] ---
+  Bounding box: y=[0:30], x=[21:54]
+  Chunk size: 30 x 33 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_1/manual_ROIs.npz, shape=(1, 30, 33)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_1/movReg_denoised.tif
+
+--- Processing chunk 2/22 with ROIs [2] ---
+  Bounding box: y=[0:25], x=[35:67]
+  Chunk size: 25 x 32 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_2/manual_ROIs.npz, shape=(1, 25, 32)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_2/movReg_denoised.tif
+
+--- Processing chunk 3/22 with ROIs [3] ---
+  Bounding box: y=[9:43], x=[38:73]
+  Chunk size: 34 x 35 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_3/manual_ROIs.npz, shape=(1, 34, 35)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_3/movReg_denoised.tif
+
+--- Processing chunk 4/22 with ROIs [4] ---
+  Bounding box: y=[13:45], x=[17:50]
+  Chunk size: 32 x 33 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_4/manual_ROIs.npz, shape=(1, 32, 33)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_4/movReg_denoised.tif
+
+--- Processing chunk 5/22 with ROIs [5] ---
+  Bounding box: y=[16:51], x=[0:38]
+  Chunk size: 35 x 38 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_5/manual_ROIs.npz, shape=(1, 35, 38)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_5/movReg_denoised.tif
+
+--- Processing chunk 6/22 with ROIs [6] ---
+  Bounding box: y=[0:31], x=[61:94]
+  Chunk size: 31 x 33 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_6/manual_ROIs.npz, shape=(1, 31, 33)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_6/movReg_denoised.tif
+
+--- Processing chunk 7/22 with ROIs [7] ---
+  Bounding box: y=[18:51], x=[51:86]
+  Chunk size: 33 x 35 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_7/manual_ROIs.npz, shape=(1, 33, 35)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_7/movReg_denoised.tif
+
+--- Processing chunk 8/22 with ROIs [8] ---
+  Bounding box: y=[26:61], x=[40:75]
+  Chunk size: 35 x 35 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_8/manual_ROIs.npz, shape=(1, 35, 35)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_8/movReg_denoised.tif
+
+--- Processing chunk 9/22 with ROIs [9] ---
+  Bounding box: y=[24:53], x=[25:56]
+  Chunk size: 29 x 31 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_9/manual_ROIs.npz, shape=(1, 29, 31)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_9/movReg_denoised.tif
+
+--- Processing chunk 10/22 with ROIs [10] ---
+  Bounding box: y=[34:63], x=[23:55]
+  Chunk size: 29 x 32 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_10/manual_ROIs.npz, shape=(1, 29, 32)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_10/movReg_denoised.tif
+
+--- Processing chunk 11/22 with ROIs [11] ---
+  Bounding box: y=[42:70], x=[15:45]
+  Chunk size: 28 x 30 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_11/manual_ROIs.npz, shape=(1, 28, 30)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_11/movReg_denoised.tif
+
+--- Processing chunk 12/22 with ROIs [12] ---
+  Bounding box: y=[31:62], x=[9:41]
+  Chunk size: 31 x 32 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_12/manual_ROIs.npz, shape=(1, 31, 32)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_12/movReg_denoised.tif
+
+--- Processing chunk 13/22 with ROIs [13] ---
+  Bounding box: y=[53:87], x=[8:42]
+  Chunk size: 34 x 34 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_13/manual_ROIs.npz, shape=(1, 34, 34)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_13/movReg_denoised.tif
+
+--- Processing chunk 14/22 with ROIs [14] ---
+  Bounding box: y=[48:81], x=[41:75]
+  Chunk size: 33 x 34 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_14/manual_ROIs.npz, shape=(1, 33, 34)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_14/movReg_denoised.tif
+
+--- Processing chunk 15/22 with ROIs [15] ---
+  Bounding box: y=[34:65], x=[52:85]
+  Chunk size: 31 x 33 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_15/manual_ROIs.npz, shape=(1, 31, 33)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_15/movReg_denoised.tif
+
+--- Processing chunk 16/22 with ROIs [16] ---
+  Bounding box: y=[48:81], x=[57:88]
+  Chunk size: 33 x 31 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_16/manual_ROIs.npz, shape=(1, 33, 31)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_16/movReg_denoised.tif
+
+--- Processing chunk 17/22 with ROIs [17] ---
+  Bounding box: y=[43:74], x=[68:98]
+  Chunk size: 31 x 30 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_17/manual_ROIs.npz, shape=(1, 31, 30)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_17/movReg_denoised.tif
+
+--- Processing chunk 18/22 with ROIs [18] ---
+  Bounding box: y=[26:58], x=[76:108]
+  Chunk size: 32 x 32 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_18/manual_ROIs.npz, shape=(1, 32, 32)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_18/movReg_denoised.tif
+
+--- Processing chunk 19/22 with ROIs [19] ---
+  Bounding box: y=[34:66], x=[77:109]
+  Chunk size: 32 x 32 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_19/manual_ROIs.npz, shape=(1, 32, 32)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_19/movReg_denoised.tif
+
+--- Processing chunk 20/22 with ROIs [20] ---
+  Bounding box: y=[37:71], x=[87:119]
+  Chunk size: 34 x 32 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_20/manual_ROIs.npz, shape=(1, 34, 32)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_20/movReg_denoised.tif
+
+--- Processing chunk 21/22 with ROIs [21] ---
+  Bounding box: y=[81:102], x=[102:140]
+  Chunk size: 21 x 38 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_21/manual_ROIs.npz, shape=(1, 21, 38)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_21/movReg_denoised.tif
+
+--- Processing chunk 22/22 with ROIs [22] ---
+  Bounding box: y=[73:102], x=[63:100]
+  Chunk size: 29 x 37 pixels
+  Saved chunk ROIs: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_22/manual_ROIs.npz, shape=(1, 29, 37)
+  Saved chunk MC denoised: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_22/movReg_denoised.tif
+
+Saved chunk metadata to: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_metadata.pkl
+Saved chunk visualization to: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunk_visualization.png
+
+============================================================
+CHUNKING COMPLETE
+============================================================
+Total chunks created: 23
+Chunks directory: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks
+
+To process chunks, submit jobs for each chunk_*/movReg_denoised.tif
+Job finished.

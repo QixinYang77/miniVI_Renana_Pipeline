@@ -1,0 +1,74 @@
+Starting Python: utils/demix_chunk.py
+Workdir: /ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline
+Args: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_14/movReg_denoised.tif
+Current working directory: /ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline
+Python executable: /ems/elsc-labs/adam-y/qixin.yang/anaconda3/envs/caiman/bin/python
+Python 3.6.13
+Chunk folder: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_14
+Processing chunk 14
+Original ROI indices: [14]
+Bounding box: (48, 81, 41, 75)
+Loading ROIs from: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_14/manual_ROIs.npz
+ROIs shape: (1, 33, 34)
+Now processing cell number 0
+Data type: <class 'numpy.ndarray'>
+Data shape: (599000,)
+Trace summary:
+Min: -594.7059936523438
+Max: 620.9705810546875
+Mean: -0.002056412361644656
+Std: 11.234870942834386
+First 20 frames: [ -4.35758781 333.56945801 570.72888184 552.00695801 534.95709229
+ 522.14324951 504.10168457 504.10070801 480.4074707  475.22131348
+ 457.6668396  430.08532715 422.4067688  402.00109863 411.46472168
+ 400.50756836 386.6312561  371.42855835 347.91973877 336.38613892]
+Data type: <class 'numpy.ndarray'>
+Data shape: (599000,)
+Trace summary:
+Min: -414.1396789550781
+Max: 495.3987121582031
+Mean: 0.00030059104813226256
+Std: 10.52339802429896
+First 20 frames: [ -4.30968428 277.27746582 495.39871216 483.61669922 457.42529297
+ 446.74169922 437.53933716 429.9223938  404.32662964 411.47277832
+ 394.47921753 360.08764648 362.31143188 347.27261353 350.29849243
+ 350.19268799 325.57516479 325.23059082 306.42251587 297.62454224]
+Data type: <class 'numpy.ndarray'>
+Data shape: (599000,)
+Trace summary:
+Min: -262.2196350097656
+Max: 358.170654296875
+Mean: 0.00039015313248468394
+Std: 8.653616007280428
+First 20 frames: [ -3.41821194 181.79718018 358.1706543  352.30603027 328.85540771
+ 320.60620117 316.29330444 309.80932617 288.86990356 298.60168457
+ 284.95578003 254.9197998  261.74493408 251.54145813 252.92556763
+ 254.42991638 230.82455444 236.31060791 221.7870636  218.20059204]
+Data type: <class 'numpy.ndarray'>
+Data shape: (599000,)
+Trace summary:
+Min: -219.17544555664062
+Max: 286.257568359375
+Mean: 0.00012856481749117156
+Std: 7.644876925318335
+First 20 frames: [ -3.10202336 113.43061829 286.25756836 282.68606567 265.82110596
+ 258.40362549 256.15856934 249.33872986 232.68493652 241.45307922
+ 230.95780945 204.84181213 210.69293213 203.09638977 203.82525635
+ 204.36959839 181.60871887 186.81362915 176.68058777 175.41398621]
+MC denoised video: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_14/movReg_denoised.tif
+volpy_trace shape (raw): (1, 599000)
+volpy_sub_trace shape (raw): (1, 599000)
+spikes shape (raw): (1, 3359)
+weights shape (raw): (1, 33, 34)
+SNR (raw): [3.61527971]
+volpy_trace shape (fixed): (1, 599000)
+volpy_sub_trace shape (fixed): (1, 599000)
+spikes shape (fixed): (1, 3359)
+weights shape (fixed): (1, 33, 34)
+[INFO] Background cleaner used weight-derived support for 1/1 cells.
+[WARN] movReg.tif not found in chunk folder; using denoised movie as fallback for mc_traces.
+mc_denoised_traces shape: (1, 599000)
+weighted_mc_denoised_traces shape: (1, 599000)
+weighted_mc_denoised_traces_cleaned shape: (1, 599000)
+Done! Chunk results saved to: /ems/elsc-labs/adam-y/Adam-Lab-Shared/Data/renana_malka/pAce45/2026-01-18_pAce45/PX/post/Awake/output_concat/output_final/concat_mc/chunks/chunk_14/chunk_results.pickle
+Job finished.

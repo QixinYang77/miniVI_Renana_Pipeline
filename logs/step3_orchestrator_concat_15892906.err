@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "utils/run_step3_chunk_demix_concat.py", line 444, in <module>
+    raise SystemExit(main())
+  File "utils/run_step3_chunk_demix_concat.py", line 391, in main
+    prefix=pref,
+  File "utils/run_step3_chunk_demix_concat.py", line 100, in _run_demix_for_chunks
+    prefix=prefix,
+  File "utils/run_step3_chunk_demix_concat.py", line 247, in _run_demix_for_chunks_sbatch
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+  File "/ems/elsc-labs/adam-y/qixin.yang/anaconda3/envs/caiman/lib/python3.6/subprocess.py", line 423, in run
+    with Popen(*popenargs, **kwargs) as process:
+TypeError: __init__() got an unexpected keyword argument 'capture_output'
