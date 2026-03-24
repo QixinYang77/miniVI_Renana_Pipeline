@@ -18,6 +18,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 HERE = Path(__file__).parent.parent.resolve()
+# Remove any top-level repo paths that would shadow our utils/ with the top-level utils/
+_top_repo = str(HERE.parent)
+sys.path[:] = [p for p in sys.path if os.path.normpath(p) != os.path.normpath(_top_repo)]
 sys.path.insert(0, str(HERE))
 os.environ['PYTHONPATH'] = str(HERE)
 
