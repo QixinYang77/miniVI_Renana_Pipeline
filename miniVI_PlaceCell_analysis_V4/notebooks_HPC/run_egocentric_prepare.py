@@ -97,7 +97,7 @@ def main():
     parser.add_argument('--figures-root', type=str, default=str(HERE / 'figures'))
     parser.add_argument('--output-dir', type=str, required=True,
                         help='Directory to write manifest.json and per-cell results')
-    parser.add_argument('--categories', nargs='+', default=['CSplus', 'CSminus'])
+    parser.add_argument('--categories', nargs='+', default=['CSplus', 'CSminus', 'all-nonPLC'])
     parser.add_argument('--force-recompute', action='store_true')
     args = parser.parse_args()
 
