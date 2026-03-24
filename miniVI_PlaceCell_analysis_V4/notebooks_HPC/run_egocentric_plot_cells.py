@@ -2,11 +2,14 @@
 """
 Step 5a: Generate per-cell egocentric summary plots on the cluster.
 
-Iterates through all cells in the manifest, extracts plot timeseries
-(including theta amplitude and slow Vm from traces), and generates
-per-cell summary figures organized by category folder.
+Reads per-cell .npz results directly from per_cell_results/ (no aggregation
+step needed). Iterates through all cells in the manifest, loads the
+corresponding .npz to build the summary_row, extracts plot timeseries,
+and generates per-cell summary figures organized by category folder.
 
 Uses animal-level caching so each animal's data is loaded only once.
+
+Tolerates missing .npz files (e.g. jobs that haven't finished yet).
 
 Submitted by HPC_egocentric_job_submission.ipynb via sbatch.
 """
@@ -26,6 +29,7 @@ os.environ['PYTHONPATH'] = str(HERE)
 
 import matplotlib
 matplotlib.use('Agg')  # headless backend for cluster
+import matplotlib.pyplot as plt
 
 from utils.placecell_pipeline import (
     AnalysisParams,
@@ -38,12 +42,9 @@ from utils.placecell_pipeline import (
     _load_merged_data,
     _prepare_native_analysis_context,
     _load_spatial_analysis_by_idx,
-    _get_spatial_category_cells,
-    _normalize_pf_category_name,
     _passes_egocentric_category_gate,
     _extract_egocentric_plot_timeseries,
     _plot_egocentric_per_cell_summary_figure,
-    _build_egocentric_summary_lookup,
 )
 from utils.spatial_heatmaps import classify_spatial_cells
 
@@ -102,6 +103,54 @@ def build_config(data_root, figures_root):
     )
 
 
+def load_npz_summary_lookup(results_dir, manifest):
+    """Build summary_lookup dict from per-cell .npz files.
+
+    Returns {(category, animal_id, cell_idx): dict} for all successful cells.
+    Missing or skipped .npz files are silently ignored.
+    """
+    lookup = {}
+    n_found = 0
+    n_missing = 0
+    n_skipped = 0
+
+    for manifest_idx, cell_info in enumerate(manifest):
+        npz_path = results_dir / f'cell_{manifest_idx:04d}.npz'
+        if not npz_path.exists():
+            n_missing += 1
+            continue
+
+        try:
+            data = dict(np.load(npz_path, allow_pickle=True))
+        except Exception as exc:
+            print(f'  [WARN] Failed to load {npz_path}: {exc}')
+            n_missing += 1
+            continue
+
+        status = str(data.get('status', ''))
+        if status != 'success':
+            n_skipped += 1
+            continue
+
+        # Build a summary row dict from the .npz fields
+        row = {}
+        for key, val in data.items():
+            if key == 'status':
+                continue
+            # np.load wraps scalars in 0-d arrays
+            v = val.item() if hasattr(val, 'item') and val.ndim == 0 else val
+            row[key] = v
+
+        cat = str(row.get('category', cell_info['category']))
+        animal = str(row.get('animal_id', cell_info['animal_id']))
+        cidx = int(row.get('cell_idx', cell_info['cell_idx']))
+        lookup[(cat, animal, cidx)] = row
+        n_found += 1
+
+    print(f'NPZ lookup: {n_found} success, {n_skipped} skipped, {n_missing} missing')
+    return lookup
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate per-cell egocentric summary plots')
     parser.add_argument('--output-dir', type=str, required=True,
@@ -128,13 +177,9 @@ def main():
         manifest = json.load(f)
     print(f'Loaded manifest: {len(manifest)} cells')
 
-    # Load summary CSV from aggregation step (for fit parameters / pass status)
-    summary_csv = output_dir / 'egocentric_tuning_summary.csv'
-    summary_lookup = _build_egocentric_summary_lookup(
-        summary_csv=summary_csv,
-        summary_df=None,
-    )
-    print(f'Loaded summary lookup: {len(summary_lookup)} entries')
+    # Build summary lookup directly from .npz files (no aggregation step needed)
+    results_dir = output_dir / 'per_cell_results'
+    summary_lookup = load_npz_summary_lookup(results_dir, manifest)
 
     # Build plot params matching the notebook configuration
     params = EgocentricSummaryPlotParams(
@@ -231,6 +276,17 @@ def main():
             cat_dir = per_cell_root / str(category)
             cat_dir.mkdir(parents=True, exist_ok=True)
 
+            # Check if .npz result exists for this cell
+            summary_row = summary_lookup.get((str(category), str(animal_id), int(cell_idx)))
+            if summary_row is None:
+                skip_rows.append({
+                    'category': category, 'animal_id': animal_id,
+                    'cell_idx': cell_idx, 'reason': 'npz_missing_or_skipped',
+                })
+                counts['skipped'] += 1
+                print(f'  [SKIP] {category} / cell {cell_idx + 1}: no .npz result')
+                continue
+
             # Validate cell
             analysis = spatial_by_idx.get(cell_idx)
             if not isinstance(analysis, dict):
@@ -270,7 +326,6 @@ def main():
                 continue
 
             bad_mask = np.asarray(ctx['bad_masks'][cell_idx], dtype=bool)
-            summary_row = summary_lookup.get((str(category), str(animal_id), int(cell_idx)))
 
             try:
                 plot_data = _extract_egocentric_plot_timeseries(
@@ -291,7 +346,6 @@ def main():
                     params=params,
                     out_base=out_base,
                 )
-                import matplotlib.pyplot as plt
                 plt.close('all')  # free memory
 
                 counts['plotted'] += 1

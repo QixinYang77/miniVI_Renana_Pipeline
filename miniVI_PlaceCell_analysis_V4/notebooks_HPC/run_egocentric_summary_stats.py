@@ -2,15 +2,21 @@
 """
 Step 5b: Summarize egocentric tuning statistics across all categories.
 
-Extends the original CSplus-vs-CSminus comparison to include all-nonPLC.
+Reads per-cell .npz results directly from per_cell_results/ (no aggregation
+step needed). Extends the original CSplus-vs-CSminus comparison to include
+all-nonPLC.
+
 Generates:
   1. Bar chart of pass counts (pass_95, pass_99, pass_100) per category
   2. Box + scatter plot of real_mrl per category with pairwise Mann-Whitney U tests
-  3. Prints summary tables to stdout
+  3. Summary tables (printed + saved as CSV)
+
+Tolerates missing .npz files (e.g. jobs that haven't finished yet).
 
 Submitted by HPC_egocentric_job_submission.ipynb via sbatch.
 """
 import argparse
+import json
 import os
 import sys
 import numpy as np
@@ -38,10 +44,69 @@ DEFAULT_COLORS = {
 }
 
 
+def load_results_from_npz(results_dir, manifest, categories):
+    """Load all successful .npz results, filtered to requested categories.
+
+    Returns a list of dicts (one per successful cell).
+    """
+    rows = []
+    n_missing = 0
+    n_skipped = 0
+
+    for manifest_idx, cell_info in enumerate(manifest):
+        npz_path = results_dir / f'cell_{manifest_idx:04d}.npz'
+        if not npz_path.exists():
+            n_missing += 1
+            continue
+
+        try:
+            data = dict(np.load(npz_path, allow_pickle=True))
+        except Exception:
+            n_missing += 1
+            continue
+
+        status = str(data.get('status', ''))
+        if status != 'success':
+            n_skipped += 1
+            continue
+
+        row = {}
+        for key, val in data.items():
+            if key == 'status':
+                continue
+            v = val.item() if hasattr(val, 'item') and val.ndim == 0 else val
+            row[key] = v
+
+        # Use manifest info as fallback
+        cat = str(row.get('category', cell_info['category']))
+        row['category'] = cat
+        row.setdefault('animal_id', cell_info['animal_id'])
+        row.setdefault('cell_idx', cell_info['cell_idx'])
+
+        if cat in categories:
+            rows.append(row)
+
+    print(f'NPZ results: {len(rows)} success (in requested categories), '
+          f'{n_skipped} skipped, {n_missing} missing')
+    return rows
+
+
+def _coerce_bool(v):
+    """Coerce various representations to bool."""
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return bool(v)
+    s = str(v).strip().lower()
+    return s in ('true', '1', 'yes')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Summarize egocentric tuning statistics')
     parser.add_argument('--output-dir', type=str, required=True,
-                        help='Direction/spike-specific output dir with egocentric_tuning_summary.csv')
+                        help='Direction/spike-specific output dir with per_cell_results/')
+    parser.add_argument('--manifest-dir', type=str, default=None,
+                        help='Directory containing manifest.json. Defaults to parent of --output-dir.')
     parser.add_argument('--categories', nargs='+', default=['CSplus', 'CSminus', 'all-nonPLC'],
                         help='Categories to include in the summary')
     parser.add_argument('--save-formats', nargs='+', default=['svg', 'png'])
@@ -53,20 +118,28 @@ def main():
     from scipy.stats import mannwhitneyu
 
     output_dir = Path(args.output_dir)
-    summary_csv = output_dir / 'egocentric_tuning_summary.csv'
+    manifest_dir = Path(args.manifest_dir) if args.manifest_dir else output_dir.parent
+    results_dir = output_dir / 'per_cell_results'
 
-    if not summary_csv.exists():
-        print(f'[ERROR] Summary CSV not found: {summary_csv}')
+    # Load manifest
+    manifest_path = manifest_dir / 'manifest.json'
+    if not manifest_path.exists():
+        print(f'[ERROR] Manifest not found: {manifest_path}')
         sys.exit(1)
-
-    df = pd.read_csv(summary_csv)
-    print(f'Loaded {len(df)} rows from {summary_csv}')
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    print(f'Loaded manifest: {len(manifest)} cells')
 
     cats = list(args.categories)
-    df = df[df['category'].astype(str).isin(cats)].copy()
-    if len(df) == 0:
-        print(f'[ERROR] No rows found for categories: {cats}')
+
+    # Load results directly from .npz files
+    rows = load_results_from_npz(results_dir, manifest, set(cats))
+    if len(rows) == 0:
+        print(f'[ERROR] No successful results found for categories: {cats}')
         sys.exit(1)
+
+    df = pd.DataFrame(rows)
+    print(f'Total rows for analysis: {len(df)}')
 
     # Coerce pass columns to bool
     for col in ('pass_95', 'pass_99', 'pass_100'):
@@ -94,6 +167,7 @@ def main():
     mrl_df['real_mrl'] = pd.to_numeric(mrl_df['real_mrl'], errors='coerce')
     mrl_df = mrl_df[np.isfinite(mrl_df['real_mrl'])]
 
+    pairwise_results = []
     if len(mrl_df) > 0:
         mrl_stats = (
             mrl_df.groupby('category')['real_mrl']
@@ -105,7 +179,6 @@ def main():
 
         # Pairwise Mann-Whitney U tests
         print('\n=== Pairwise Mann-Whitney U Tests ===')
-        pairwise_results = []
         for cat_a, cat_b in combinations(cats, 2):
             a = mrl_df.loc[mrl_df['category'] == cat_a, 'real_mrl'].to_numpy(dtype=float)
             b = mrl_df.loc[mrl_df['category'] == cat_b, 'real_mrl'].to_numpy(dtype=float)
@@ -234,19 +307,10 @@ def main():
     if len(mrl_df) > 0:
         mrl_stats.to_csv(save_dir / 'mrl_stats.csv')
 
-    print(f'\nAll stats saved to: {save_dir}')
-
-
-def _coerce_bool(v):
-    """Coerce various representations to bool."""
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    s = str(v).strip().lower()
-    if s in ('true', '1', 'yes'):
-        return True
-    return False
+    # Also save the full results as a combined CSV (replaces the old aggregate step)
+    df.to_csv(output_dir / 'egocentric_tuning_summary.csv', index=False)
+    print(f'\nSaved combined summary: {output_dir / "egocentric_tuning_summary.csv"}')
+    print(f'All stats saved to: {save_dir}')
 
 
 if __name__ == '__main__':
