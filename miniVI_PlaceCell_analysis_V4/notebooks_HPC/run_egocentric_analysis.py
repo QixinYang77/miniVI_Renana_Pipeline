@@ -12,6 +12,7 @@ from pathlib import Path
 # Add miniVI_PlaceCell_analysis_V4 to path so utils can be imported
 HERE = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(HERE))
+os.environ['PYTHONPATH'] = str(HERE)
 
 from utils.placecell_pipeline import (
     AnalysisParams,

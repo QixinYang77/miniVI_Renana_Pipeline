@@ -16,7 +16,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).parent.parent.resolve()
+# Must be first in sys.path AND override PYTHONPATH to avoid the top-level utils/ package
 sys.path.insert(0, str(HERE))
+os.environ['PYTHONPATH'] = str(HERE)
 
 from utils.placecell_pipeline import (
     AnalysisParams,
