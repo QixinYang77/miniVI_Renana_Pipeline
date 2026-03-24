@@ -1,0 +1,16 @@
+# OS files
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Project-specific
+logs/
+MainFigures/
+miniVI_PlaceCell_analysis_V4_2sessions copy/
+
+# Inside miniVI_PlaceCell_analysis_V4
+miniVI_PlaceCell_analysis_V4/data/
+miniVI_PlaceCell_analysis_V4/figures/
+miniVI_PlaceCell_analysis_V4/logs/
