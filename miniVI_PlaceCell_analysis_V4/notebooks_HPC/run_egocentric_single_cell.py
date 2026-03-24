@@ -99,6 +99,9 @@ def main():
     parser.add_argument('--cell-index', type=int, required=True,
                         help='Index into manifest (typically $SLURM_ARRAY_TASK_ID)')
     parser.add_argument('--direction-mode', type=str, default='head', choices=['head', 'travel'])
+    parser.add_argument('--spike-type', type=str, default='all_spike',
+                        choices=['all_spike', 'simple_spike', 'complex_spike'],
+                        help='Which spike type to use for egocentric analysis')
     parser.add_argument('--n-surrogates', type=int, default=1000)
     parser.add_argument('--n-jobs', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument('--first-n-minutes', type=float, default=10.0)
@@ -127,6 +130,7 @@ def main():
     print(f'Category:    {category}')
     print(f'Animal:      {animal_id}')
     print(f'Cell idx:    {cell_idx}')
+    print(f'Spike type:  {args.spike_type}')
     print(f'Output:      {out_file}')
 
     config = build_config(args.data_root, args.figures_root)
@@ -194,12 +198,24 @@ def main():
         _save_skip(out_file, category, animal_id, cell_idx, 'cell_not_eligible_after_snr_filter')
         return
 
-    # Run analysis
-    spike_frames = np.asarray(ctx['all_spikes'][cell_idx], dtype=int)
+    # Select spike type
+    SPIKE_TYPE_MAP = {
+        'all_spike': 'all_spikes',
+        'simple_spike': 'refined_ss',
+        'complex_spike': 'all_cs_spikes',
+    }
+    spike_key = SPIKE_TYPE_MAP[args.spike_type]
+    spike_frames = np.asarray(ctx[spike_key][cell_idx], dtype=int)
+    if spike_frames.size == 0:
+        _save_skip(out_file, category, animal_id, cell_idx,
+                   f'no_spikes_for_type_{args.spike_type}')
+        return
+
     bad_mask = np.asarray(ctx['bad_masks'][cell_idx], dtype=bool)
     rng = np.random.default_rng(42 + args.cell_index)
 
-    print(f'Running egocentric analysis (n_surrogates={args.n_surrogates}, n_jobs={args.n_jobs}) ...')
+    print(f'Running egocentric analysis (spike_type={args.spike_type}, '
+          f'n_spikes={spike_frames.size}, n_surrogates={args.n_surrogates}, n_jobs={args.n_jobs}) ...')
     result, null_mrls, fail_reason = _run_single_cell_egocentric_tuning_frame_sampled(
         category=category,
         animal_id=animal_id,
