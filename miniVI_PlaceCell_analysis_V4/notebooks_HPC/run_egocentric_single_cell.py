@@ -103,8 +103,8 @@ def main():
                              'Defaults to --output-dir if not specified.')
     parser.add_argument('--data-root', type=str, default=str(HERE / 'data'))
     parser.add_argument('--figures-root', type=str, default=str(HERE / 'figures'))
-    parser.add_argument('--cell-index', type=int, required=True,
-                        help='Index into manifest (typically $SLURM_ARRAY_TASK_ID)')
+    parser.add_argument('--cell-index', type=int, default=None,
+                        help='Index into manifest. Defaults to $SLURM_ARRAY_TASK_ID env var.')
     parser.add_argument('--direction-mode', type=str, default='head', choices=['head', 'travel'])
     parser.add_argument('--spike-type', type=str, default='all_spike',
                         choices=['all_spike', 'simple_spike', 'complex_spike'],
@@ -113,6 +113,14 @@ def main():
     parser.add_argument('--n-jobs', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument('--first-n-minutes', type=float, default=10.0)
     args = parser.parse_args()
+
+    # Resolve cell index: CLI arg > $SLURM_ARRAY_TASK_ID
+    if args.cell_index is None:
+        slurm_task = os.environ.get('SLURM_ARRAY_TASK_ID')
+        if slurm_task is None:
+            print('[ERROR] --cell-index not provided and $SLURM_ARRAY_TASK_ID not set.')
+            sys.exit(1)
+        args.cell_index = int(slurm_task)
 
     output_dir = Path(args.output_dir)
     manifest_dir = Path(args.manifest_dir) if args.manifest_dir else output_dir
