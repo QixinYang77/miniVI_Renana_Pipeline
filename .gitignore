@@ -5,10 +5,14 @@
 __pycache__/
 *.pyc
 
+# Claude Code
+.claude/
+
 # Project-specific
 logs/
 MainFigures/
 miniVI_PlaceCell_analysis_V4_2sessions copy/
+ln-model-of-mec-neurons/
 
 # Inside miniVI_PlaceCell_analysis_V4
 miniVI_PlaceCell_analysis_V4/data/
