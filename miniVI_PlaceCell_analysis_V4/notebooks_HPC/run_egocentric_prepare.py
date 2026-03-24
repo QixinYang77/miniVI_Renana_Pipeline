@@ -96,7 +96,7 @@ def main():
     parser.add_argument('--data-root', type=str, default=str(HERE / 'data'))
     parser.add_argument('--figures-root', type=str, default=str(HERE / 'figures'))
     parser.add_argument('--output-dir', type=str, required=True,
-                        help='Directory to write manifest.json and per-cell results')
+                        help='Directory to write manifest.json (shared across direction/spike runs)')
     parser.add_argument('--categories', nargs='+', default=['CSplus', 'CSminus', 'all-nonPLC'])
     parser.add_argument('--force-recompute', action='store_true')
     args = parser.parse_args()
@@ -136,7 +136,6 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / 'per_cell_results').mkdir(exist_ok=True)
 
     manifest_path = output_dir / 'manifest.json'
     with open(manifest_path, 'w') as f:

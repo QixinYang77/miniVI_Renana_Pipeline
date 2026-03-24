@@ -97,7 +97,10 @@ def build_config(data_root, figures_root):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output-dir', type=str, required=True,
-                        help='Directory containing manifest.json and per_cell_results/')
+                        help='Directory for per_cell_results/ (direction/spike-specific)')
+    parser.add_argument('--manifest-dir', type=str, default=None,
+                        help='Directory containing manifest.json (shared across runs). '
+                             'Defaults to --output-dir if not specified.')
     parser.add_argument('--data-root', type=str, default=str(HERE / 'data'))
     parser.add_argument('--figures-root', type=str, default=str(HERE / 'figures'))
     parser.add_argument('--cell-index', type=int, required=True,
@@ -112,11 +115,12 @@ def main():
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
+    manifest_dir = Path(args.manifest_dir) if args.manifest_dir else output_dir
     results_dir = output_dir / 'per_cell_results'
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Load manifest
-    manifest_path = output_dir / 'manifest.json'
+    manifest_path = manifest_dir / 'manifest.json'
     with open(manifest_path) as f:
         manifest = json.load(f)
 
