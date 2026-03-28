@@ -45,6 +45,8 @@ from utils.placecell_pipeline import (
     _passes_egocentric_category_gate,
     _extract_egocentric_plot_timeseries,
     _plot_egocentric_per_cell_summary_figure,
+    _filter_egocentric_summary_row_by_valid_bins,
+    _filter_egocentric_summary_row_for_tuning_decision,
 )
 from utils.spatial_heatmaps import classify_spatial_cells
 
@@ -140,6 +142,7 @@ def load_npz_summary_lookup(results_dir, manifest):
             # np.load wraps scalars in 0-d arrays
             v = val.item() if hasattr(val, 'item') and val.ndim == 0 else val
             row[key] = v
+        row = _filter_egocentric_summary_row_by_valid_bins(row, min_valid_bins=5)
 
         cat = str(row.get('category', cell_info['category']))
         animal = str(row.get('animal_id', cell_info['animal_id']))
@@ -195,7 +198,8 @@ def main():
         occupancy_threshold_s=0.2,
         min_occupied_angle_bins=3,
         min_mean_rate_hz=0.5,
-        only_plot_spikes_in_valid_spatial_bins=True,
+        # Keep all valid-time spikes on trajectory panels (do not hide spikes outside spatial-valid bins).
+        only_plot_spikes_in_valid_spatial_bins=False,
         show_empirical_fit_curve=True,
         show_spatial_map_with_fitted_arrows=True,
         curve_polar=False,
@@ -334,6 +338,11 @@ def main():
                     bad_mask=bad_mask,
                     analysis=analysis,
                     params=params,
+                )
+                summary_row = _filter_egocentric_summary_row_for_tuning_decision(
+                    summary_row,
+                    local_tuning=plot_data.get('local_tuning'),
+                    min_valid_bins=5,
                 )
                 out_base = cat_dir / f'{animal_id}_cell{cell_idx + 1:03d}_egocentric_summary'
                 plot_meta = _plot_egocentric_per_cell_summary_figure(

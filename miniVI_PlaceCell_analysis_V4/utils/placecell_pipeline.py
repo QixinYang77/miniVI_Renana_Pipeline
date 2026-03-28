@@ -183,6 +183,8 @@ class PFDRZParams:
     include_long_cb_as_plateau: bool = True
     include_resting_plateaus: bool = True
     cb_plateau_min_duration_ms: float = 100.0
+    phase_signed_drz_filter: bool = True
+    first_n_minutes: float | None = None
 
 
 @dataclass
@@ -329,9 +331,9 @@ class EgocentricCellResult:
     null_p99: float
     null_max: float
     empirical_p: float
-    pass_95: bool
-    pass_99: bool
-    pass_100: bool
+    pass_95: bool | float
+    pass_99: bool | float
+    pass_100: bool | float
 
 
 @dataclass
@@ -7990,9 +7992,11 @@ def build_pf_distance_centered_component_dataset(
 def _compute_single_heatmap_max_trials(
     entry_data: dict[str, Any],
     time_rel: np.ndarray,
+    *,
+    direction_keys: tuple[str, str, str] = ("all", "cw", "ccw"),
 ) -> int:
     cell_data = entry_data["data"]
-    directions = [cell_data.get("all", {}), cell_data.get("cw", {}), cell_data.get("ccw", {})]
+    directions = [cell_data.get(str(k), {}) for k in direction_keys]
     stack_keys = ["rate_stack", "ss_rate_stack", "cs_rate_stack", "theta_stack", "slow_stack"]
     col_trials: list[int] = []
     for dir_data in directions:
@@ -8015,8 +8019,13 @@ def _estimate_single_heatmap_figure_height(
     trial_height: float,
     avg_height: float,
     merge_ss_cs: bool,
+    direction_keys: tuple[str, str, str] = ("all", "cw", "ccw"),
 ) -> float:
-    max_trials_all = _compute_single_heatmap_max_trials(entry_data, time_rel)
+    max_trials_all = _compute_single_heatmap_max_trials(
+        entry_data,
+        time_rel,
+        direction_keys=direction_keys,
+    )
     n_rows = 4 if bool(merge_ss_cs) else 5
     heatmap_h = max_trials_all * float(trial_height)
     row_spacing = 0.05
@@ -8030,9 +8039,10 @@ def _compute_single_cell_fr_vmaxs(
     time_rel: np.ndarray,
     *,
     smooth_window: int = 0,
+    direction_keys: tuple[str, str, str] = ("all", "cw", "ccw"),
 ) -> tuple[float, float, float]:
     cell_data = entry_data["data"]
-    directions = [cell_data.get("all", {}), cell_data.get("cw", {}), cell_data.get("ccw", {})]
+    directions = [cell_data.get(str(k), {}) for k in direction_keys]
     stack_keys = ["rate_stack", "ss_rate_stack", "cs_rate_stack"]
     row_vmax = [0.0, 0.0, 0.0]
     n_time = len(time_rel)
@@ -8154,15 +8164,18 @@ def _plot_single_cell_heatmap_on_figure(
     ss_cs_cbar_tick_labelsize: int = 3,
     heatmap_wspace: float = 0.15,
     apply_tight_layout: bool = True,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    direction_titles: tuple[str, str, str] | list[str] | None = None,
 ) -> dict[int, tuple[float, float]]:
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import LinearSegmentedColormap, Normalize
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
+    dir_keys, dir_titles = _normalize_direction_triplet(
+        direction_keys=direction_keys,
+        direction_titles=direction_titles,
+    )
     cell_data = entry_data["data"]
-    all_data = cell_data.get("all", {})
-    cw_data = cell_data.get("cw", {})
-    ccw_data = cell_data.get("ccw", {})
 
     def _get_stack(data: dict[str, Any], key: str) -> np.ndarray | None:
         stack = data.get(key)
@@ -8199,8 +8212,7 @@ def _plot_single_cell_heatmap_on_figure(
         return float(boundary_after) + 0.5
 
     stack_keys_all = ["rate_stack", "ss_rate_stack", "cs_rate_stack", "theta_stack", "slow_stack"]
-    directions = [all_data, cw_data, ccw_data]
-    dir_titles = ["All", "CW", "CCW"]
+    directions = [cell_data.get(k, {}) for k in dir_keys]
 
     all_stacks_5 = [[None] * 3 for _ in range(5)]
     row_vmax_5 = [0.0] * 5
@@ -8591,13 +8603,20 @@ def plot_pf_centered_single_cell_heatmap(
     show_heatmap_yticks_all_columns: bool = False,
     ss_cs_cbar_tick_labelsize: int = 3,
     heatmap_wspace: float = 0.15,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    direction_titles: tuple[str, str, str] | list[str] | None = None,
 ) -> plt.Figure:
+    dir_keys, dir_titles = _normalize_direction_triplet(
+        direction_keys=direction_keys,
+        direction_titles=direction_titles,
+    )
     fig_height = _estimate_single_heatmap_figure_height(
         entry_data,
         np.asarray(time_rel, dtype=float),
         trial_height=trial_height,
         avg_height=avg_height,
         merge_ss_cs=merge_ss_cs,
+        direction_keys=dir_keys,
     )
     colorbar_vmax_use = dict(colorbar_vmax_override) if isinstance(colorbar_vmax_override, dict) else None
     if colorbar_vmax_use is None and bool(auto_colorbar_vmax_from_pf1_all):
@@ -8636,6 +8655,8 @@ def plot_pf_centered_single_cell_heatmap(
         ss_cs_cbar_tick_labelsize=int(ss_cs_cbar_tick_labelsize),
         heatmap_wspace=float(heatmap_wspace),
         apply_tight_layout=True,
+        direction_keys=dir_keys,
+        direction_titles=dir_titles,
     )
     if out_path is not None:
         fig.savefig(out_path, dpi=300)
@@ -8681,7 +8702,13 @@ def plot_pf_centered_dual_component_heatmap(
     show_heatmap_yticks_all_columns: bool = False,
     ss_cs_cbar_tick_labelsize: int = 3,
     heatmap_wspace: float = 0.15,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    direction_titles: tuple[str, str, str] | list[str] | None = None,
 ) -> plt.Figure:
+    dir_keys, dir_titles = _normalize_direction_triplet(
+        direction_keys=direction_keys,
+        direction_titles=direction_titles,
+    )
     if entry_secondary is None:
         return plot_pf_centered_single_cell_heatmap(
             entry_primary,
@@ -8715,6 +8742,8 @@ def plot_pf_centered_dual_component_heatmap(
             show_heatmap_yticks_all_columns=show_heatmap_yticks_all_columns,
             ss_cs_cbar_tick_labelsize=ss_cs_cbar_tick_labelsize,
             heatmap_wspace=heatmap_wspace,
+            direction_keys=dir_keys,
+            direction_titles=dir_titles,
         )
 
     time_rel = np.asarray(time_rel, dtype=float)
@@ -8724,6 +8753,7 @@ def plot_pf_centered_dual_component_heatmap(
             entry_primary,
             time_rel,
             smooth_window=int(smooth_window),
+            direction_keys=dir_keys,
         )
     colorbar_vmax_use = dict(colorbar_vmax_override) if isinstance(colorbar_vmax_override, dict) else None
     if colorbar_vmax_use is None and bool(auto_colorbar_vmax_from_pf1_all):
@@ -8733,14 +8763,32 @@ def plot_pf_centered_dual_component_heatmap(
             smooth_window=int(smooth_window),
             std_multiplier=float(colorbar_std_multiplier),
         )
-    max_trials_primary = _compute_single_heatmap_max_trials(entry_primary, time_rel)
-    max_trials_secondary = _compute_single_heatmap_max_trials(entry_secondary, time_rel)
+    max_trials_primary = _compute_single_heatmap_max_trials(
+        entry_primary,
+        time_rel,
+        direction_keys=dir_keys,
+    )
+    max_trials_secondary = _compute_single_heatmap_max_trials(
+        entry_secondary,
+        time_rel,
+        direction_keys=dir_keys,
+    )
     fixed_heatmap_height = max(max_trials_primary, max_trials_secondary) * float(trial_height)
     h1 = _estimate_single_heatmap_figure_height(
-        entry_primary, time_rel, trial_height=trial_height, avg_height=avg_height, merge_ss_cs=merge_ss_cs
+        entry_primary,
+        time_rel,
+        trial_height=trial_height,
+        avg_height=avg_height,
+        merge_ss_cs=merge_ss_cs,
+        direction_keys=dir_keys,
     )
     h2 = _estimate_single_heatmap_figure_height(
-        entry_secondary, time_rel, trial_height=trial_height, avg_height=avg_height, merge_ss_cs=merge_ss_cs
+        entry_secondary,
+        time_rel,
+        trial_height=trial_height,
+        avg_height=avg_height,
+        merge_ss_cs=merge_ss_cs,
+        direction_keys=dir_keys,
     )
     fig = plt.figure(figsize=(fig_width * 2 + 0.45, max(h1, h2)))
     subfigs = fig.subfigures(1, 2, wspace=0.04)
@@ -8779,6 +8827,8 @@ def plot_pf_centered_dual_component_heatmap(
         ss_cs_cbar_tick_labelsize=int(ss_cs_cbar_tick_labelsize),
         heatmap_wspace=float(heatmap_wspace),
         apply_tight_layout=True,
+        direction_keys=dir_keys,
+        direction_titles=dir_titles,
     )
     _plot_single_cell_heatmap_on_figure(
         subfigs[1],
@@ -8814,6 +8864,8 @@ def plot_pf_centered_dual_component_heatmap(
         ss_cs_cbar_tick_labelsize=int(ss_cs_cbar_tick_labelsize),
         heatmap_wspace=float(heatmap_wspace),
         apply_tight_layout=True,
+        direction_keys=dir_keys,
+        direction_titles=dir_titles,
     )
 
     session = entry_primary["session"]
@@ -9010,6 +9062,11 @@ def _plot_pooled_category_3col_on_axes(
     align_all_peak_to_zero: bool = False,
     peak_align_window: tuple[float, float] = (-5.0, 5.0),
     avg_smooth_window: int | None = None,
+    all_direction_key: str = "all",
+    cw_direction_key: str = "cw",
+    ccw_direction_key: str = "ccw",
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
+    direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
 ) -> None:
     min_trav = int(min_traversals_per_type)
     if min_trav < 0:
@@ -9028,6 +9085,32 @@ def _plot_pooled_category_3col_on_axes(
     align_mask = (time_rel >= float(peak_align_window[0])) & (time_rel <= float(peak_align_window[1]))
     if not np.any(align_mask):
         align_mask = np.ones_like(time_rel, dtype=bool)
+    all_key = str(all_direction_key).strip()
+    cw_key = str(cw_direction_key).strip()
+    ccw_key = str(ccw_direction_key).strip()
+    if len(all_key) == 0 or len(cw_key) == 0 or len(ccw_key) == 0:
+        raise ValueError("Direction keys cannot be empty.")
+    if explicit_preferred_nonpreferred_keys is None:
+        pref_fixed = None
+        nonpref_fixed = None
+    else:
+        pref_nonpref = tuple(explicit_preferred_nonpreferred_keys)
+        if len(pref_nonpref) != 2:
+            raise ValueError("explicit_preferred_nonpreferred_keys must contain exactly two keys.")
+        pref_fixed = str(pref_nonpref[0]).strip()
+        nonpref_fixed = str(pref_nonpref[1]).strip()
+        if len(pref_fixed) == 0 or len(nonpref_fixed) == 0:
+            raise ValueError("Preferred/non-preferred direction keys cannot be empty.")
+        if pref_fixed == nonpref_fixed:
+            raise ValueError("Preferred and non-preferred direction keys must differ.")
+    titles_in = tuple(direction_titles)
+    if len(titles_in) != 3:
+        raise ValueError("direction_titles must contain exactly three labels.")
+    dir_titles = [str(titles_in[0]), str(titles_in[1]), str(titles_in[2])]
+    trace_direction_keys = [all_key, cw_key, ccw_key]
+    if pref_fixed is not None:
+        trace_direction_keys.extend([pref_fixed, nonpref_fixed])
+    trace_direction_keys = list(dict.fromkeys(trace_direction_keys))
     metric_keys = ["rate_stack", "ss_rate_stack", "cs_rate_stack", "theta_stack", "slow_stack"]
     records = []
     for e in entries:
@@ -9036,8 +9119,8 @@ def _plot_pooled_category_3col_on_axes(
             continue
         session = str(e.get("session", ""))
         cell_idx = int(e.get("cell_idx", -1))
-        traces = {"all": {}, "cw": {}, "ccw": {}}
-        for base_dir in ("all", "cw", "ccw"):
+        traces = {k: {} for k in trace_direction_keys}
+        for base_dir in trace_direction_keys:
             for key in metric_keys:
                 traces[base_dir][key] = _extract_cell_metric_trace(
                     cell_data,
@@ -9053,7 +9136,7 @@ def _plot_pooled_category_3col_on_axes(
             # all-spike mean trace after both smoothing stages.
             all_rate_ref = _extract_cell_metric_trace(
                 cell_data,
-                "all",
+                all_key,
                 "rate_stack",
                 n_time,
                 smooth_window=smooth_window,
@@ -9066,7 +9149,7 @@ def _plot_pooled_category_3col_on_axes(
                     peak_idx = int(np.nanargmax(masked))
                     shift_bins = int(zero_idx - peak_idx)
                     if shift_bins != 0:
-                        for base_dir in ("all", "cw", "ccw"):
+                        for base_dir in trace_direction_keys:
                             for key in metric_keys:
                                 tr = traces[base_dir].get(key)
                                 if tr is None:
@@ -9075,27 +9158,31 @@ def _plot_pooled_category_3col_on_axes(
                                 if tr.ndim == 1 and tr.size == n_time:
                                     traces[base_dir][key] = _shift_trace_with_nan(tr, shift_bins)
 
-        all_rate = traces["all"]["rate_stack"]
-        cw_rate = traces["cw"]["rate_stack"]
-        ccw_rate = traces["ccw"]["rate_stack"]
+        all_rate = traces[all_key]["rate_stack"]
+        cw_rate = traces[cw_key]["rate_stack"]
+        ccw_rate = traces[ccw_key]["rate_stack"]
         all_zero = all_rate[zero_idx] if all_rate is not None else np.nan
 
-        preferred_dir = _infer_preferred_direction_from_rate_traces(cw_rate, ccw_rate)
+        if pref_fixed is None:
+            preferred_dir = _infer_preferred_direction_from_rate_traces(cw_rate, ccw_rate)
+            if preferred_dir == "cw":
+                preferred_dir_key = cw_key
+                nonpreferred_dir_key = ccw_key
+            elif preferred_dir == "ccw":
+                preferred_dir_key = ccw_key
+                nonpreferred_dir_key = cw_key
+            else:
+                preferred_dir_key = None
+                nonpreferred_dir_key = None
+        else:
+            preferred_dir_key = str(pref_fixed)
+            nonpreferred_dir_key = str(nonpref_fixed)
 
         # Gate inclusion so each kept cell has enough traversals in all 3 plotted types:
         # All, Preferred, Non-preferred.
-        n_all_trials = int(cell_data.get("all", {}).get("n_trials", 0))
-        n_cw_trials = int(cell_data.get("cw", {}).get("n_trials", 0))
-        n_ccw_trials = int(cell_data.get("ccw", {}).get("n_trials", 0))
-        if preferred_dir == "cw":
-            n_pref_trials = n_cw_trials
-            n_nonpref_trials = n_ccw_trials
-        elif preferred_dir == "ccw":
-            n_pref_trials = n_ccw_trials
-            n_nonpref_trials = n_cw_trials
-        else:
-            n_pref_trials = 0
-            n_nonpref_trials = 0
+        n_all_trials = int(cell_data.get(all_key, {}).get("n_trials", 0))
+        n_pref_trials = int(cell_data.get(str(preferred_dir_key), {}).get("n_trials", 0)) if preferred_dir_key is not None else 0
+        n_nonpref_trials = int(cell_data.get(str(nonpreferred_dir_key), {}).get("n_trials", 0)) if nonpreferred_dir_key is not None else 0
         if (
             n_all_trials < min_trav
             or n_pref_trials < min_trav
@@ -9107,7 +9194,8 @@ def _plot_pooled_category_3col_on_axes(
             {
                 "traces": traces,
                 "all_rate_zero": all_zero,
-                "preferred_dir": preferred_dir,
+                "preferred_direction_key": preferred_dir_key,
+                "nonpreferred_direction_key": nonpreferred_dir_key,
                 "session": session,
                 "cell_idx": cell_idx,
             }
@@ -9117,17 +9205,16 @@ def _plot_pooled_category_3col_on_axes(
         arrs = []
         for rec in records:
             if column_key == "all":
-                trace = rec["traces"]["all"][metric_key]
+                trace = rec["traces"][all_key][metric_key]
             elif column_key == "preferred":
-                pref = rec["preferred_dir"]
+                pref = rec.get("preferred_direction_key")
                 if pref is None:
                     continue
                 trace = rec["traces"][pref][metric_key]
             else:
-                pref = rec["preferred_dir"]
-                if pref is None:
+                nonpref = rec.get("nonpreferred_direction_key")
+                if nonpref is None:
                     continue
-                nonpref = "ccw" if pref == "cw" else "cw"
                 trace = rec["traces"][nonpref][metric_key]
             if trace is None:
                 continue
@@ -9153,7 +9240,6 @@ def _plot_pooled_category_3col_on_axes(
         return np.vstack(arrs)
 
     directions = ["all", "preferred", "nonpreferred"]
-    dir_titles = ["All", "Pref", "Non-pref"]
     all_rate_means, all_ss_means, all_cs_means = [], [], []
     n_cells_by_direction: dict[str, int] = {}
 
@@ -9305,6 +9391,11 @@ def plot_pooled_category_3col(
     align_all_peak_to_zero: bool = False,
     peak_align_window: tuple[float, float] = (-5.0, 5.0),
     avg_smooth_window: int | None = None,
+    all_direction_key: str = "all",
+    cw_direction_key: str = "cw",
+    ccw_direction_key: str = "ccw",
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
+    direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
     show_plot: bool = True,
     close_on_return: bool = True,
 ) -> plt.Figure | None:
@@ -9335,6 +9426,11 @@ def plot_pooled_category_3col(
         align_all_peak_to_zero=align_all_peak_to_zero,
         peak_align_window=peak_align_window,
         avg_smooth_window=avg_smooth_window,
+        all_direction_key=all_direction_key,
+        cw_direction_key=cw_direction_key,
+        ccw_direction_key=ccw_direction_key,
+        explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
+        direction_titles=direction_titles,
     )
     fig.suptitle(f"{title}", y=0.98)
     try:
@@ -9378,6 +9474,11 @@ def plot_pooled_category_primary_secondary(
     align_all_peak_to_zero: bool = False,
     peak_align_window: tuple[float, float] = (-5.0, 5.0),
     avg_smooth_window: int | None = None,
+    all_direction_key: str = "all",
+    cw_direction_key: str = "cw",
+    ccw_direction_key: str = "ccw",
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
+    direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
     show_plot: bool = True,
     close_on_return: bool = True,
 ) -> plt.Figure | None:
@@ -9409,6 +9510,11 @@ def plot_pooled_category_primary_secondary(
             align_all_peak_to_zero=align_all_peak_to_zero,
             peak_align_window=peak_align_window,
             avg_smooth_window=avg_smooth_window,
+            all_direction_key=all_direction_key,
+            cw_direction_key=cw_direction_key,
+            ccw_direction_key=ccw_direction_key,
+            explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
+            direction_titles=direction_titles,
             show_plot=show_plot,
             close_on_return=close_on_return,
         )
@@ -9426,7 +9532,7 @@ def plot_pooled_category_primary_secondary(
             continue
         all_tr = _extract_cell_metric_trace(
             entry.get("data", {}),
-            "all",
+            str(all_direction_key),
             "rate_stack",
             len(time_rel_primary),
             smooth_window=smooth_window,
@@ -9467,6 +9573,11 @@ def plot_pooled_category_primary_secondary(
         align_all_peak_to_zero=align_all_peak_to_zero,
         peak_align_window=peak_align_window,
         avg_smooth_window=avg_smooth_window,
+        all_direction_key=all_direction_key,
+        cw_direction_key=cw_direction_key,
+        ccw_direction_key=ccw_direction_key,
+        explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
+        direction_titles=direction_titles,
     )
     _plot_pooled_category_3col_on_axes(
         np.asarray(time_rel_secondary, dtype=float),
@@ -9493,6 +9604,11 @@ def plot_pooled_category_primary_secondary(
         align_all_peak_to_zero=align_all_peak_to_zero,
         peak_align_window=peak_align_window,
         avg_smooth_window=avg_smooth_window,
+        all_direction_key=all_direction_key,
+        cw_direction_key=cw_direction_key,
+        ccw_direction_key=ccw_direction_key,
+        explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
+        direction_titles=direction_titles,
     )
     fig.suptitle(f"{title}", y=0.999)
     try:
@@ -11597,6 +11713,36 @@ def _normalize_direction_avg_mode(avg_mode: str | None) -> str:
     return aliases[token]
 
 
+def _normalize_direction_triplet(
+    direction_keys: tuple[str, str, str] | list[str] | None = None,
+    direction_titles: tuple[str, str, str] | list[str] | None = None,
+) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
+    keys_in = ("all", "cw", "ccw") if direction_keys is None else tuple(direction_keys)
+    if len(keys_in) != 3:
+        raise ValueError("direction_keys must contain exactly three keys.")
+    keys = tuple(str(k).strip() for k in keys_in)
+    if any(len(k) == 0 for k in keys):
+        raise ValueError("direction_keys cannot contain empty keys.")
+    if len(set(keys)) != 3:
+        raise ValueError("direction_keys must be unique.")
+
+    if direction_titles is None:
+        default_labels = {
+            "all": "All",
+            "cw": "CW",
+            "ccw": "CCW",
+            "p": "Preferred",
+            "np": "Non-preferred",
+        }
+        titles = tuple(default_labels.get(k, k) for k in keys)
+    else:
+        titles_in = tuple(direction_titles)
+        if len(titles_in) != 3:
+            raise ValueError("direction_titles must contain exactly three labels.")
+        titles = tuple(str(t).strip() for t in titles_in)
+    return keys, titles
+
+
 def _filter_direction_data_by_avg_mode(
     dir_data: dict[str, Any],
     *,
@@ -11678,13 +11824,15 @@ def _filter_entry_by_avg_mode_for_directions(
     entry: dict[str, Any] | None,
     *,
     avg_mode: str,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
 ) -> dict[str, Any] | None:
-    """Filter PF entry by avg_mode across all/cw/ccw stacks."""
+    """Filter PF entry by avg_mode across the selected direction stacks."""
     if entry is None:
         return None
     mode = _normalize_direction_avg_mode(avg_mode)
     if mode == "combined":
         return entry
+    direction_keys_use, _ = _normalize_direction_triplet(direction_keys=direction_keys, direction_titles=None)
 
     out = dict(entry)
     data_in = entry.get("data", {})
@@ -11692,7 +11840,7 @@ def _filter_entry_by_avg_mode_for_directions(
         return out
     data_out: dict[str, Any] = {}
     for dir_key, dir_data in data_in.items():
-        if dir_key in {"all", "cw", "ccw"} and isinstance(dir_data, dict):
+        if dir_key in set(direction_keys_use) and isinstance(dir_data, dict):
             data_out[dir_key] = _filter_direction_data_by_avg_mode(dir_data, avg_mode=mode)
         else:
             data_out[dir_key] = dir_data
@@ -11708,16 +11856,18 @@ def _compute_dual_pf_fr_colorbar_vmax_from_direction_means(
     smooth_window: int = 0,
     avg_smooth_window: int = 0,
     avg_mode: str = "combined",
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
 ) -> dict[str, float]:
     """Dynamic FR colorbar vmax from displayed mean traces across PF1/PF2 and all directions."""
     mode = _normalize_direction_avg_mode(avg_mode)
+    direction_keys_use, _ = _normalize_direction_triplet(direction_keys=direction_keys, direction_titles=None)
     n_time = int(len(time_rel))
     metric_to_stack = {
         "rate": "rate_stack",
         "ss": "ss_rate_stack",
         "cs": "cs_rate_stack",
     }
-    directions = ("all", "cw", "ccw")
+    directions = tuple(direction_keys_use)
 
     def _smooth_stack(stack: np.ndarray) -> np.ndarray:
         if int(smooth_window) <= 1:
@@ -13340,11 +13490,18 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
     average_export_stage: str = "post",
     avg_mode: str = "combined",
     enforce_min_traversals_on_saved_exports: bool = False,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
     show_plot: bool = True,
 ) -> plt.Figure | None:
     import csv
 
     mode_norm = _normalize_direction_avg_mode(avg_mode)
+    dir_keys, dir_titles = _normalize_direction_triplet(
+        direction_keys=direction_keys,
+        direction_titles=direction_titles,
+    )
     cat = _normalize_pf_category_name(category)
     cat_data = dataset.get(cat, {})
     primary = cat_data.get(1, {})
@@ -13412,7 +13569,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
             "theta": "theta_stack",
             "slow": "slow_stack",
         }
-        directions = ("all", "cw", "ccw")
+        directions = tuple(dir_keys)
         data_out: dict[str, Any] = {}
 
         for direction in directions:
@@ -13516,11 +13673,11 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
     else:
         if mode_norm != "combined":
             primary_entries = [
-                _filter_entry_by_avg_mode_for_directions(e, avg_mode=mode_norm)
+                _filter_entry_by_avg_mode_for_directions(e, avg_mode=mode_norm, direction_keys=dir_keys)
                 for e in primary_entries
             ]
             secondary_entries = [
-                _filter_entry_by_avg_mode_for_directions(e, avg_mode=mode_norm)
+                _filter_entry_by_avg_mode_for_directions(e, avg_mode=mode_norm, direction_keys=dir_keys)
                 for e in secondary_entries
             ]
 
@@ -13578,6 +13735,11 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
         avg_smooth_window=avg_smooth_window_bins,
         show_plot=False,
         close_on_return=False,
+        all_direction_key=str(dir_keys[0]),
+        cw_direction_key=str(dir_keys[1]),
+        ccw_direction_key=str(dir_keys[2]),
+        explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
+        direction_titles=dir_titles,
     )
     if fig is None:
         return None
@@ -13610,6 +13772,10 @@ def compute_pf_distance_centered_pref_nonpref_stats(
     average_export_dir: str | Path | None = None,
     average_export_stage: str = "post",
     avg_mode: str = "combined",
+    all_direction_key: str = "all",
+    cw_direction_key: str = "cw",
+    ccw_direction_key: str = "ccw",
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
     print_nan_diagnostics: bool = True,
     set_nan_r_to_zero: bool = True,
 ) -> dict[str, Any]:
@@ -13623,13 +13789,32 @@ def compute_pf_distance_centered_pref_nonpref_stats(
       - peak_ratio_s2_s1 (peak_nonpref / peak_pref)
       - peak_abs_sym_diff (abs((peak_nonpref-peak_pref)/(peak_nonpref+peak_pref)))
 
-    Preferred direction is defined by higher all-spike peak between CW and CCW.
+    Preferred direction is defined by higher all-spike peak between CW and CCW unless
+    explicit_preferred_nonpreferred_keys is provided.
     `timepoint_cm` is kept for API compatibility and is not used.
     """
     import csv
     import pandas as pd
 
     mode_norm = _normalize_direction_avg_mode(avg_mode)
+    all_key = str(all_direction_key).strip()
+    cw_key = str(cw_direction_key).strip()
+    ccw_key = str(ccw_direction_key).strip()
+    if len(all_key) == 0 or len(cw_key) == 0 or len(ccw_key) == 0:
+        raise ValueError("Direction keys cannot be empty.")
+    if explicit_preferred_nonpreferred_keys is None:
+        pref_key_fixed = None
+        nonpref_key_fixed = None
+    else:
+        pref_nonpref = tuple(explicit_preferred_nonpreferred_keys)
+        if len(pref_nonpref) != 2:
+            raise ValueError("explicit_preferred_nonpreferred_keys must contain exactly two keys.")
+        pref_key_fixed = str(pref_nonpref[0]).strip()
+        nonpref_key_fixed = str(pref_nonpref[1]).strip()
+        if len(pref_key_fixed) == 0 or len(nonpref_key_fixed) == 0:
+            raise ValueError("Preferred/non-preferred keys cannot be empty.")
+        if pref_key_fixed == nonpref_key_fixed:
+            raise ValueError("Preferred and non-preferred keys must differ.")
     _ = float(timepoint_cm)  # retained for compatibility with older call sites
     min_req = int(min_traversals_per_type)
     if min_req < 0:
@@ -13820,7 +14005,10 @@ def compute_pf_distance_centered_pref_nonpref_stats(
             "theta": "theta_mean",
             "slow": "slow_mean",
         }
-        directions = ("all", "cw", "ccw")
+        directions = [all_key, cw_key, ccw_key]
+        if pref_key_fixed is not None:
+            directions.extend([pref_key_fixed, nonpref_key_fixed])
+        directions = list(dict.fromkeys(directions))
         data_out: dict[str, Any] = {"time_rel": rel}
         for direction in directions:
             d: dict[str, Any] = {"distance_rel": rel}
@@ -13882,17 +14070,30 @@ def compute_pf_distance_centered_pref_nonpref_stats(
                                         continue
                                     n_time = int(x_rel.size)
 
-                                    cw_rate = _trace_1d(npz, f"{stage}_pf{int(pf_rank)}_cw_{mode_norm}_all_spike", n_time)
-                                    ccw_rate = _trace_1d(npz, f"{stage}_pf{int(pf_rank)}_ccw_{mode_norm}_all_spike", n_time)
-                                    pref_key = _infer_preferred_direction_from_rate_traces(cw_rate, ccw_rate)
-                                    if pref_key not in {"cw", "ccw"}:
-                                        skipped_counts["no_preferred"] += 1
-                                        continue
-                                    nonpref_key = "ccw" if pref_key == "cw" else "cw"
+                                    if pref_key_fixed is None:
+                                        cw_rate = _trace_1d(
+                                            npz,
+                                            f"{stage}_pf{int(pf_rank)}_{cw_key}_{mode_norm}_all_spike",
+                                            n_time,
+                                        )
+                                        ccw_rate = _trace_1d(
+                                            npz,
+                                            f"{stage}_pf{int(pf_rank)}_{ccw_key}_{mode_norm}_all_spike",
+                                            n_time,
+                                        )
+                                        pref_side = _infer_preferred_direction_from_rate_traces(cw_rate, ccw_rate)
+                                        if pref_side not in {"cw", "ccw"}:
+                                            skipped_counts["no_preferred"] += 1
+                                            continue
+                                        pref_key = str(cw_key) if pref_side == "cw" else str(ccw_key)
+                                        nonpref_key = str(ccw_key) if pref_side == "cw" else str(cw_key)
+                                    else:
+                                        pref_key = str(pref_key_fixed)
+                                        nonpref_key = str(nonpref_key_fixed)
 
-                                    n_all = _safe_int(row.get(f"n_trials_pf{int(pf_rank)}_all_{mode_norm}", np.nan), default=0)
+                                    n_all = _safe_int(row.get(f"n_trials_pf{int(pf_rank)}_{all_key}_{mode_norm}", np.nan), default=0)
                                     if n_all <= 0:
-                                        n_all = _safe_int(npz.get(f"n_trials_pf{int(pf_rank)}_all_{mode_norm}", np.nan), default=0)
+                                        n_all = _safe_int(npz.get(f"n_trials_pf{int(pf_rank)}_{all_key}_{mode_norm}", np.nan), default=0)
                                     n_pref = _safe_int(row.get(f"n_trials_pf{int(pf_rank)}_{pref_key}_{mode_norm}", np.nan), default=0)
                                     if n_pref <= 0:
                                         n_pref = _safe_int(npz.get(f"n_trials_pf{int(pf_rank)}_{pref_key}_{mode_norm}", np.nan), default=0)
@@ -14016,26 +14217,31 @@ def compute_pf_distance_centered_pref_nonpref_stats(
             for entry in entries:
                 data = entry.get("data", {})
                 x_rel = np.asarray(
-                    data.get("time_rel", data.get("distance_rel", data.get("all", {}).get("distance_rel", []))),
+                    data.get("time_rel", data.get("distance_rel", data.get(all_key, {}).get("distance_rel", []))),
                     dtype=float,
                 )
                 if x_rel.ndim != 1 or x_rel.size == 0:
                     skipped_counts["missing"] += 1
                     continue
                 n_time = int(x_rel.size)
-                all_dir = data.get("all", {})
-                cw_dir = data.get("cw", {})
-                ccw_dir = data.get("ccw", {})
+                all_dir = data.get(all_key, {})
+                cw_dir = data.get(cw_key, {})
+                ccw_dir = data.get(ccw_key, {})
 
-                cw_rate = _trace_from_dir(cw_dir, "rate_mean", "rate_stack", n_time)
-                ccw_rate = _trace_from_dir(ccw_dir, "rate_mean", "rate_stack", n_time)
-                pref_key = _infer_preferred_direction_from_rate_traces(cw_rate, ccw_rate)
-                if pref_key not in {"cw", "ccw"}:
-                    skipped_counts["no_preferred"] += 1
-                    continue
-                nonpref_key = "ccw" if pref_key == "cw" else "cw"
-                pref_dir = cw_dir if pref_key == "cw" else ccw_dir
-                nonpref_dir = ccw_dir if pref_key == "cw" else cw_dir
+                if pref_key_fixed is None:
+                    cw_rate = _trace_from_dir(cw_dir, "rate_mean", "rate_stack", n_time)
+                    ccw_rate = _trace_from_dir(ccw_dir, "rate_mean", "rate_stack", n_time)
+                    pref_side = _infer_preferred_direction_from_rate_traces(cw_rate, ccw_rate)
+                    if pref_side not in {"cw", "ccw"}:
+                        skipped_counts["no_preferred"] += 1
+                        continue
+                    pref_key = str(cw_key) if pref_side == "cw" else str(ccw_key)
+                    nonpref_key = str(ccw_key) if pref_side == "cw" else str(cw_key)
+                else:
+                    pref_key = str(pref_key_fixed)
+                    nonpref_key = str(nonpref_key_fixed)
+                pref_dir = data.get(pref_key, {})
+                nonpref_dir = data.get(nonpref_key, {})
 
                 n_all = int(all_dir.get("n_trials", 0))
                 n_pref = int(pref_dir.get("n_trials", 0))
@@ -14188,6 +14394,14 @@ def compute_pf_distance_centered_pref_nonpref_stats(
         "slow_auc_window_cm": (float(slow_x0), float(slow_x1)),
         "peak_window_cm": (float(peak_x0), float(peak_x1)),
         "set_nan_r_to_zero": bool(set_nan_r_to_zero),
+        "all_direction_key": str(all_key),
+        "cw_direction_key": str(cw_key),
+        "ccw_direction_key": str(ccw_key),
+        "explicit_preferred_nonpreferred_keys": (
+            None
+            if pref_key_fixed is None
+            else (str(pref_key_fixed), str(nonpref_key_fixed))
+        ),
     }
 
 
@@ -19378,8 +19592,10 @@ def compute_pf_drz_trial_data_iterative(
     cb_plateau_min_duration_ms: float = 100.0,
     plateau_min_duration_ms: float = 100.0,
     include_resting_plateaus: bool = True,
+    phase_signed_drz_filter: bool = True,
     analysis_override: dict[str, Any] | None = None,
     distance_mode: str = "euclidean_to_peak",
+    first_n_minutes: float | None = None,
 ) -> dict[str, Any] | None:
     if analysis_override is None or not bool(analysis_override.get("is_place_cell", False)):
         return None
@@ -19441,6 +19657,16 @@ def compute_pf_drz_trial_data_iterative(
     valid_frame_mask &= np.isfinite(np.asarray(speed, dtype=float))
     if bad_mask is not None:
         valid_frame_mask &= ~bad_mask
+    first_n_minutes_use = None if first_n_minutes is None else float(first_n_minutes)
+    if first_n_minutes_use is not None:
+        if (not np.isfinite(first_n_minutes_use)) or first_n_minutes_use <= 0:
+            raise ValueError("first_n_minutes must be a finite number > 0 when provided.")
+        if float(frame_rate) <= 0:
+            raise ValueError("frame_rate must be > 0 when first_n_minutes is provided.")
+        cutoff_frame = int(np.floor(float(first_n_minutes_use) * 60.0 * float(frame_rate)))
+        cutoff_frame = max(1, min(int(len(trace)), int(cutoff_frame)))
+        if cutoff_frame < int(len(trace)):
+            valid_frame_mask[cutoff_frame:] = False
 
     moving_kernel_size = max(3, int(moving_kernel_size))
     if moving_kernel_size % 2 == 0:
@@ -19591,6 +19817,18 @@ def compute_pf_drz_trial_data_iterative(
         if not np.any(in_pf_local & valid_local):
             continue
         valid_local = valid_local & np.asarray(in_pf_local, dtype=bool)
+        if bool(phase_signed_drz_filter):
+            center_local = int(center_idx - start)
+            if center_local < 0 or center_local >= int(end - start):
+                continue
+            phase_sign_mask = np.zeros(int(end - start), dtype=bool)
+            idx_local = np.arange(int(end - start), dtype=int)
+            pre_mask = idx_local < int(center_local)
+            post_mask = idx_local > int(center_local)
+            phase_sign_mask[pre_mask] = np.asarray(drz_values[pre_mask], dtype=float) < 0.0
+            phase_sign_mask[post_mask] = np.asarray(drz_values[post_mask], dtype=float) > 0.0
+            phase_sign_mask[int(center_local)] = np.isfinite(np.asarray(drz_values, dtype=float)[int(center_local)])
+            valid_local = valid_local & np.asarray(phase_sign_mask, dtype=bool)
         if not np.any(valid_local):
             continue
         bin_idx = np.digitize(drz_values, bin_edges) - 1
@@ -19752,7 +19990,9 @@ def compute_pf_drz_trial_data_iterative(
         "distance_mode": str(distance_mode),
         "include_long_cb_as_plateau": bool(include_long_cb_as_plateau),
         "include_resting_plateaus": bool(include_resting_plateaus),
+        "phase_signed_drz_filter": bool(phase_signed_drz_filter),
         "cb_plateau_min_duration_ms": float(cb_plateau_min_duration_ms),
+        "first_n_minutes": (None if first_n_minutes_use is None else float(first_n_minutes_use)),
         "center_vicinity_min_cm": int(center_vicinity_min_cm),
         "center_vicinity_max_cm": int(center_vicinity_max_cm),
         "moving_speed_threshold": float(moving_speed_threshold),
@@ -19866,10 +20106,16 @@ def compute_drz_component_result_iterative(
         complex_bursts_dicts=merged.get("complex_bursts_dicts", []),
         include_long_cb_as_plateau=bool(drz_params.include_long_cb_as_plateau),
         include_resting_plateaus=bool(drz_params.include_resting_plateaus),
+        phase_signed_drz_filter=bool(getattr(drz_params, "phase_signed_drz_filter", True)),
         cb_plateau_min_duration_ms=float(drz_params.cb_plateau_min_duration_ms),
         plateau_min_duration_ms=float(config.traversal.plateau_min_duration_ms),
         analysis_override=analysis_override,
         distance_mode=str(drz_params.distance_mode),
+        first_n_minutes=(
+            None
+            if getattr(drz_params, "first_n_minutes", None) is None
+            else float(drz_params.first_n_minutes)
+        ),
     )
     if result is None:
         return None
@@ -19950,7 +20196,13 @@ def build_pf_drz_component_dataset(
             "resting_speed_threshold": float(drz_params.resting_speed_threshold),
             "include_long_cb_as_plateau": bool(drz_params.include_long_cb_as_plateau),
             "include_resting_plateaus": bool(drz_params.include_resting_plateaus),
+            "phase_signed_drz_filter": bool(getattr(drz_params, "phase_signed_drz_filter", True)),
             "cb_plateau_min_duration_ms": float(drz_params.cb_plateau_min_duration_ms),
+            "first_n_minutes": (
+                None
+                if getattr(drz_params, "first_n_minutes", None) is None
+                else float(drz_params.first_n_minutes)
+            ),
             "traversal_merge_gap_s": float(getattr(config.traversal, "traversal_merge_gap_s", 0.0)),
             "session_indices": tuple(config.traversal.session_indices),
             "pf_source_by_category": dict(pf_source_by_category),
@@ -20409,7 +20661,13 @@ def generate_drz_trials_and_dataset(
             "resting_speed_threshold": float(drz_params.resting_speed_threshold),
             "include_long_cb_as_plateau": bool(drz_params.include_long_cb_as_plateau),
             "include_resting_plateaus": bool(drz_params.include_resting_plateaus),
+            "phase_signed_drz_filter": bool(getattr(drz_params, "phase_signed_drz_filter", True)),
             "cb_plateau_min_duration_ms": float(drz_params.cb_plateau_min_duration_ms),
+            "first_n_minutes": (
+                None
+                if getattr(drz_params, "first_n_minutes", None) is None
+                else float(drz_params.first_n_minutes)
+            ),
             "traversal_merge_gap_s": float(getattr(config.traversal, "traversal_merge_gap_s", 0.0)),
             "session_indices": tuple(config.traversal.session_indices),
             "pf_source_by_category": dict(pf_source_by_category),
@@ -20774,6 +21032,1270 @@ def generate_drz_trials_and_dataset(
     return {"plot_summary": plot_summary, "dataset": dataset}
 
 
+def _load_egocentric_npz_summary_lookup(
+    *,
+    results_dir: Path,
+    manifest: list[dict[str, Any]],
+) -> dict[tuple[str, str, int], dict[str, Any]]:
+    lookup: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for manifest_idx, cell_info in enumerate(manifest):
+        npz_path = Path(results_dir) / f"cell_{int(manifest_idx):04d}.npz"
+        if not npz_path.exists():
+            continue
+        try:
+            data = dict(np.load(npz_path, allow_pickle=True))
+        except Exception:
+            continue
+        if str(data.get("status", "")) != "success":
+            continue
+        row: dict[str, Any] = {}
+        for key, val in data.items():
+            if key == "status":
+                continue
+            vv = val.item() if hasattr(val, "item") and getattr(val, "ndim", 1) == 0 else val
+            row[str(key)] = vv
+        cat = str(row.get("category", cell_info.get("category", "")))
+        animal = str(row.get("animal_id", cell_info.get("animal_id", "")))
+        try:
+            cidx = int(row.get("cell_idx", cell_info.get("cell_idx", -1)))
+        except Exception:
+            cidx = -1
+        if (not cat) or (not animal) or cidx < 0:
+            continue
+        lookup[(cat, animal, int(cidx))] = row
+    return lookup
+
+
+def _load_selected_cells_from_egocentric_csplus_svgs(csplus_svg_dir: Path) -> list[tuple[str, int]]:
+    pat = re.compile(r"^(?P<animal>.+)_cell(?P<cell>\d+)_egocentric_summary_any99_3spike\.svg$", re.IGNORECASE)
+    out: list[tuple[str, int]] = []
+    if not Path(csplus_svg_dir).exists():
+        return out
+    for path in sorted(Path(csplus_svg_dir).glob("*.svg")):
+        m = pat.match(path.name)
+        if m is None:
+            continue
+        animal = str(m.group("animal")).strip()
+        try:
+            cell_num_1based = int(m.group("cell"))
+        except Exception:
+            continue
+        if (not animal) or cell_num_1based <= 0:
+            continue
+        out.append((animal, int(cell_num_1based - 1)))
+    # Stable dedupe preserving sort order.
+    seen: set[tuple[str, int]] = set()
+    dedup: list[tuple[str, int]] = []
+    for item in out:
+        if item in seen:
+            continue
+        seen.add(item)
+        dedup.append(item)
+    return dedup
+
+
+def _rebuild_distance_defined_trials_from_all_result(all_result: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(all_result, dict):
+        return []
+    trial_data = dict(all_result.get("trial_data", {}) or {})
+    starts = np.asarray(trial_data.get("epoch_start_frames", []), dtype=int).reshape(-1)
+    ends = np.asarray(trial_data.get("epoch_end_frames", []), dtype=int).reshape(-1)
+    centers = np.asarray(trial_data.get("center_frames", []), dtype=int).reshape(-1)
+    vicinity = np.asarray(trial_data.get("center_vicinity_cm", []), dtype=float).reshape(-1)
+    sess = np.asarray(trial_data.get("session_idx", []), dtype=int).reshape(-1)
+    n_all = np.asarray(trial_data.get("n_spikes_all", []), dtype=int).reshape(-1)
+    n_ss = np.asarray(trial_data.get("n_spikes_ss", []), dtype=int).reshape(-1)
+    n_cs = np.asarray(trial_data.get("n_spikes_cs", []), dtype=int).reshape(-1)
+    nonrest = np.asarray(trial_data.get("nonrest_duration_sec", []), dtype=float).reshape(-1)
+    ttypes = np.asarray(trial_data.get("traversal_types", []), dtype=object).reshape(-1)
+
+    theta_stack = np.asarray(all_result.get("theta_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    slow_stack = np.asarray(all_result.get("slow_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    rate_stack = np.asarray(all_result.get("rate_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    ss_rate_stack = np.asarray(all_result.get("ss_rate_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    cs_rate_stack = np.asarray(all_result.get("cs_rate_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    ss_pct_stack = np.asarray(all_result.get("ss_pct_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    cs_pct_stack = np.asarray(all_result.get("cs_pct_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    plateau_stack = np.asarray(all_result.get("plateau_stack", np.empty((0, 0), dtype=float)), dtype=float)
+    pf_entry_rel = np.asarray(all_result.get("pf_entry_rel", []), dtype=float).reshape(-1)
+    pf_exit_rel = np.asarray(all_result.get("pf_exit_rel", []), dtype=float).reshape(-1)
+    n_plateaus = np.asarray(all_result.get("n_plateaus_per_trial", []), dtype=int).reshape(-1)
+
+    n_trials = int(starts.size)
+    if n_trials <= 0:
+        return []
+    required_1d = [ends, centers, vicinity, sess, n_all, n_ss, n_cs, nonrest, ttypes, pf_entry_rel, pf_exit_rel, n_plateaus]
+    if any(arr.size != n_trials for arr in required_1d):
+        return []
+    required_2d = [theta_stack, slow_stack, rate_stack, ss_rate_stack, cs_rate_stack, ss_pct_stack, cs_pct_stack, plateau_stack]
+    if any(arr.ndim != 2 or arr.shape[0] != n_trials for arr in required_2d):
+        return []
+
+    trials: list[dict[str, Any]] = []
+    for i in range(n_trials):
+        trials.append(
+            {
+                "epoch_start": int(starts[i]),
+                "epoch_end": int(ends[i]),
+                "center_idx": int(centers[i]),
+                "center_vicinity_cm": float(vicinity[i]),
+                "session_idx": int(sess[i]),
+                "traversal_type": str(ttypes[i]) if i < ttypes.size else "unknown",
+                "pf_entry_rel": float(pf_entry_rel[i]),
+                "pf_exit_rel": float(pf_exit_rel[i]),
+                "n_plateaus": int(n_plateaus[i]),
+                "n_spikes_all": int(n_all[i]),
+                "n_spikes_ss": int(n_ss[i]),
+                "n_spikes_cs": int(n_cs[i]),
+                "nonrest_duration_sec": float(nonrest[i]),
+                "theta_trial": np.asarray(theta_stack[i], dtype=float),
+                "slow_trial": np.asarray(slow_stack[i], dtype=float),
+                "rate_trial": np.asarray(rate_stack[i], dtype=float),
+                "ss_rate_trial": np.asarray(ss_rate_stack[i], dtype=float),
+                "cs_rate_trial": np.asarray(cs_rate_stack[i], dtype=float),
+                "ss_pct_trial": np.asarray(ss_pct_stack[i], dtype=float),
+                "cs_pct_trial": np.asarray(cs_pct_stack[i], dtype=float),
+                "plateau_trial": np.asarray(plateau_stack[i], dtype=float),
+            }
+        )
+    return trials
+
+
+def _classify_drz_trials_by_egocentric_green_bins(
+    *,
+    trials: list[dict[str, Any]],
+    x_frames: np.ndarray,
+    y_frames: np.ndarray,
+    hd_frames_rad: np.ndarray,
+    speed_frames: np.ndarray,
+    frame_rate: float,
+    moving_kernel_size: int,
+    moving_speed_threshold: float,
+    moving_min_duration_s: float,
+    moving_merge_gap_s: float,
+    green_maps: dict[str, Any],
+    preferred_half_width_deg: float,
+    preferred_fraction_threshold: float,
+    min_covered_green_bins: int,
+    bin_selection_mode: str = "green",
+    preferred_angle_source: str = "empirical",
+    fit_angle_fallback_to_empirical: bool = True,
+    frame_selection_mode: str = "moving_epochs",
+    resting_speed_threshold: float | None = None,
+    drz_segment_mode: str = "all",
+    phase_signed_drz_filter: bool = True,
+    pf_bins: list[np.ndarray] | tuple[np.ndarray, np.ndarray] | None = None,
+    component_mask: np.ndarray | None = None,
+    reference_rate_map: np.ndarray | None = None,
+    pf_peak_xy: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    n_trials = int(len(trials))
+    labels = np.full(n_trials, "unclassified", dtype=object)
+    overlay_by_trial: list[dict[str, np.ndarray]] = []
+    records: list[dict[str, Any]] = []
+
+    x_arr = np.asarray(x_frames, dtype=float).reshape(-1)
+    y_arr = np.asarray(y_frames, dtype=float).reshape(-1)
+    hd_arr = _wrap_angle_to_pi(np.asarray(hd_frames_rad, dtype=float).reshape(-1))
+    speed_arr = np.asarray(speed_frames, dtype=float).reshape(-1)
+    n_frames = int(x_arr.size)
+    if any(arr.size != n_frames for arr in (y_arr, hd_arr, speed_arr)):
+        for _ in range(n_trials):
+            overlay_by_trial.append(
+                {"x": np.array([], dtype=float), "y": np.array([], dtype=float), "angle": np.array([], dtype=float), "is_green": np.array([], dtype=bool)}
+            )
+        return {
+            "labels": labels,
+            "records": records,
+            "overlay_by_trial": overlay_by_trial,
+            "n_p": 0,
+            "n_np": 0,
+            "n_unclassified": int(n_trials),
+            "classified_indices": np.array([], dtype=int),
+            "p_indices": np.array([], dtype=int),
+            "np_indices": np.array([], dtype=int),
+            "unclassified_indices": np.arange(n_trials, dtype=int),
+        }
+
+    x_edges = np.asarray(green_maps.get("x_edges", np.array([])), dtype=float)
+    y_edges = np.asarray(green_maps.get("y_edges", np.array([])), dtype=float)
+    x_centers = np.asarray(green_maps.get("x_centers", np.array([])), dtype=float).reshape(-1)
+    y_centers = np.asarray(green_maps.get("y_centers", np.array([])), dtype=float).reshape(-1)
+    valid_bin_mask = np.asarray(green_maps.get("valid_bin_mask", np.array([])), dtype=bool)
+    green_bin_mask = np.asarray(green_maps.get("green_bin_mask", np.array([])), dtype=bool)
+    psi_emp_map = np.asarray(green_maps.get("psi_emp_map", np.array([])), dtype=float)
+    psi_fit_map = np.asarray(green_maps.get("psi_fit_map", np.array([])), dtype=float)
+    if x_edges.size < 2 or y_edges.size < 2 or valid_bin_mask.ndim != 2 or green_bin_mask.shape != valid_bin_mask.shape:
+        for _ in range(n_trials):
+            overlay_by_trial.append(
+                {"x": np.array([], dtype=float), "y": np.array([], dtype=float), "angle": np.array([], dtype=float), "is_green": np.array([], dtype=bool)}
+            )
+        return {
+            "labels": labels,
+            "records": records,
+            "overlay_by_trial": overlay_by_trial,
+            "n_p": 0,
+            "n_np": 0,
+            "n_unclassified": int(n_trials),
+            "classified_indices": np.array([], dtype=int),
+            "p_indices": np.array([], dtype=int),
+            "np_indices": np.array([], dtype=int),
+            "unclassified_indices": np.arange(n_trials, dtype=int),
+        }
+    nx, ny = valid_bin_mask.shape
+    if psi_emp_map.shape != (nx, ny):
+        psi_emp_map = np.full((nx, ny), np.nan, dtype=float)
+    if psi_fit_map.shape != (nx, ny):
+        psi_fit_map = np.full((nx, ny), np.nan, dtype=float)
+    if x_centers.size != nx:
+        x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    if y_centers.size != ny:
+        y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+
+    mode_tok = str(bin_selection_mode).strip().lower()
+    if mode_tok in {"all", "all_valid", "valid"}:
+        bin_selection_mode_norm = "all_valid"
+    elif mode_tok in {"green", "green_only"}:
+        bin_selection_mode_norm = "green"
+    else:
+        raise ValueError("bin_selection_mode must be 'green' or 'all_valid'.")
+    ang_tok = str(preferred_angle_source).strip().lower()
+    if ang_tok in {"fit", "fitted", "model_fit"}:
+        preferred_angle_source_norm = "fit"
+    elif ang_tok in {"emp", "empirical", "data"}:
+        preferred_angle_source_norm = "empirical"
+    else:
+        raise ValueError("preferred_angle_source must be 'empirical' or 'fit'.")
+    if bin_selection_mode_norm == "all_valid":
+        coverage_bin_mask = np.asarray(valid_bin_mask, dtype=bool)
+    else:
+        coverage_bin_mask = np.asarray(green_bin_mask, dtype=bool)
+    if preferred_angle_source_norm == "fit":
+        theta_pref_map = np.asarray(psi_fit_map, dtype=float)
+        if bool(fit_angle_fallback_to_empirical):
+            bad = ~np.isfinite(theta_pref_map)
+            if np.any(bad):
+                theta_pref_map = np.asarray(theta_pref_map, dtype=float)
+                theta_pref_map[bad] = np.asarray(psi_emp_map, dtype=float)[bad]
+    else:
+        theta_pref_map = np.asarray(psi_emp_map, dtype=float)
+
+    drz_seg_tok = str(drz_segment_mode).strip().lower()
+    if drz_seg_tok in {"all", "full", "whole"}:
+        drz_segment_mode_norm = "all"
+    elif drz_seg_tok in {"approach_negative", "approach", "drz_negative", "negative"}:
+        drz_segment_mode_norm = "approach_negative"
+    else:
+        raise ValueError("drz_segment_mode must be 'all' or 'approach_negative'.")
+    need_trial_drz = bool(phase_signed_drz_filter) or (drz_segment_mode_norm == "approach_negative")
+    if need_trial_drz:
+        if (
+            pf_bins is None
+            or component_mask is None
+            or reference_rate_map is None
+            or pf_peak_xy is None
+        ):
+            raise ValueError(
+                "pf_bins/component_mask/reference_rate_map/pf_peak_xy are required "
+                "when using DRZ-sign segment filters."
+            )
+        comp_mask_arr = np.asarray(component_mask, dtype=bool)
+        ref_map_arr = np.asarray(reference_rate_map, dtype=float)
+        if comp_mask_arr.ndim != 2 or ref_map_arr.shape != comp_mask_arr.shape:
+            raise ValueError(
+                "component_mask and reference_rate_map must be 2D arrays with matching shapes "
+                "when using DRZ-sign segment filters."
+            )
+        if (
+            not isinstance(pf_peak_xy, (tuple, list))
+            or len(pf_peak_xy) != 2
+            or (not np.isfinite(float(pf_peak_xy[0])))
+            or (not np.isfinite(float(pf_peak_xy[1])))
+        ):
+            raise ValueError("pf_peak_xy must be a finite (x, y) pair when using DRZ-sign segment filters.")
+        pf_bins_use = [
+            np.asarray(pf_bins[0], dtype=float),
+            np.asarray(pf_bins[1], dtype=float),
+        ]
+        if pf_bins_use[0].ndim != 1 or pf_bins_use[1].ndim != 1 or pf_bins_use[0].size < 2 or pf_bins_use[1].size < 2:
+            raise ValueError("pf_bins must contain two 1D edge arrays when using DRZ-sign segment filters.")
+    else:
+        pf_bins_use = None
+        comp_mask_arr = None
+        ref_map_arr = None
+
+    valid_frame_mask = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(hd_arr) & np.isfinite(speed_arr)
+    frame_mode_tok = str(frame_selection_mode).strip().lower()
+    if frame_mode_tok in {"moving", "moving_epoch", "moving_epochs"}:
+        moving_kernel = max(3, int(moving_kernel_size))
+        if moving_kernel % 2 == 0:
+            moving_kernel += 1
+        _, _, moving_idx_raw = core._compute_moving_epochs(
+            speed=np.asarray(speed_arr, dtype=float),
+            frame_rate=float(frame_rate),
+            kernel_size=int(moving_kernel),
+            filter_type="median",
+            speed_threshold=float(moving_speed_threshold),
+            min_duration_s=float(max(0.0, moving_min_duration_s)),
+            merge_gap_s=float(max(0.0, moving_merge_gap_s)),
+        )
+        moving_mask = np.zeros(n_frames, dtype=bool)
+        moving_idx_raw = np.asarray(moving_idx_raw, dtype=int)
+        moving_idx_raw = moving_idx_raw[(moving_idx_raw >= 0) & (moving_idx_raw < n_frames)]
+        moving_mask[moving_idx_raw] = True
+        frame_keep_mask = moving_mask & valid_frame_mask
+        frame_selection_mode_norm = "moving_epochs"
+        frame_speed_threshold_used = float(moving_speed_threshold)
+    elif frame_mode_tok in {"nonrest", "non_rest", "all_nonrest", "all_non_rest"}:
+        rest_thr = float(
+            moving_speed_threshold if resting_speed_threshold is None else resting_speed_threshold
+        )
+        frame_keep_mask = valid_frame_mask & (np.asarray(speed_arr, dtype=float) >= float(rest_thr))
+        frame_selection_mode_norm = "nonrest"
+        frame_speed_threshold_used = float(rest_thr)
+    else:
+        raise ValueError("frame_selection_mode must be 'moving_epochs' or 'nonrest'.")
+
+    half_width_rad = float(np.deg2rad(float(preferred_half_width_deg)))
+    frac_thr = float(np.clip(float(preferred_fraction_threshold), 0.0, 1.0))
+    min_cov = int(max(0, int(min_covered_green_bins)))
+
+    for trial_idx, tr in enumerate(trials):
+        start = int(tr.get("epoch_start", -1))
+        end = int(tr.get("epoch_end", -1))
+        if (start < 0) or (end <= start) or (start >= n_frames):
+            overlay_by_trial.append(
+                {"x": np.array([], dtype=float), "y": np.array([], dtype=float), "angle": np.array([], dtype=float), "is_green": np.array([], dtype=bool)}
+            )
+            records.append(
+                {
+                    "trial_idx": int(trial_idx),
+                    "label": "unclassified",
+                    "covered_bins": 0,
+                    "preferred_bins": 0,
+                    "covered_green_bins": 0,
+                    "preferred_green_bins": 0,
+                    "preferred_fraction": np.nan,
+                }
+            )
+            continue
+        end = int(min(end, n_frames))
+        idx = np.arange(start, end, dtype=int)
+        keep = np.asarray(frame_keep_mask[start:end], dtype=bool)
+        trial_drz: np.ndarray | None = None
+        if need_trial_drz:
+            trial_drz = _compute_drz_values_for_positions(
+                np.asarray(x_arr[start:end], dtype=float),
+                np.asarray(y_arr[start:end], dtype=float),
+                pf_bins=pf_bins_use,
+                component_mask=np.asarray(comp_mask_arr, dtype=bool),
+                reference_rate_map=np.asarray(ref_map_arr, dtype=float),
+                pf_peak_xy=(float(pf_peak_xy[0]), float(pf_peak_xy[1])),
+            )
+            trial_drz = np.asarray(trial_drz, dtype=float).reshape(-1)
+            if trial_drz.size != keep.size:
+                keep = np.zeros_like(keep, dtype=bool)
+            elif bool(phase_signed_drz_filter):
+                center_local = int(int(tr.get("center_idx", -1)) - int(start))
+                if center_local < 0 or center_local >= int(keep.size):
+                    keep = np.zeros_like(keep, dtype=bool)
+                else:
+                    phase_mask = np.zeros(int(keep.size), dtype=bool)
+                    idx_local = np.arange(int(keep.size), dtype=int)
+                    pre_mask = idx_local < int(center_local)
+                    post_mask = idx_local > int(center_local)
+                    phase_mask[pre_mask] = np.asarray(trial_drz[pre_mask], dtype=float) < 0.0
+                    phase_mask[post_mask] = np.asarray(trial_drz[post_mask], dtype=float) > 0.0
+                    phase_mask[int(center_local)] = np.isfinite(np.asarray(trial_drz, dtype=float)[int(center_local)])
+                    keep &= np.asarray(phase_mask, dtype=bool)
+            elif drz_segment_mode_norm == "approach_negative":
+                keep &= np.isfinite(trial_drz) & (trial_drz < 0.0)
+        if idx.size <= 0 or not np.any(keep):
+            overlay_by_trial.append(
+                {"x": np.array([], dtype=float), "y": np.array([], dtype=float), "angle": np.array([], dtype=float), "is_green": np.array([], dtype=bool)}
+            )
+            records.append(
+                {
+                    "trial_idx": int(trial_idx),
+                    "label": "unclassified",
+                    "covered_bins": 0,
+                    "preferred_bins": 0,
+                    "covered_green_bins": 0,
+                    "preferred_green_bins": 0,
+                    "preferred_fraction": np.nan,
+                }
+            )
+            continue
+
+        xs = np.asarray(x_arr[start:end][keep], dtype=float)
+        ys = np.asarray(y_arr[start:end][keep], dtype=float)
+        hs = np.asarray(hd_arr[start:end][keep], dtype=float)
+        xi = _digitize_with_upper_edge_inclusive(xs, x_edges)
+        yi = _digitize_with_upper_edge_inclusive(ys, y_edges)
+        in_bounds = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(hs) & (xi >= 0) & (yi >= 0) & (xi < nx) & (yi < ny)
+        if not np.any(in_bounds):
+            overlay_by_trial.append(
+                {"x": np.array([], dtype=float), "y": np.array([], dtype=float), "angle": np.array([], dtype=float), "is_green": np.array([], dtype=bool)}
+            )
+            records.append(
+                {
+                    "trial_idx": int(trial_idx),
+                    "label": "unclassified",
+                    "covered_bins": 0,
+                    "preferred_bins": 0,
+                    "covered_green_bins": 0,
+                    "preferred_green_bins": 0,
+                    "preferred_fraction": np.nan,
+                }
+            )
+            continue
+        ii = xi[in_bounds].astype(int)
+        jj = yi[in_bounds].astype(int)
+        hh = hs[in_bounds]
+
+        overlay_x: list[float] = []
+        overlay_y: list[float] = []
+        overlay_ang: list[float] = []
+        overlay_green: list[bool] = []
+        covered_bins = 0
+        preferred_bins = 0
+        flat_ids = ii * ny + jj
+        for flat_id in np.unique(flat_ids):
+            bx = int(flat_id // ny)
+            by = int(flat_id % ny)
+            sel = flat_ids == flat_id
+            xs_bin = np.asarray(xs[sel], dtype=float)
+            ys_bin = np.asarray(ys[sel], dtype=float)
+            hh_bin = np.asarray(hh[sel], dtype=float)
+            hh_bin = hh_bin[np.isfinite(hh_bin)]
+            if hh_bin.size <= 0:
+                continue
+            mean_hd = float(np.angle(np.nanmean(np.exp(1j * hh_bin))))
+            if bool(valid_bin_mask[bx, by]):
+                cx = float(x_centers[bx])
+                cy = float(y_centers[by])
+                if xs_bin.size > 0 and ys_bin.size > 0:
+                    xy_ok = np.isfinite(xs_bin) & np.isfinite(ys_bin)
+                    if np.any(xy_ok):
+                        dx = np.asarray(xs_bin[xy_ok], dtype=float) - cx
+                        dy = np.asarray(ys_bin[xy_ok], dtype=float) - cy
+                        d2 = dx * dx + dy * dy
+                        k = int(np.nanargmin(d2))
+                        px = float(np.asarray(xs_bin[xy_ok], dtype=float)[k])
+                        py = float(np.asarray(ys_bin[xy_ok], dtype=float)[k])
+                    else:
+                        px, py = cx, cy
+                else:
+                    px, py = cx, cy
+                overlay_x.append(px)
+                overlay_y.append(py)
+                overlay_ang.append(float(mean_hd))
+                overlay_green.append(bool(coverage_bin_mask[bx, by]))
+            if not bool(coverage_bin_mask[bx, by]):
+                continue
+            theta_pref = float(theta_pref_map[bx, by])
+            if not np.isfinite(theta_pref):
+                continue
+            covered_bins += 1
+            if abs(float(_wrap_angle_to_pi(mean_hd - theta_pref))) <= (half_width_rad + 1e-12):
+                preferred_bins += 1
+
+        if int(covered_bins) < int(min_cov):
+            label = "unclassified"
+            pref_fraction = np.nan
+        else:
+            pref_fraction = float(preferred_bins) / float(max(1, covered_bins))
+            label = "p" if pref_fraction >= float(frac_thr) else "np"
+        labels[int(trial_idx)] = str(label)
+        records.append(
+            {
+                "trial_idx": int(trial_idx),
+                "label": str(label),
+                "covered_bins": int(covered_bins),
+                "preferred_bins": int(preferred_bins),
+                "covered_green_bins": int(covered_bins),
+                "preferred_green_bins": int(preferred_bins),
+                "preferred_fraction": float(pref_fraction) if np.isfinite(pref_fraction) else np.nan,
+            }
+        )
+        overlay_by_trial.append(
+            {
+                "x": np.asarray(overlay_x, dtype=float),
+                "y": np.asarray(overlay_y, dtype=float),
+                "angle": np.asarray(overlay_ang, dtype=float),
+                "is_green": np.asarray(overlay_green, dtype=bool),
+            }
+        )
+
+    p_indices = np.where(labels == "p")[0].astype(int)
+    np_indices = np.where(labels == "np")[0].astype(int)
+    classified_indices = np.where((labels == "p") | (labels == "np"))[0].astype(int)
+    unclassified_indices = np.where(labels == "unclassified")[0].astype(int)
+    return {
+        "labels": np.asarray(labels, dtype=object),
+        "records": records,
+        "overlay_by_trial": overlay_by_trial,
+        "bin_selection_mode": str(bin_selection_mode_norm),
+        "preferred_angle_source": str(preferred_angle_source_norm),
+        "fit_angle_fallback_to_empirical": bool(fit_angle_fallback_to_empirical),
+        "frame_selection_mode": str(frame_selection_mode_norm),
+        "frame_speed_threshold_used": float(frame_speed_threshold_used),
+        "drz_segment_mode": str(drz_segment_mode_norm),
+        "phase_signed_drz_filter": bool(phase_signed_drz_filter),
+        "n_p": int(p_indices.size),
+        "n_np": int(np_indices.size),
+        "n_unclassified": int(unclassified_indices.size),
+        "classified_indices": np.asarray(classified_indices, dtype=int),
+        "p_indices": np.asarray(p_indices, dtype=int),
+        "np_indices": np.asarray(np_indices, dtype=int),
+        "unclassified_indices": np.asarray(unclassified_indices, dtype=int),
+    }
+
+
+def _add_egocentric_reference_panel_to_drz_figure(
+    *,
+    fig: Any,
+    axes: Any,
+    local_tuning_all: dict[str, Any] | None,
+    arrow_fields_all: dict[str, Any] | None,
+) -> None:
+    if fig is None or axes is None:
+        return
+    try:
+        axes_arr = np.asarray(axes, dtype=object)
+    except Exception:
+        return
+    if axes_arr.ndim != 2 or axes_arr.shape[0] < 1 or axes_arr.shape[1] < 2:
+        return
+    top_traj_ax = axes_arr[0, 1]
+    if top_traj_ax is None:
+        return
+    try:
+        bbox = top_traj_ax.get_position(fig)
+    except Exception:
+        return
+    inset_h = float(min(0.13, max(0.06, 0.85 * float(bbox.height))))
+    inset_w = float(max(0.10, float(bbox.width)))
+    inset_x = float(bbox.x0)
+    inset_y = float(min(0.99 - inset_h, float(bbox.y1) + 0.006))
+    if not (np.isfinite(inset_x) and np.isfinite(inset_y) and np.isfinite(inset_w) and np.isfinite(inset_h)):
+        return
+    if inset_w <= 0 or inset_h <= 0:
+        return
+    parent_ax = fig.add_axes([inset_x, inset_y, inset_w, inset_h])
+    _plot_egocentric_bin_polar_grid_panel(
+        fig=fig,
+        parent_ax=parent_ax,
+        local_tuning=local_tuning_all,
+        arrow_fields=arrow_fields_all,
+        title="Bin polar emp-only (All)",
+        variant="empirical_only_pm45",
+    )
+
+
+def generate_drz_trials_and_dataset_egocentric_preferred_nonpreferred(
+    config: PipelineConfig,
+    spatial_data: Any,
+    drz_params: PFDRZParams | None = None,
+    *,
+    egocentric_base_dir: str | Path | None = None,
+    csplus_svg_dir: str | Path | None = None,
+    manifest_path: str | Path | None = None,
+    all_run_name: str = "head_all_spike",
+    figure_save_folder: str | Path | None = None,
+    pf_ranks: tuple[int, ...] = (1, 2),
+    clear_output: bool = True,
+    save_summary_csv: bool = True,
+    show_plots: bool = False,
+    show_rest_patches: bool = True,
+    trace_slow_gap: float = 1.0,
+    theta_slow_pad_factor: float = 0.05,
+    sharey: bool = True,
+    max_plot_trial_duration_s: float = 20.0,
+    plot_figures: bool = True,
+    pf_reliability_dilation_bins: int | None = None,
+    pf_reliability_dilation_shape: str | None = None,
+    preferred_fraction_threshold: float = 0.5,
+    preferred_half_width_deg: float = 50.0,
+    min_covered_green_bins: int = 1,
+    traversal_bin_selection_mode: str = "all_valid",
+    preferred_angle_source: str = "fit",
+    fit_angle_fallback_to_empirical: bool = True,
+    classification_frame_selection_mode: str = "nonrest",
+    classification_drz_segment_mode: str = "all",
+    classification_phase_signed_drz_filter: bool = True,
+    min_valid_traversal_duration_s: float = 1.0,
+    debug_mode: bool = False,
+) -> dict[str, Any]:
+    import pandas as pd
+
+    if drz_params is None:
+        drz_params = PFDRZParams()
+    preferred_fraction_threshold = float(np.clip(float(preferred_fraction_threshold), 0.0, 1.0))
+    preferred_half_width_deg = float(max(0.0, preferred_half_width_deg))
+    min_covered_green_bins = int(max(0, int(min_covered_green_bins)))
+    traversal_bin_selection_mode = str(traversal_bin_selection_mode).strip().lower()
+    preferred_angle_source = str(preferred_angle_source).strip().lower()
+    fit_angle_fallback_to_empirical = bool(fit_angle_fallback_to_empirical)
+    classification_frame_selection_mode = str(classification_frame_selection_mode).strip().lower()
+    classification_drz_segment_mode = str(classification_drz_segment_mode).strip().lower()
+    if classification_drz_segment_mode in {"all", "full", "whole"}:
+        classification_drz_segment_mode = "all"
+    elif classification_drz_segment_mode in {"approach_negative", "approach", "drz_negative", "negative"}:
+        classification_drz_segment_mode = "approach_negative"
+    else:
+        raise ValueError("classification_drz_segment_mode must be 'all' or 'approach_negative'.")
+    classification_phase_signed_drz_filter = bool(classification_phase_signed_drz_filter)
+    min_valid_traversal_duration_s = float(max(0.0, float(min_valid_traversal_duration_s)))
+    trial_max_plot_duration_s = float(max_plot_trial_duration_s)
+    if (not np.isfinite(trial_max_plot_duration_s)) or (trial_max_plot_duration_s <= 0):
+        raise ValueError("max_plot_trial_duration_s must be > 0.")
+    dilation_bins = int(
+        config.place_cell.pf_reliability_dilation_bins
+        if pf_reliability_dilation_bins is None
+        else pf_reliability_dilation_bins
+    )
+    dilation_shape = str(
+        config.place_cell.pf_reliability_dilation_shape
+        if pf_reliability_dilation_shape is None
+        else pf_reliability_dilation_shape
+    ).strip().lower()
+    if dilation_bins < 0:
+        raise ValueError("pf_reliability_dilation_bins must be >= 0.")
+    if dilation_shape not in {"disk", "square", "manhattan"}:
+        raise ValueError("pf_reliability_dilation_shape must be one of: disk, square, manhattan.")
+
+    if egocentric_base_dir is None:
+        egocentric_base = Path(config.data_root) / "egocentric_tuning_carpenter"
+    else:
+        egocentric_base = Path(egocentric_base_dir)
+    if manifest_path is None:
+        manifest_file = egocentric_base / "manifest.json"
+    else:
+        manifest_file = Path(manifest_path)
+    if csplus_svg_dir is None:
+        csplus_dir = egocentric_base / "head_any99_three_spike_compare" / "per_cell_summary" / "CSplus"
+    else:
+        csplus_dir = Path(csplus_svg_dir)
+    all_run_results_dir = egocentric_base / str(all_run_name) / "per_cell_results"
+
+    if figure_save_folder is None:
+        figure_root = egocentric_base / "head_any99_three_spike_compare" / "drz_preferred_nonpreferred"
+    else:
+        figure_root = Path(figure_save_folder)
+    out_dir = figure_root / "PF_drz_trials_CSplus_PLCs_egocentric_pnp"
+    summary_csv = figure_root / "PF_drz_trials_csplus_egocentric_pnp_summary.csv"
+    if bool(plot_figures):
+        if bool(clear_output) and out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    elif bool(save_summary_csv):
+        figure_root.mkdir(parents=True, exist_ok=True)
+
+    if not manifest_file.exists():
+        raise FileNotFoundError(f"Missing egocentric manifest: {manifest_file}")
+    with open(manifest_file, "r") as f:
+        manifest = json.load(f)
+    if not isinstance(manifest, list):
+        raise ValueError(f"Invalid manifest format in {manifest_file}")
+    lookup_all = _load_egocentric_npz_summary_lookup(results_dir=all_run_results_dir, manifest=manifest)
+    selected_cells = _load_selected_cells_from_egocentric_csplus_svgs(csplus_dir)
+
+    runtime_cache: dict[str, dict[str, Any]] = {}
+    ctx_cache: dict[str, dict[str, Any]] = {}
+    plot_cell_cache: dict[tuple[str, int], dict[str, Any]] = {}
+
+    ego_plot_params = EgocentricSummaryPlotParams(
+        categories=("CSplus",),
+        first_n_minutes=10.0,
+        direction_mode="head",
+        time_bin_s=0.1,
+        arena_size_cm=(35.5, 20.0),
+        speed_min_cm_s=3.0,
+        speed_max_cm_s=60.0,
+        local_spatial_bin_cm=5.0,
+        n_angle_bins=10,
+        occupancy_threshold_s=0.2,
+        min_occupied_angle_bins=3,
+        min_mean_rate_hz=0.5,
+        only_plot_spikes_in_valid_spatial_bins=False,
+        travel_smooth_window=5,
+        travel_min_step=0.0,
+        theta_freqs=tuple(config.analysis.theta_freqs),
+        slow_freqs=float(config.analysis.slow_freqs),
+        theta_slow_speed_threshold=float(config.analysis.speed_threshold),
+        theta_slow_kernel_size=int(config.analysis.kernel_size),
+        theta_slow_min_duration_s=float(config.analysis.min_duration_s),
+        theta_slow_merge_gap_s=float(config.analysis.merge_gap_s),
+        save_formats=("svg",),
+        clear_output=False,
+    )
+
+    dataset: dict[str, Any] = {
+        "metadata": {
+            "axis_mode": "drz",
+            "analysis_mode": "egocentric_green_bin_pnp",
+            "categories": ("CSplus",),
+            "pf_ranks": tuple(int(r) for r in pf_ranks),
+            "selected_cell_source": str(csplus_dir),
+            "n_selected_cells": int(len(selected_cells)),
+            "preferred_fraction_threshold": float(preferred_fraction_threshold),
+            "preferred_half_width_deg": float(preferred_half_width_deg),
+            "min_covered_green_bins": int(min_covered_green_bins),
+            "traversal_bin_selection_mode": str(traversal_bin_selection_mode),
+            "preferred_angle_source": str(preferred_angle_source),
+            "fit_angle_fallback_to_empirical": bool(fit_angle_fallback_to_empirical),
+            "classification_frame_selection_mode": str(classification_frame_selection_mode),
+            "classification_drz_segment_mode": str(classification_drz_segment_mode),
+            "classification_phase_signed_drz_filter": bool(classification_phase_signed_drz_filter),
+            "classification_resting_speed_threshold": float(drz_params.resting_speed_threshold),
+            "first_n_minutes": (
+                None
+                if getattr(drz_params, "first_n_minutes", None) is None
+                else float(drz_params.first_n_minutes)
+            ),
+            "min_valid_traversal_duration_s": float(min_valid_traversal_duration_s),
+            "green_source": "egocentric_empirical_panel_row1",
+            "trial_distance_window_cm": float(drz_params.trial_distance_window_cm),
+            "trial_detection_window_cm": float(drz_params.trial_detection_window_cm),
+            "trial_clip_mode": str(_normalize_drz_trial_clip_mode(drz_params.trial_clip_mode)),
+            "drz_window": float(drz_params.drz_window),
+            "drz_bin": float(drz_params.drz_bin),
+            "distance_mode": str(drz_params.distance_mode),
+            "dilation_bins": int(dilation_bins),
+            "dilation_shape": str(dilation_shape),
+            "max_plot_trial_duration_s": float(trial_max_plot_duration_s),
+            "debug_mode": bool(debug_mode),
+        }
+    }
+    summary_rows: list[dict[str, Any]] = []
+    category_payload: dict[int, dict[str, Any]] = {}
+
+    for pf_rank in pf_ranks:
+        entries: list[dict[str, Any]] = []
+        rel_ref: np.ndarray | None = None
+        skipped = 0
+        for animal_id, cell_idx in selected_cells:
+            fig = None
+            try:
+                if animal_id not in runtime_cache:
+                    runtime_cache[animal_id] = _build_trial_plot_runtime_payload(animal_id, config)
+                    ctx_cache[animal_id] = _prepare_native_analysis_context(runtime_cache[animal_id]["merged"], config)
+                runtime = runtime_cache[animal_id]
+                ctx = ctx_cache[animal_id]
+                merged = runtime["merged"]
+                spatial_by_idx = runtime["spatial_by_idx"]
+                analysis = spatial_by_idx.get(int(cell_idx))
+                if not isinstance(analysis, dict):
+                    skipped += 1
+                    continue
+
+                bad_timepoints = (
+                    runtime["bad_masks"][cell_idx]
+                    if isinstance(runtime["bad_masks"], np.ndarray) and cell_idx < len(runtime["bad_masks"])
+                    else None
+                )
+                bad_mask = None
+                if bad_timepoints is not None:
+                    bad_mask = np.asarray(bad_timepoints, dtype=bool)
+                    if bad_mask.shape[0] != np.asarray(merged["x_neural"]).shape[0]:
+                        bad_mask = None
+                raw_bad_mask = None
+                traces_raw_source = merged.get("traces", None)
+                if traces_raw_source is not None and cell_idx < len(traces_raw_source):
+                    raw_trace = np.asarray(traces_raw_source[cell_idx], dtype=float)
+                    if raw_trace.ndim == 1 and raw_trace.shape[0] == np.asarray(merged["x_neural"]).shape[0]:
+                        raw_bad_mask = ~np.isfinite(raw_trace)
+                traversal_bad_mask = None
+                if bad_mask is not None and raw_bad_mask is not None:
+                    traversal_bad_mask = bad_mask | raw_bad_mask
+                elif bad_mask is not None:
+                    traversal_bad_mask = bad_mask
+                elif raw_bad_mask is not None:
+                    traversal_bad_mask = raw_bad_mask
+
+                result_obj = compute_drz_component_result_iterative(
+                    animal_id=str(animal_id),
+                    cell_idx=int(cell_idx),
+                    pf_rank=int(pf_rank),
+                    runtime=runtime,
+                    config=config,
+                    drz_params=drz_params,
+                    dilation_bins=int(dilation_bins),
+                    dilation_shape=str(dilation_shape),
+                    pf_source_mode="all",
+                    bad_frame_mask=traversal_bad_mask,
+                    min_traversals=1,
+                )
+                if result_obj is None:
+                    skipped += 1
+                    continue
+                rel = np.asarray(result_obj.get("distance_rel", []), dtype=float)
+                if rel.size == 0:
+                    skipped += 1
+                    continue
+                if rel_ref is None:
+                    rel_ref = rel
+                elif len(rel_ref) != len(rel):
+                    skipped += 1
+                    continue
+
+                analysis_for_plot = dict(analysis)
+                analysis_params_for_plot = (
+                    dict(analysis.get("params", {})) if isinstance(analysis.get("params", {}), dict) else {}
+                )
+                analysis_params_for_plot["smooth_sigma"] = float(config.place_cell.smooth_sigma)
+                analysis_params_for_plot["occ_smooth_sigma"] = float(config.place_cell.occ_smooth_sigma)
+                analysis_for_plot["params"] = analysis_params_for_plot
+
+                if bad_mask is None:
+                    bad_mask = np.zeros(int(len(np.asarray(ctx.get("x_neural", []), dtype=float))), dtype=bool)
+                plot_data = _extract_egocentric_plot_timeseries(
+                    ctx=ctx,
+                    cell_idx=int(cell_idx),
+                    bad_mask=np.asarray(bad_mask, dtype=bool),
+                    analysis=analysis_for_plot,
+                    params=ego_plot_params,
+                )
+                row_all = lookup_all.get(("CSplus", str(animal_id), int(cell_idx)))
+                row_all = _filter_egocentric_summary_row_for_tuning_decision(
+                    row_all,
+                    local_tuning=plot_data.get("local_tuning_all"),
+                    min_valid_bins=5,
+                )
+                fit_info = _resolve_plot_fit_params(
+                    local_tuning=plot_data.get("local_tuning_all"),
+                    summary_row=row_all,
+                )
+                arrow_fields_all = _compute_spatial_arrow_fields(
+                    local_tuning=plot_data.get("local_tuning_all"),
+                    fit_info=fit_info,
+                    params=ego_plot_params,
+                )
+                green_maps = _compute_empirical_only_green_bin_maps(
+                    local_tuning=plot_data.get("local_tuning_all"),
+                    arrow_fields=arrow_fields_all,
+                    zone_half_width_deg=float(preferred_half_width_deg),
+                    inside_frac_threshold=0.4,
+                    mean_rate_min_hz=0.5,
+                )
+                if not bool(green_maps.get("ok", False)):
+                    skipped += 1
+                    continue
+
+                all_trials = _rebuild_distance_defined_trials_from_all_result(dict(result_obj.get("all", {})))
+                if len(all_trials) > 0 and float(min_valid_traversal_duration_s) > 0.0:
+                    min_frames = int(np.ceil(float(min_valid_traversal_duration_s) * float(merged["frame_rate"])))
+                    if min_frames > 1:
+                        all_trials = [
+                            tr
+                            for tr in all_trials
+                            if int(tr.get("epoch_end", -1)) > int(tr.get("epoch_start", -1))
+                            and (int(tr.get("epoch_end", -1)) - int(tr.get("epoch_start", -1))) >= int(min_frames)
+                        ]
+                if len(all_trials) <= 0:
+                    skipped += 1
+                    continue
+                hd_frames = _coerce_hd_to_radians_wrapped(
+                    np.asarray(merged.get("hd_angles_neural", np.full_like(np.asarray(merged["x_neural"], dtype=float), np.nan)), dtype=float)
+                )
+                class_out = _classify_drz_trials_by_egocentric_green_bins(
+                    trials=all_trials,
+                    x_frames=np.asarray(plot_data.get("x_frames", np.array([])), dtype=float),
+                    y_frames=np.asarray(plot_data.get("y_frames", np.array([])), dtype=float),
+                    hd_frames_rad=np.asarray(hd_frames, dtype=float),
+                    speed_frames=np.asarray(plot_data.get("speed_frames", np.array([])), dtype=float),
+                    frame_rate=float(merged["frame_rate"]),
+                    moving_kernel_size=int(config.analysis.kernel_size),
+                    moving_speed_threshold=float(drz_params.moving_speed_threshold),
+                    moving_min_duration_s=float(config.analysis.min_duration_s),
+                    moving_merge_gap_s=float(getattr(config.traversal, "traversal_merge_gap_s", 0.0)),
+                    green_maps=green_maps,
+                    preferred_half_width_deg=float(preferred_half_width_deg),
+                    preferred_fraction_threshold=float(preferred_fraction_threshold),
+                    min_covered_green_bins=int(min_covered_green_bins),
+                    bin_selection_mode=str(traversal_bin_selection_mode),
+                    preferred_angle_source=str(preferred_angle_source),
+                    fit_angle_fallback_to_empirical=bool(fit_angle_fallback_to_empirical),
+                    frame_selection_mode=str(classification_frame_selection_mode),
+                    resting_speed_threshold=float(drz_params.resting_speed_threshold),
+                    drz_segment_mode=str(classification_drz_segment_mode),
+                    phase_signed_drz_filter=bool(classification_phase_signed_drz_filter),
+                    pf_bins=result_obj.get("pf_bins", None),
+                    component_mask=np.asarray(result_obj.get("place_field_mask", []), dtype=bool),
+                    reference_rate_map=np.asarray(result_obj.get("rate_map", []), dtype=float),
+                    pf_peak_xy=result_obj.get("pf_peak_xy", None),
+                )
+
+                labels = np.asarray(class_out.get("labels", np.array([], dtype=object)), dtype=object)
+                if labels.size != len(all_trials):
+                    labels = np.full(len(all_trials), "unclassified", dtype=object)
+                classified_trials: list[dict[str, Any]] = []
+                p_trials: list[dict[str, Any]] = []
+                np_trials: list[dict[str, Any]] = []
+                for i, tr in enumerate(all_trials):
+                    lbl = str(labels[i]).strip().lower()
+                    if lbl not in {"p", "np"}:
+                        continue
+                    tr_cls = dict(tr)
+                    tr_cls["traversal_type"] = str(lbl)
+                    classified_trials.append(tr_cls)
+                    if lbl == "p":
+                        p_trials.append(tr_cls)
+                    else:
+                        np_trials.append(tr_cls)
+
+                frame_rate_local = float(merged["frame_rate"])
+                result_all_classified = _aggregate_distance_defined_trials(classified_trials, rel, frame_rate_local)
+                result_p = _aggregate_distance_defined_trials(p_trials, rel, frame_rate_local)
+                result_np = _aggregate_distance_defined_trials(np_trials, rel, frame_rate_local)
+
+                result_pnp = dict(result_obj)
+                result_pnp["all_detected"] = dict(result_obj.get("all", {}))
+                result_pnp["all"] = result_all_classified
+                result_pnp["p"] = result_p
+                result_pnp["np"] = result_np
+                result_pnp["classification"] = {
+                    "preferred_fraction_threshold": float(preferred_fraction_threshold),
+                    "preferred_half_width_deg": float(preferred_half_width_deg),
+                    "min_covered_green_bins": int(min_covered_green_bins),
+                    "traversal_bin_selection_mode": str(class_out.get("bin_selection_mode", traversal_bin_selection_mode)),
+                    "preferred_angle_source": str(class_out.get("preferred_angle_source", preferred_angle_source)),
+                    "fit_angle_fallback_to_empirical": bool(
+                        class_out.get("fit_angle_fallback_to_empirical", fit_angle_fallback_to_empirical)
+                    ),
+                    "frame_selection_mode": str(
+                        class_out.get("frame_selection_mode", classification_frame_selection_mode)
+                    ),
+                    "frame_speed_threshold_used": float(
+                        class_out.get("frame_speed_threshold_used", np.nan)
+                    ),
+                    "drz_segment_mode": str(
+                        class_out.get("drz_segment_mode", classification_drz_segment_mode)
+                    ),
+                    "phase_signed_drz_filter": bool(
+                        class_out.get("phase_signed_drz_filter", classification_phase_signed_drz_filter)
+                    ),
+                    "min_valid_traversal_duration_s": float(min_valid_traversal_duration_s),
+                    "labels": np.asarray(labels, dtype=object),
+                    "records": list(class_out.get("records", [])),
+                    "n_detected": int(len(all_trials)),
+                    "n_classified": int(len(classified_trials)),
+                    "n_p": int(len(p_trials)),
+                    "n_np": int(len(np_trials)),
+                    "n_unclassified": int(len(all_trials) - len(classified_trials)),
+                }
+                entries.append(
+                    {
+                        "session": str(animal_id),
+                        "cell_idx": int(cell_idx),
+                        "pf_rank": int(pf_rank),
+                        "pf_source": str(result_obj.get("pf_source", "all")),
+                        "data": result_pnp,
+                    }
+                )
+
+                n_detected = int(len(all_trials))
+                n_classified = int(len(classified_trials))
+                n_p = int(len(p_trials))
+                n_np = int(len(np_trials))
+                n_unclassified = int(n_detected - n_classified)
+                status = "dataset_only"
+                message = ""
+
+                if bool(plot_figures):
+                    if n_classified > 0:
+                        plot_cell_key = (str(animal_id), int(cell_idx))
+                        if plot_cell_key not in plot_cell_cache:
+                            plot_cell_cache[plot_cell_key] = _prepare_drz_trial_plot_cell_payload(
+                                runtime=runtime,
+                                cell_idx=int(cell_idx),
+                                config=config,
+                                drz_params=drz_params,
+                            )
+                        plot_payload = plot_cell_cache[plot_cell_key]
+                        trial_data_cls = dict(result_all_classified.get("trial_data", {}) or {})
+                        starts_cls = np.asarray(trial_data_cls.get("epoch_start_frames", []), dtype=int)
+                        ends_cls = np.asarray(trial_data_cls.get("epoch_end_frames", []), dtype=int)
+                        traversal_epochs = list(zip(starts_cls.tolist(), ends_cls.tolist()))
+                        traversal_types = list(np.asarray(trial_data_cls.get("traversal_types", []), dtype=object))
+                        if len(traversal_epochs) != len(traversal_types):
+                            traversal_types = ["p"] * len(traversal_epochs)
+
+                        classified_indices = np.asarray(class_out.get("classified_indices", np.array([], dtype=int)), dtype=int)
+                        overlays_all = list(class_out.get("overlay_by_trial", []))
+                        overlays_plot = [
+                            overlays_all[int(ii)]
+                            for ii in classified_indices.tolist()
+                            if 0 <= int(ii) < len(overlays_all)
+                        ]
+                        if len(overlays_plot) != len(traversal_epochs):
+                            overlays_plot = overlays_plot[: len(traversal_epochs)]
+
+                        place_field_mask = np.asarray(result_obj.get("place_field_mask", []), dtype=bool)
+                        place_field_contour_mask = np.asarray(
+                            result_obj.get("place_field_contour_mask", place_field_mask),
+                            dtype=bool,
+                        )
+                        pf_bins = result_obj.get("pf_bins", None)
+                        pf_peak_xy = result_obj.get("pf_peak_xy", None)
+                        reference_rate_map = np.asarray(result_obj.get("rate_map", []), dtype=float)
+                        if place_field_mask.size == 0 or pf_bins is None:
+                            raise ValueError("Missing place_field_mask and/or pf_bins for DRZ traversal plotting.")
+
+                        trajectory_color_values_by_trial: list[np.ndarray] = []
+                        for epoch_start, epoch_end in traversal_epochs:
+                            trajectory_color_values_by_trial.append(
+                                _compute_drz_values_for_positions(
+                                    np.asarray(plot_payload["x_neural_plot"][int(epoch_start):int(epoch_end)], dtype=float),
+                                    np.asarray(plot_payload["y_neural_plot"][int(epoch_start):int(epoch_end)], dtype=float),
+                                    pf_bins=pf_bins,
+                                    component_mask=np.asarray(place_field_mask, dtype=bool),
+                                    reference_rate_map=reference_rate_map,
+                                    pf_peak_xy=pf_peak_xy,
+                                )
+                            )
+
+                        contour_color = "magenta" if int(pf_rank) == 1 else "cyan"
+                        plot_result = core.plot_place_field_traversal_trials_with_cb_example_centered_by_max_rate(
+                            plot_payload["trace"],
+                            plot_payload["theta_vm"],
+                            plot_payload["slow_vm"],
+                            plot_payload["speed_plot"],
+                            plot_payload["x_neural_plot"],
+                            plot_payload["y_neural_plot"],
+                            traversal_epochs,
+                            place_field_mask,
+                            pf_bins,
+                            float(plot_payload["frame_rate"]),
+                            complex_bursts_dicts=runtime["merged"].get("complex_bursts_dicts", []),
+                            cell_idx=int(cell_idx),
+                            traversal_types=traversal_types,
+                            trial_type_label_map={"p": "P", "np": "NP"},
+                            trajectory_spatial_bin_hd_overlays_by_trial=overlays_plot,
+                            padding_sec=0.0,
+                            zscore_traces=False,
+                            theta_freqs=tuple(config.analysis.theta_freqs),
+                            slow_freqs=float(config.analysis.slow_freqs),
+                            session_start_frames=plot_payload["session_start_frames"],
+                            session_indices=tuple(config.traversal.session_indices),
+                            color_by_session=True,
+                            resting_speed_threshold=float(drz_params.resting_speed_threshold),
+                            show_rest_patches=bool(show_rest_patches),
+                            show_pf_prepost_patches=True,
+                            pf_prepost_patch_alpha=0.1,
+                            pf_prepost_patch_scope="full_window",
+                            pf_prepost_running_only=False,
+                            pf_prepost_patch_defs=[{"mask": np.asarray(place_field_contour_mask, dtype=bool), "color": contour_color}],
+                            rest_patch_scope="full_window",
+                            rest_patch_require_in_pf=False,
+                            min_rest_patch_duration_s=1.0,
+                            rest_patch_color="#B3B3B3",
+                            rest_patch_alpha=0.25,
+                            shade_traversal_epoch=False,
+                            gradient_traversal_trajectory=True,
+                            trajectory_rasterized=True,
+                            trajectory_direction_label_top=True,
+                            trajectory_direction_label_fontsize=5,
+                            max_plot_trial_duration_s=trial_max_plot_duration_s,
+                            drop_epochs_with_bad_timepoints=bool(drz_params.exclude_trials_with_bad_frames),
+                            refined_SS=plot_payload["refined_ss_cell"],
+                            all_CS_spikes=plot_payload["all_cs_spikes_cell"],
+                            all_spikes=plot_payload["all_spikes_cell"],
+                            firing_rate_bin_ms=float(config.traversal.firing_rate_bin_ms),
+                            firing_rate_smooth_ms=float(config.traversal.firing_rate_smooth_ms),
+                            show_firing_rate=False,
+                            simple_spike_color="#026C80",
+                            complex_spike_color="#EE9B00",
+                            pf_peak_xy=pf_peak_xy,
+                            pf_center_window_sec=float(config.traversal.pf_center_window_sec),
+                            plot_pf_centered_average=True,
+                            return_pf_centered=False,
+                            return_spike_rate_means=True,
+                            show=show_plots,
+                            bad_timepoints=plot_payload["traversal_bad_mask"],
+                            return_trial_firing_rates=False,
+                            center_by_pf_position=True,
+                            max_pf_distance_cm=drz_params.max_pf_distance_cm,
+                            plateaus_dicts=plot_payload["plateaus_for_plot"],
+                            slow_trace_gap=float(trace_slow_gap),
+                            theta_slow_pad_factor=float(theta_slow_pad_factor),
+                            sharey=bool(sharey),
+                            place_field_contours=[{"mask": np.asarray(place_field_contour_mask, dtype=bool), "color": contour_color, "linewidth": 0.8, "linestyle": "solid", "alpha": 1.0}],
+                            pf_occupancy_mask=np.asarray(place_field_contour_mask, dtype=bool),
+                            center_position_label=f"Closest to PF{int(pf_rank)}",
+                            pf_peak_label=f"PF{int(pf_rank)} peak",
+                            pf_peak_color=contour_color,
+                            trajectory_color_values_by_trial=trajectory_color_values_by_trial,
+                            trajectory_color_cmap="vanimo",
+                            trajectory_color_vmin=-1.0,
+                            trajectory_color_vmax=1.0,
+                            trajectory_colorbar=True,
+                            trajectory_colorbar_ticks=(-1.0, 0.0, 1.0),
+                            trajectory_colorbar_label="DRZ",
+                            show_pf_centered_pct=False,
+                        )
+                        fig = plot_result[0] if isinstance(plot_result, tuple) and len(plot_result) > 0 else plot_result
+                        axes = plot_result[1] if isinstance(plot_result, tuple) and len(plot_result) > 1 else None
+                        valid_epochs_plot = (
+                            list(plot_result[2])
+                            if isinstance(plot_result, tuple) and len(plot_result) > 2 and plot_result[2] is not None
+                            else list(traversal_epochs)
+                        )
+                        n_trials_plot = int(len(valid_epochs_plot))
+                        if fig is None:
+                            raise ValueError("Traversal plot function returned fig=None.")
+                        if n_trials_plot != int(len(traversal_epochs)):
+                            if not show_plots:
+                                plt.close(fig)
+                            raise ValueError(
+                                f"Classified traversals ({len(traversal_epochs)}) != plotted valid epochs ({n_trials_plot})."
+                            )
+                        plot_result_payload = dict(result_pnp)
+                        plot_result_payload["all"] = dict(result_all_classified)
+                        _plot_drz_average_rows_on_traversal_figure(
+                            axes,
+                            n_trials_plot=n_trials_plot,
+                            result=plot_result_payload,
+                        )
+                        _add_egocentric_reference_panel_to_drz_figure(
+                            fig=fig,
+                            axes=axes,
+                            local_tuning_all=plot_data.get("local_tuning_all"),
+                            arrow_fields_all=arrow_fields_all,
+                        )
+                        _remove_trial_plot_trajectory_start_end_indicators(axes)
+                        out_name = f"{animal_id}_Cell{cell_idx + 1}_PF{int(pf_rank)}_drz_traversal_pnp.svg"
+                        out_path = out_dir / out_name
+                        fig.savefig(out_path, dpi=300)
+                        if not show_plots:
+                            plt.close(fig)
+                        status = "saved"
+                        message = str(out_path)
+                    else:
+                        status = "no_classified_trials"
+                        message = "No traversals passed classification (P/NP)."
+
+                summary_rows.append(
+                    {
+                        "category": "CSplus",
+                        "animal_id": str(animal_id),
+                        "cell_idx": int(cell_idx),
+                        "cell_num": int(cell_idx) + 1,
+                        "pf_rank": int(pf_rank),
+                        "status": str(status),
+                        "n_detected_traversals": int(n_detected),
+                        "n_classified_traversals": int(n_classified),
+                        "n_preferred_traversals": int(n_p),
+                        "n_nonpreferred_traversals": int(n_np),
+                        "n_unclassified_traversals": int(n_unclassified),
+                        "preferred_fraction_threshold": float(preferred_fraction_threshold),
+                        "preferred_half_width_deg": float(preferred_half_width_deg),
+                        "min_covered_green_bins": int(min_covered_green_bins),
+                        "traversal_bin_selection_mode": str(class_out.get("bin_selection_mode", traversal_bin_selection_mode)),
+                        "preferred_angle_source": str(class_out.get("preferred_angle_source", preferred_angle_source)),
+                        "fit_angle_fallback_to_empirical": bool(
+                            class_out.get("fit_angle_fallback_to_empirical", fit_angle_fallback_to_empirical)
+                        ),
+                        "classification_frame_selection_mode": str(
+                            class_out.get("frame_selection_mode", classification_frame_selection_mode)
+                        ),
+                        "classification_drz_segment_mode": str(
+                            class_out.get("drz_segment_mode", classification_drz_segment_mode)
+                        ),
+                        "classification_phase_signed_drz_filter": bool(
+                            class_out.get("phase_signed_drz_filter", classification_phase_signed_drz_filter)
+                        ),
+                        "classification_speed_threshold_used": float(
+                            class_out.get("frame_speed_threshold_used", np.nan)
+                        ),
+                        "min_valid_traversal_duration_s": float(min_valid_traversal_duration_s),
+                        "message": str(message),
+                    }
+                )
+            except Exception as exc:
+                if fig is not None:
+                    try:
+                        plt.close(fig)
+                    except Exception:
+                        pass
+                skipped += 1
+                if bool(debug_mode):
+                    traceback.print_exc()
+                summary_rows.append(
+                    {
+                        "category": "CSplus",
+                        "animal_id": str(animal_id),
+                        "cell_idx": int(cell_idx),
+                        "cell_num": int(cell_idx) + 1,
+                        "pf_rank": int(pf_rank),
+                        "status": "error",
+                        "n_detected_traversals": np.nan,
+                        "n_classified_traversals": np.nan,
+                        "n_preferred_traversals": np.nan,
+                        "n_nonpreferred_traversals": np.nan,
+                        "n_unclassified_traversals": np.nan,
+                        "preferred_fraction_threshold": float(preferred_fraction_threshold),
+                        "preferred_half_width_deg": float(preferred_half_width_deg),
+                        "min_covered_green_bins": int(min_covered_green_bins),
+                        "traversal_bin_selection_mode": str(traversal_bin_selection_mode),
+                        "preferred_angle_source": str(preferred_angle_source),
+                        "fit_angle_fallback_to_empirical": bool(fit_angle_fallback_to_empirical),
+                        "classification_frame_selection_mode": str(classification_frame_selection_mode),
+                        "classification_drz_segment_mode": str(classification_drz_segment_mode),
+                        "classification_phase_signed_drz_filter": bool(classification_phase_signed_drz_filter),
+                        "classification_speed_threshold_used": float(drz_params.resting_speed_threshold),
+                        "first_n_minutes": (
+                            None
+                            if getattr(drz_params, "first_n_minutes", None) is None
+                            else float(drz_params.first_n_minutes)
+                        ),
+                        "min_valid_traversal_duration_s": float(min_valid_traversal_duration_s),
+                        "message": str(exc),
+                    }
+                )
+                continue
+
+        category_payload[int(pf_rank)] = {
+            "distance_rel": rel_ref,
+            "entries": entries,
+            "n_requested_cells": int(len(selected_cells)),
+            "n_entries": int(len(entries)),
+            "n_skipped": int(skipped),
+        }
+    dataset["CSplus"] = category_payload
+
+    summary_df = pd.DataFrame(summary_rows)
+    if bool(save_summary_csv):
+        figure_root.mkdir(parents=True, exist_ok=True)
+        summary_df.to_csv(summary_csv, index=False)
+    plot_summary = {
+        "output_dir": str(out_dir),
+        "summary_csv": str(summary_csv) if bool(save_summary_csv) else None,
+        "summary_df": summary_df,
+        "n_selected_cells": int(len(selected_cells)),
+        "selected_cells": [(str(a), int(c)) for a, c in selected_cells],
+        "preferred_fraction_threshold": float(preferred_fraction_threshold),
+        "preferred_half_width_deg": float(preferred_half_width_deg),
+        "min_covered_green_bins": int(min_covered_green_bins),
+        "traversal_bin_selection_mode": str(traversal_bin_selection_mode),
+        "preferred_angle_source": str(preferred_angle_source),
+        "fit_angle_fallback_to_empirical": bool(fit_angle_fallback_to_empirical),
+        "classification_frame_selection_mode": str(classification_frame_selection_mode),
+        "classification_drz_segment_mode": str(classification_drz_segment_mode),
+        "classification_phase_signed_drz_filter": bool(classification_phase_signed_drz_filter),
+        "classification_resting_speed_threshold": float(drz_params.resting_speed_threshold),
+        "first_n_minutes": (
+            None
+            if getattr(drz_params, "first_n_minutes", None) is None
+            else float(drz_params.first_n_minutes)
+        ),
+        "min_valid_traversal_duration_s": float(min_valid_traversal_duration_s),
+        "plot_figures": bool(plot_figures),
+    }
+    return {"plot_summary": plot_summary, "dataset": dataset}
+
+
 def _drz_export_matches_axis_metadata(
     row: dict[str, Any] | None,
     npz_obj: Any,
@@ -21012,6 +22534,7 @@ def _build_drz_entry_from_2direction_export(
     cell_idx: int,
     pf_rank: int,
     mode: str,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
 ) -> dict[str, Any] | None:
     rel_key = f"distance_rel_pf{int(pf_rank)}"
     if rel_key not in npz_obj:
@@ -21020,7 +22543,11 @@ def _build_drz_entry_from_2direction_export(
     if rel.ndim != 1 or rel.size == 0:
         return None
     n_time = int(rel.size)
-    directions = ("all", "cw", "ccw")
+    direction_keys_use, _ = _normalize_direction_triplet(
+        direction_keys=direction_keys,
+        direction_titles=None,
+    )
+    directions = tuple(direction_keys_use)
     metric_to_stack_key = {
         "all_spike": "rate_stack",
         "ss": "ss_rate_stack",
@@ -21066,6 +22593,8 @@ def _load_drz_dataset_from_2direction_exports(
     *,
     dataset_metadata: dict[str, Any],
     avg_mode: str,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    index_csv_name: str = "direction_averages_raw_index.csv",
 ) -> dict[str, Any] | None:
     categories = tuple(dataset_metadata.get("categories", ()))
     if len(categories) == 0:
@@ -21074,7 +22603,7 @@ def _load_drz_dataset_from_2direction_exports(
     any_loaded = False
     for cat in categories:
         cat_name = _normalize_pf_category_name(cat)
-        index_csv = export_root / cat_name / "direction_averages_raw_index.csv"
+        index_csv = export_root / cat_name / str(index_csv_name)
         primary_entries: list[dict[str, Any]] = []
         secondary_entries: list[dict[str, Any]] = []
         rel_pf1: np.ndarray | None = None
@@ -21105,8 +22634,22 @@ def _load_drz_dataset_from_2direction_exports(
                         continue
                     animal_id = str(row.get("animal_id", ""))
                     cell_idx = int(row.get("cell_idx", -1))
-                    entry_pf1 = _build_drz_entry_from_2direction_export(npz, animal_id=animal_id, cell_idx=cell_idx, pf_rank=1, mode=avg_mode)
-                    entry_pf2 = _build_drz_entry_from_2direction_export(npz, animal_id=animal_id, cell_idx=cell_idx, pf_rank=2, mode=avg_mode)
+                    entry_pf1 = _build_drz_entry_from_2direction_export(
+                        npz,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        pf_rank=1,
+                        mode=avg_mode,
+                        direction_keys=direction_keys,
+                    )
+                    entry_pf2 = _build_drz_entry_from_2direction_export(
+                        npz,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        pf_rank=2,
+                        mode=avg_mode,
+                        direction_keys=direction_keys,
+                    )
                     if entry_pf1 is not None:
                         primary_entries.append(entry_pf1)
                         if rel_pf1 is None and "distance_rel_pf1" in npz:
@@ -21710,11 +23253,18 @@ def generate_pf_drz_component_heatmaps_2directions(
     avg_mode: str = "combined",
     save_average_exports: bool = True,
     average_export_subdir: str = "pf_drz_2directions_average_exports",
+    output_prefix: str = "pf_drz_2directions",
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    direction_titles: tuple[str, str, str] | list[str] | None = None,
     show_plot: bool = False,
 ) -> dict[str, Any]:
     import csv
 
     mode_norm = _normalize_direction_avg_mode(avg_mode)
+    dir_keys, dir_titles = _normalize_direction_triplet(
+        direction_keys=direction_keys,
+        direction_titles=direction_titles,
+    )
     figure_root = Path(figure_save_folder)
     drz_window = float(dataset.get("metadata", {}).get("drz_window", dataset.get("metadata", {}).get("distance_window_cm", 1.0)))
     drz_bin = float(dataset.get("metadata", {}).get("drz_bin", dataset.get("metadata", {}).get("distance_bin_cm", 0.1)))
@@ -21726,7 +23276,7 @@ def generate_pf_drz_component_heatmaps_2directions(
     figure_root.mkdir(parents=True, exist_ok=True)
     categories = _ordered_dataset_categories(dataset)
     cat_to_dir = {
-        cat: figure_root / _category_output_dir_name(prefix="pf_drz_2directions", category=cat, suffix="_heatmaps")
+        cat: figure_root / _category_output_dir_name(prefix=str(output_prefix), category=cat, suffix="_heatmaps")
         for cat in categories
     }
     summary: dict[str, Any] = {}
@@ -21757,11 +23307,23 @@ def generate_pf_drz_component_heatmaps_2directions(
             entry1 = pri_by_key.get(key)
             entry2 = sec_by_key.get(key)
             if entry1 is not None:
-                entry_main = _filter_entry_by_avg_mode_for_directions(entry1, avg_mode=mode_norm)
-                entry_secondary = _filter_entry_by_avg_mode_for_directions(entry2, avg_mode=mode_norm)
+                entry_main = _filter_entry_by_avg_mode_for_directions(
+                    entry1,
+                    avg_mode=mode_norm,
+                    direction_keys=dir_keys,
+                )
+                entry_secondary = _filter_entry_by_avg_mode_for_directions(
+                    entry2,
+                    avg_mode=mode_norm,
+                    direction_keys=dir_keys,
+                )
                 time_rel = np.asarray(payload["rel1"], dtype=float)
             else:
-                entry_main = _filter_entry_by_avg_mode_for_directions(entry2, avg_mode=mode_norm)
+                entry_main = _filter_entry_by_avg_mode_for_directions(
+                    entry2,
+                    avg_mode=mode_norm,
+                    direction_keys=dir_keys,
+                )
                 entry_secondary = None
                 time_rel = np.asarray(payload["rel2"], dtype=float)
                 n_pf2_only += 1
@@ -21797,6 +23359,8 @@ def generate_pf_drz_component_heatmaps_2directions(
                 show_heatmap_yticks_all_columns=False,
                 ss_cs_cbar_tick_labelsize=4,
                 heatmap_wspace=0.20,
+                direction_keys=dir_keys,
+                direction_titles=dir_titles,
             )
             print(f"[{category}] {i}/{len(all_keys)} saved: {out_path.resolve().as_uri()}")
             n_saved += 1
@@ -21819,7 +23383,7 @@ def generate_pf_drz_component_heatmaps_2directions(
         export_root = figure_root / str(average_export_subdir)
         export_root.mkdir(parents=True, exist_ok=True)
         metric_to_stack = {"all_spike": "rate_stack", "ss": "ss_rate_stack", "cs": "cs_rate_stack", "theta": "theta_stack", "slow": "slow_stack"}
-        directions = ("all", "cw", "ccw")
+        directions = tuple(dir_keys)
         modes = ("combined", "s1", "s2")
 
         def _smooth_stack_for_export(stack: np.ndarray) -> np.ndarray:
@@ -21957,13 +23521,27 @@ def plot_pf_drz_category_primary_secondary_from_dataset_2directions(
     average_export_dir: str | Path | None = None,
     avg_mode: str = "combined",
     enforce_min_traversals_on_saved_exports: bool = False,
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
+    average_export_index_name: str = "direction_averages_raw_index.csv",
     show_plot: bool = True,
 ) -> plt.Figure | None:
     mode_norm = _normalize_direction_avg_mode(avg_mode)
+    dir_keys, dir_titles = _normalize_direction_triplet(
+        direction_keys=direction_keys,
+        direction_titles=direction_titles,
+    )
     source_dataset = dataset
     if bool(use_saved_average_exports):
         export_root = Path(average_export_dir) if average_export_dir is not None else Path(out_path).resolve().parent / "pf_drz_2directions_average_exports"
-        loaded = _load_drz_dataset_from_2direction_exports(export_root, dataset_metadata=dict(dataset.get("metadata", {})), avg_mode=mode_norm)
+        loaded = _load_drz_dataset_from_2direction_exports(
+            export_root,
+            dataset_metadata=dict(dataset.get("metadata", {})),
+            avg_mode=mode_norm,
+            direction_keys=dir_keys,
+            index_csv_name=str(average_export_index_name),
+        )
         if loaded is not None:
             source_dataset = loaded
     fig = plot_pf_distance_centered_category_primary_secondary_from_dataset_2directions(
@@ -21988,6 +23566,9 @@ def plot_pf_drz_category_primary_secondary_from_dataset_2directions(
         align_all_peak_to_zero=False,
         use_saved_average_exports=False,
         avg_mode=mode_norm,
+        direction_keys=dir_keys,
+        direction_titles=dir_titles,
+        explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
         show_plot=False,
     )
     if fig is None:
@@ -22014,13 +23595,23 @@ def compute_pf_drz_pref_nonpref_stats(
     use_saved_average_exports: bool = True,
     average_export_dir: str | Path | None = None,
     avg_mode: str = "combined",
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
+    average_export_index_name: str = "direction_averages_raw_index.csv",
 ) -> dict[str, Any]:
     mode_norm = _normalize_direction_avg_mode(avg_mode)
+    dir_keys, _ = _normalize_direction_triplet(direction_keys=direction_keys, direction_titles=None)
     source_dataset = drz_dataset
     used_saved = False
     if bool(use_saved_average_exports):
         export_root = Path(average_export_dir) if average_export_dir is not None else Path("figures") / "CKII_pooled" / "pf_drz_2directions_average_exports"
-        loaded = _load_drz_dataset_from_2direction_exports(export_root, dataset_metadata=dict(drz_dataset.get("metadata", {})), avg_mode=mode_norm)
+        loaded = _load_drz_dataset_from_2direction_exports(
+            export_root,
+            dataset_metadata=dict(drz_dataset.get("metadata", {})),
+            avg_mode=mode_norm,
+            direction_keys=dir_keys,
+            index_csv_name=str(average_export_index_name),
+        )
         if loaded is not None:
             source_dataset = loaded
             used_saved = True
@@ -22035,6 +23626,10 @@ def compute_pf_drz_pref_nonpref_stats(
         use_saved_average_exports=False,
         average_export_dir=None,
         avg_mode=mode_norm,
+        all_direction_key=str(dir_keys[0]),
+        cw_direction_key=str(dir_keys[1]),
+        ccw_direction_key=str(dir_keys[2]),
+        explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
     )
     out["data_source"] = "saved_average_exports" if bool(used_saved) else "drz_dataset"
     out["average_export_stage"] = "raw" if bool(used_saved) else None
@@ -23098,25 +24693,36 @@ def _run_single_cell_egocentric_tuning(
     )
 
     best_params = np.asarray(fit_real["best_params"], dtype=float).reshape(4)
+    n_valid_spatial_bins = int(fit_real["n_valid_spatial_bins"])
+    pass_95_val: bool | float = bool(float(real_mrl) > float(null_p95))
+    pass_99_val: bool | float = bool(float(real_mrl) > float(null_p99))
+    pass_100_val: bool | float = bool(float(real_mrl) > float(null_max))
+    real_mrl_out = float(real_mrl)
+    if n_valid_spatial_bins < 5:
+        real_mrl_out = float("nan")
+        pass_95_val = np.nan
+        pass_99_val = np.nan
+        pass_100_val = np.nan
+
     result = EgocentricCellResult(
         category=str(category),
         animal_id=str(animal_id),
         cell_idx=int(cell_idx),
         cell_num=int(cell_idx) + 1,
-        real_mrl=float(real_mrl),
+        real_mrl=float(real_mrl_out),
         best_g=float(best_params[0]),
         best_theta=float(_wrap_angle_to_pi(best_params[1])),
         best_x_ref=float(best_params[2]),
         best_y_ref=float(best_params[3]),
         best_loss=float(fit_real["best_loss"]),
-        n_valid_spatial_bins=int(fit_real["n_valid_spatial_bins"]),
+        n_valid_spatial_bins=int(n_valid_spatial_bins),
         null_p95=float(null_p95),
         null_p99=float(null_p99),
         null_max=float(null_max),
         empirical_p=float(empirical_p),
-        pass_95=bool(float(real_mrl) > float(null_p95)),
-        pass_99=bool(float(real_mrl) > float(null_p99)),
-        pass_100=bool(float(real_mrl) > float(null_max)),
+        pass_95=pass_95_val,
+        pass_99=pass_99_val,
+        pass_100=pass_100_val,
     )
     return result, np.asarray(null_mrls, dtype=float), ""
 
@@ -23192,25 +24798,36 @@ def _run_single_cell_egocentric_tuning_frame_sampled(
     )
 
     best_params = np.asarray(fit_real["best_params"], dtype=float).reshape(4)
+    n_valid_spatial_bins = int(fit_real["n_valid_spatial_bins"])
+    pass_95_val: bool | float = bool(float(real_mrl) > float(null_p95))
+    pass_99_val: bool | float = bool(float(real_mrl) > float(null_p99))
+    pass_100_val: bool | float = bool(float(real_mrl) > float(null_max))
+    real_mrl_out = float(real_mrl)
+    if n_valid_spatial_bins < 5:
+        real_mrl_out = float("nan")
+        pass_95_val = np.nan
+        pass_99_val = np.nan
+        pass_100_val = np.nan
+
     result = EgocentricCellResult(
         category=str(category),
         animal_id=str(animal_id),
         cell_idx=int(cell_idx),
         cell_num=int(cell_idx) + 1,
-        real_mrl=float(real_mrl),
+        real_mrl=float(real_mrl_out),
         best_g=float(best_params[0]),
         best_theta=float(_wrap_angle_to_pi(best_params[1])),
         best_x_ref=float(best_params[2]),
         best_y_ref=float(best_params[3]),
         best_loss=float(fit_real["best_loss"]),
-        n_valid_spatial_bins=int(fit_real["n_valid_spatial_bins"]),
+        n_valid_spatial_bins=int(n_valid_spatial_bins),
         null_p95=float(null_p95),
         null_p99=float(null_p99),
         null_max=float(null_max),
         empirical_p=float(empirical_p),
-        pass_95=bool(float(real_mrl) > float(null_p95)),
-        pass_99=bool(float(real_mrl) > float(null_p99)),
-        pass_100=bool(float(real_mrl) > float(null_max)),
+        pass_95=pass_95_val,
+        pass_99=pass_99_val,
+        pass_100=pass_100_val,
     )
     return result, np.asarray(null_mrls, dtype=float), ""
 
@@ -24278,6 +25895,59 @@ def _coerce_float_or_nan(value: Any) -> float:
     return out if np.isfinite(out) else float("nan")
 
 
+def _filter_egocentric_summary_row_by_valid_bins(
+    summary_row: dict[str, Any] | None,
+    *,
+    min_valid_bins: int = 5,
+) -> dict[str, Any] | None:
+    if not isinstance(summary_row, dict):
+        return summary_row
+    out = dict(summary_row)
+    n_valid = _coerce_float_or_nan(out.get("n_valid_spatial_bins", np.nan))
+    if np.isfinite(n_valid) and float(n_valid) < float(max(1, int(min_valid_bins))):
+        out["real_mrl"] = np.nan
+        out["pass_95"] = np.nan
+        out["pass_99"] = np.nan
+        out["pass_100"] = np.nan
+    return out
+
+
+def _filter_egocentric_summary_row_for_tuning_decision(
+    summary_row: dict[str, Any] | None,
+    *,
+    local_tuning: dict[str, Any] | None = None,
+    min_valid_bins: int = 5,
+) -> dict[str, Any] | None:
+    out = _filter_egocentric_summary_row_by_valid_bins(
+        summary_row=summary_row,
+        min_valid_bins=int(min_valid_bins),
+    )
+    if not isinstance(out, dict):
+        return out
+    if not isinstance(local_tuning, dict):
+        return out
+
+    fit_info = _resolve_plot_fit_params(local_tuning=local_tuning, summary_row=out)
+    curve_data = _compute_empirical_vs_fitted_rh_curve(
+        local_tuning=local_tuning,
+        summary_row=None,
+        resolved_fit=fit_info,
+    )
+    n_emp = 0
+    if isinstance(curve_data, dict):
+        try:
+            n_emp = int(curve_data.get("n_valid_spatial_bins_empirical", 0))
+        except Exception:
+            n_emp = 0
+    out["n_valid_spatial_bins_empirical"] = int(max(0, n_emp))
+    if int(max(0, n_emp)) < int(max(1, int(min_valid_bins))):
+        out["real_mrl"] = np.nan
+        out["pass_95"] = np.nan
+        out["pass_99"] = np.nan
+        out["pass_100"] = np.nan
+    return out
+
+
 def _coerce_int_or_neg1(value: Any) -> int:
     try:
         return int(value)
@@ -24487,6 +26157,14 @@ def _extract_egocentric_plot_timeseries(
         analysis=analysis,
         params=params,
     )
+    pf_mask_ref = None
+    if isinstance(analysis, dict):
+        try:
+            _pf = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
+            if _pf.ndim == 2 and _pf.size > 0 and np.any(_pf):
+                pf_mask_ref = np.asarray(_pf, dtype=bool)
+        except Exception:
+            pf_mask_ref = None
 
     def _load_trace_for_theta_slow() -> np.ndarray:
         # Match plot_selected_cells_figure / spatial_analysis_full path:
@@ -24682,6 +26360,9 @@ def _extract_egocentric_plot_timeseries(
         "raw_ss_spike_frames": np.asarray(raw_ss, dtype=int),
         "raw_cs_spike_frames": np.asarray(raw_cs, dtype=int),
         "placecell_map_params": dict(placecell_map_params),
+        "place_field_mask_ref": (
+            np.asarray(pf_mask_ref, dtype=bool) if isinstance(pf_mask_ref, np.ndarray) else None
+        ),
         "theta_amp_bin": np.asarray(theta_amp_bin, dtype=float),
         "slow_vm_bin": np.asarray(slow_vm_bin, dtype=float),
         "n_valid_spikes_before_spatial_filter": int(all_plot["n_before_spatial"]),
@@ -24789,6 +26470,93 @@ def _draw_colored_pass_header(
             va="top",
         )
         x += float(wpx) / fig_w
+
+
+def _draw_centered_colored_parts(
+    *,
+    fig: Any,
+    parts: list[tuple[str, str]],
+    y: float,
+    fontsize: float,
+) -> None:
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    fig_w = float(getattr(fig.bbox, "width", 0.0))
+    if (not np.isfinite(fig_w)) or fig_w <= 0:
+        fig_w = 1.0
+
+    widths_px: list[float] = []
+    for text, color in parts:
+        t = fig.text(
+            0.0,
+            0.0,
+            str(text),
+            color=str(color),
+            fontsize=float(fontsize),
+            ha="left",
+            va="top",
+            alpha=0.0,
+        )
+        widths_px.append(float(t.get_window_extent(renderer=renderer).width))
+        t.remove()
+
+    x = 0.5 - (float(np.sum(widths_px)) / (2.0 * fig_w))
+    for (text, color), wpx in zip(parts, widths_px):
+        fig.text(
+            float(x),
+            float(y),
+            str(text),
+            color=str(color),
+            fontsize=float(fontsize),
+            ha="left",
+            va="top",
+        )
+        x += float(wpx) / fig_w
+
+
+def _draw_colored_pass99_group_line(
+    *,
+    fig: Any,
+    pass99_all: str,
+    pass99_ss: str,
+    pass99_cs: str,
+    y: float,
+    fontsize: float,
+) -> None:
+    parts: list[tuple[str, str]] = [
+        ("pass99(all/SS/CS)=", "#111111"),
+        (str(pass99_all), _pass_text_color(str(pass99_all))),
+        ("/", "#111111"),
+        (str(pass99_ss), _pass_text_color(str(pass99_ss))),
+        ("/", "#111111"),
+        (str(pass99_cs), _pass_text_color(str(pass99_cs))),
+    ]
+    _draw_centered_colored_parts(fig=fig, parts=parts, y=float(y), fontsize=float(fontsize))
+
+
+def _draw_colored_pass_triplet_line(
+    *,
+    fig: Any,
+    label: str,
+    real_mrl_txt: str,
+    pass95: str,
+    pass99: str,
+    pass100: str,
+    y: float,
+    fontsize: float,
+) -> None:
+    parts: list[tuple[str, str]] = [
+        (str(label), "#111111"),
+        ("real_mrl=", "#111111"),
+        (str(real_mrl_txt), "#111111"),
+        ("; pass_95=", "#111111"),
+        (str(pass95), _pass_text_color(str(pass95))),
+        ("; pass_99=", "#111111"),
+        (str(pass99), _pass_text_color(str(pass99))),
+        ("; pass_100=", "#111111"),
+        (str(pass100), _pass_text_color(str(pass100))),
+    ]
+    _draw_centered_colored_parts(fig=fig, parts=parts, y=float(y), fontsize=float(fontsize))
 
 
 def _compute_empirical_vs_fitted_rh_curve(
@@ -25002,6 +26770,8 @@ def _compute_spatial_arrow_fields(
         "mrl_fit_map": np.array([], dtype=float),
         "psi_emp_map": np.array([], dtype=float),
         "mrl_emp_map": np.array([], dtype=float),
+        "bin_mrl_null_p99_map": np.array([], dtype=float),
+        "bin_mrl_pass99_map": np.array([], dtype=bool),
     }
     if not isinstance(local_tuning, dict):
         return out
@@ -25013,6 +26783,8 @@ def _compute_spatial_arrow_fields(
     mean_rate_occ = np.asarray(local_tuning.get("mean_rate_occ_hz", np.array([])), dtype=float)
     spatial_valid = np.asarray(local_tuning.get("spatial_valid_mask", np.array([])), dtype=bool)
     occupied_angle_mask = np.asarray(local_tuning.get("occupied_angle_mask", np.array([])), dtype=bool)
+    occupancy = np.asarray(local_tuning.get("occupancy_s", np.array([])), dtype=float)
+    spike_sum = np.asarray(local_tuning.get("spike_sum", np.array([])), dtype=float)
     psi_centers = np.asarray(local_tuning.get("angle_centers", np.array([])), dtype=float).reshape(-1)
     norm_rate = np.asarray(local_tuning.get("normalized_rate", np.array([])), dtype=float)
 
@@ -25116,6 +26888,69 @@ def _compute_spatial_arrow_fields(
     out["mrl_fit_map"] = np.asarray(mrl_fit_map, dtype=float)
     out["psi_emp_map"] = np.asarray(psi_emp_map, dtype=float)
     out["mrl_emp_map"] = np.asarray(mrl_emp_map, dtype=float)
+    null_p99_map = np.full((nx, ny), np.nan, dtype=float)
+    pass99_map = np.zeros((nx, ny), dtype=bool)
+    # Fast per-bin null test:
+    # multinomial surrogate spikes with occupancy-derived angle probabilities.
+    # This is used only for per-bin visualization logic (not global cell tuning stats).
+    n_surrogates_fast = 200
+    rng = np.random.default_rng(12345)
+    if (
+        occupancy is not None
+        and occupancy.ndim == 3
+        and occupancy.shape == (nx, ny, int(psi_centers.size))
+        and spike_sum is not None
+        and spike_sum.ndim == 3
+        and spike_sum.shape == (nx, ny, int(psi_centers.size))
+        and int(psi_centers.size) > 1
+    ):
+        phasor = np.exp(1j * np.asarray(psi_centers, dtype=float))
+        for ix, iy in np.argwhere(arrow_valid_mask):
+            occ_vec = np.asarray(occupancy[int(ix), int(iy), :], dtype=float).reshape(-1)
+            spk_vec = np.asarray(spike_sum[int(ix), int(iy), :], dtype=float).reshape(-1)
+            valid_ang = np.isfinite(occ_vec) & np.isfinite(spk_vec) & (occ_vec > 0)
+            if int(np.sum(valid_ang)) < 2:
+                continue
+            occ_pos = np.asarray(occ_vec[valid_ang], dtype=float)
+            spk_pos = np.asarray(np.clip(spk_vec[valid_ang], 0.0, None), dtype=float)
+            ph_pos = np.asarray(phasor[valid_ang], dtype=complex)
+            total_occ = float(np.sum(occ_pos))
+            if (not np.isfinite(total_occ)) or total_occ <= 0:
+                continue
+            n_spikes_bin = int(max(0, int(np.round(float(np.sum(spk_pos))))))
+            if n_spikes_bin <= 0:
+                continue
+            p_occ = np.asarray(occ_pos / total_occ, dtype=float)
+            p_occ = np.where(np.isfinite(p_occ) & (p_occ >= 0), p_occ, 0.0)
+            p_sum = float(np.sum(p_occ))
+            if p_sum <= 0:
+                continue
+            p_occ = p_occ / p_sum
+            try:
+                sur_counts = rng.multinomial(n_spikes_bin, p_occ, size=int(n_surrogates_fast))
+            except Exception:
+                continue
+            sur_counts = np.asarray(sur_counts, dtype=float)
+            sur_rate = np.divide(
+                sur_counts,
+                occ_pos[None, :],
+                out=np.zeros_like(sur_counts, dtype=float),
+                where=occ_pos[None, :] > 0,
+            )
+            den = np.asarray(np.sum(sur_rate, axis=1), dtype=float)
+            good = np.isfinite(den) & (den > 0)
+            if not np.any(good):
+                continue
+            vec_sur = np.sum(sur_rate[good, :] * ph_pos[None, :], axis=1) / den[good]
+            mrl_sur = np.asarray(np.abs(vec_sur), dtype=float)
+            if mrl_sur.size <= 0 or (not np.any(np.isfinite(mrl_sur))):
+                continue
+            p99 = float(np.nanpercentile(mrl_sur, 99.0))
+            null_p99_map[int(ix), int(iy)] = p99
+            emp_mrl = float(mrl_emp_map[int(ix), int(iy)])
+            pass99_map[int(ix), int(iy)] = bool(np.isfinite(emp_mrl) and np.isfinite(p99) and (emp_mrl > p99))
+    out["bin_mrl_null_p99_map"] = np.asarray(null_p99_map, dtype=float)
+    out["bin_mrl_pass99_map"] = np.asarray(pass99_map, dtype=bool)
     return out
 
 
@@ -25200,9 +27035,15 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
     if not np.isfinite(merge_gap_s):
         merge_gap_s = float(params.pc_merge_gap_s)
     kernel_size = int(max(1, kernel_size))
-    smooth_sigma = float(max(0.0, smooth_sigma))
-    occ_smooth_sigma = float(max(0.0, occ_smooth_sigma))
+    smooth_sigma_cm = float(max(0.0, smooth_sigma))
+    occ_smooth_sigma_cm = float(max(0.0, occ_smooth_sigma))
     min_occupancy_s = float(max(0.0, min_occupancy_s))
+
+    # Interpret split-map smoothing sigmas in centimeters, then convert to bin units
+    # for gaussian_filter which expects sigma in pixels/bins.
+    sigma_denom = float(max(float(bin_size), 1e-9))
+    smooth_sigma = float(max(0.0, smooth_sigma_cm / sigma_denom))
+    occ_smooth_sigma = float(max(0.0, occ_smooth_sigma_cm / sigma_denom))
 
     x_edges = _make_arena_edges(float(width_real), float(bin_size))
     y_edges = _make_arena_edges(float(height_real), float(bin_size))
@@ -25303,7 +27144,7 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
             dirs = dirs[has_ref]
             ref = ref[has_ref]
             delta = _wrap_angle_to_pi(dirs - ref)
-            is_pref = np.abs(delta) <= (np.pi / 2.0 + 1e-12)
+            is_pref = np.abs(delta) <= (np.pi / 4.0 + 1e-12)
             pref_idx = np.asarray(idx_use[is_pref], dtype=int)
             nonpref_idx = np.asarray(idx_use[~is_pref], dtype=int)
 
@@ -25519,7 +27360,7 @@ def _compute_preferred_nonpreferred_split_maps(
                 vals = vals[has_ref]
                 ref_dirs = ref_dirs[has_ref]
                 delta = _wrap_angle_to_pi(dirs - ref_dirs)
-                pref_mask = np.abs(delta) <= (np.pi / 2.0 + 1e-12)
+                pref_mask = np.abs(delta) <= (np.pi / 4.0 + 1e-12)
                 nonpref_mask = ~pref_mask
                 if np.any(pref_mask):
                     np.add.at(pref_occ, (ii[pref_mask], jj[pref_mask]), dts[pref_mask])
@@ -25644,7 +27485,7 @@ def _compute_preferred_nonpreferred_split_maps_framewise(
                 val = val[has_ref]
                 ref = ref[has_ref]
                 delta = _wrap_angle_to_pi(ang - ref)
-                pref = np.abs(delta) <= (np.pi / 2.0 + 1e-12)
+                pref = np.abs(delta) <= (np.pi / 4.0 + 1e-12)
                 nonpref = ~pref
                 if np.any(pref):
                     np.add.at(pref_occ, (ii[pref], jj[pref]), dt_frame)
@@ -25670,6 +27511,510 @@ def _compute_preferred_nonpreferred_split_maps_framewise(
     }
 
 
+def _compute_empirical_only_green_bin_maps(
+    *,
+    local_tuning: dict[str, Any] | None,
+    arrow_fields: dict[str, Any] | None,
+    zone_half_width_deg: float = 50.0,
+    inside_frac_threshold: float = 0.4,
+    mean_rate_min_hz: float = 0.5,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "reason": "invalid_input",
+        "x_edges": np.array([], dtype=float),
+        "y_edges": np.array([], dtype=float),
+        "x_centers": np.array([], dtype=float),
+        "y_centers": np.array([], dtype=float),
+        "draw_mask": np.array([], dtype=bool),
+        "valid_bin_mask": np.array([], dtype=bool),
+        "arrow_valid_mask": np.array([], dtype=bool),
+        "psi_emp_map": np.array([], dtype=float),
+        "mrl_emp_map": np.array([], dtype=float),
+        "psi_fit_map": np.array([], dtype=float),
+        "mrl_fit_map": np.array([], dtype=float),
+        "fit_in_zone_map": np.array([], dtype=bool),
+        "bin_pass99_map": np.array([], dtype=bool),
+        "mean_rate_ok_map": np.array([], dtype=bool),
+        "outside_occ_map": np.array([], dtype=bool),
+        "green_bin_mask": np.array([], dtype=bool),
+        "zone_half_width_rad": float(np.deg2rad(float(zone_half_width_deg))),
+        "inside_frac_threshold": float(inside_frac_threshold),
+    }
+    if not isinstance(local_tuning, dict) or not isinstance(arrow_fields, dict):
+        return out
+
+    x_edges = np.asarray(arrow_fields.get("x_edges", np.array([])), dtype=float)
+    y_edges = np.asarray(arrow_fields.get("y_edges", np.array([])), dtype=float)
+    occupancy = np.asarray(local_tuning.get("occupancy_s", np.array([])), dtype=float)
+    occupied_angle_mask = np.asarray(local_tuning.get("occupied_angle_mask", np.array([])), dtype=bool)
+    angle_centers = np.asarray(local_tuning.get("angle_centers", np.array([])), dtype=float).reshape(-1)
+    mean_rate_occ = np.asarray(local_tuning.get("mean_rate_occ_hz", np.array([])), dtype=float)
+    spatial_valid = np.asarray(local_tuning.get("spatial_valid_mask", np.array([])), dtype=bool)
+    psi_emp_map = np.asarray(arrow_fields.get("psi_emp_map", np.array([])), dtype=float)
+    mrl_emp_map = np.asarray(arrow_fields.get("mrl_emp_map", np.array([])), dtype=float)
+    psi_fit_map = np.asarray(arrow_fields.get("psi_fit_map", np.array([])), dtype=float)
+    mrl_fit_map = np.asarray(arrow_fields.get("mrl_fit_map", np.array([])), dtype=float)
+    bin_pass99_map = np.asarray(arrow_fields.get("bin_mrl_pass99_map", np.array([])), dtype=bool)
+    arrow_valid_mask = np.asarray(arrow_fields.get("arrow_valid_mask", np.array([])), dtype=bool)
+    plot_rate_map = np.asarray(arrow_fields.get("plot_rate_map", np.array([])), dtype=float)
+
+    if (
+        x_edges.size < 2
+        or y_edges.size < 2
+        or occupancy.ndim != 3
+        or occupied_angle_mask.ndim != 3
+        or angle_centers.size <= 0
+    ):
+        return out
+    nx = int(x_edges.size - 1)
+    ny = int(y_edges.size - 1)
+    n_ang = int(angle_centers.size)
+    if (
+        nx <= 0
+        or ny <= 0
+        or occupancy.shape != (nx, ny, n_ang)
+        or occupied_angle_mask.shape != (nx, ny, n_ang)
+        or mean_rate_occ.shape != (nx, ny)
+        or psi_emp_map.shape != (nx, ny)
+        or mrl_emp_map.shape != (nx, ny)
+        or psi_fit_map.shape != (nx, ny)
+        or mrl_fit_map.shape != (nx, ny)
+        or bin_pass99_map.shape != (nx, ny)
+        or arrow_valid_mask.shape != (nx, ny)
+    ):
+        return out
+
+    if plot_rate_map.shape == (nx, ny):
+        draw_mask = np.asarray(np.isfinite(plot_rate_map), dtype=bool)
+    else:
+        draw_mask = np.asarray(np.any(occupied_angle_mask, axis=2), dtype=bool)
+    if spatial_valid.shape == (nx, ny):
+        valid_bin_mask = np.asarray(spatial_valid, dtype=bool)
+    else:
+        valid_bin_mask = np.asarray(arrow_valid_mask, dtype=bool)
+
+    zone_half_width_rad = float(np.deg2rad(float(zone_half_width_deg)))
+    inside_frac_threshold = float(np.clip(float(inside_frac_threshold), 0.0, 1.0))
+    dtheta = float(2.0 * np.pi / max(1, n_ang))
+
+    fit_in_zone_map = np.zeros((nx, ny), dtype=bool)
+    mean_rate_ok_map = np.zeros((nx, ny), dtype=bool)
+    outside_occ_map = np.zeros((nx, ny), dtype=bool)
+    green_bin_mask = np.zeros((nx, ny), dtype=bool)
+
+    for ix in range(nx):
+        for iy in range(ny):
+            if not bool(draw_mask[ix, iy]):
+                continue
+            if not bool(arrow_valid_mask[ix, iy]):
+                continue
+            theta_emp = float(psi_emp_map[ix, iy])
+            mrl_emp = float(mrl_emp_map[ix, iy])
+            if (not np.isfinite(theta_emp)) or (not np.isfinite(mrl_emp)) or (mrl_emp <= 0):
+                continue
+            theta_fit = float(psi_fit_map[ix, iy])
+            if np.isfinite(theta_fit):
+                fit_in_zone_map[ix, iy] = bool(
+                    abs(float(_wrap_angle_to_pi(theta_fit - theta_emp))) <= (zone_half_width_rad + 1e-12)
+                )
+            mr = float(mean_rate_occ[ix, iy])
+            mean_rate_ok_map[ix, iy] = bool(np.isfinite(mr) and (mr > float(mean_rate_min_hz)))
+
+            occ_mask = np.asarray(occupied_angle_mask[ix, iy, :], dtype=bool).reshape(-1)
+            centers = np.asarray(angle_centers, dtype=float).reshape(-1)
+            outside_flags = np.zeros_like(occ_mask, dtype=bool)
+            for kk in np.where(occ_mask & np.isfinite(centers))[0]:
+                delta_c = float(_wrap_angle_to_pi(centers[int(kk)] - theta_emp))
+                lo = delta_c - 0.5 * dtheta
+                hi = delta_c + 0.5 * dtheta
+                overlap = 0.0
+                for shift in (-2.0 * np.pi, 0.0, 2.0 * np.pi):
+                    lo_s = lo + shift
+                    hi_s = hi + shift
+                    ov = max(0.0, min(hi_s, zone_half_width_rad) - max(lo_s, -zone_half_width_rad))
+                    if ov > overlap:
+                        overlap = float(ov)
+                frac_inside = float(overlap / max(dtheta, 1e-12))
+                is_inside = bool(frac_inside >= inside_frac_threshold)
+                outside_flags[int(kk)] = not is_inside
+            outside_occ_map[ix, iy] = bool(np.any(outside_flags))
+            green_bin_mask[ix, iy] = bool(
+                fit_in_zone_map[ix, iy]
+                and bool(bin_pass99_map[ix, iy])
+                and mean_rate_ok_map[ix, iy]
+                and outside_occ_map[ix, iy]
+            )
+
+    out.update(
+        {
+            "ok": True,
+            "reason": "ok",
+            "x_edges": np.asarray(x_edges, dtype=float),
+            "y_edges": np.asarray(y_edges, dtype=float),
+            "x_centers": 0.5 * (np.asarray(x_edges[:-1], dtype=float) + np.asarray(x_edges[1:], dtype=float)),
+            "y_centers": 0.5 * (np.asarray(y_edges[:-1], dtype=float) + np.asarray(y_edges[1:], dtype=float)),
+            "draw_mask": np.asarray(draw_mask, dtype=bool),
+            "valid_bin_mask": np.asarray(valid_bin_mask, dtype=bool),
+            "arrow_valid_mask": np.asarray(arrow_valid_mask, dtype=bool),
+            "psi_emp_map": np.asarray(psi_emp_map, dtype=float),
+            "mrl_emp_map": np.asarray(mrl_emp_map, dtype=float),
+            "psi_fit_map": np.asarray(psi_fit_map, dtype=float),
+            "mrl_fit_map": np.asarray(mrl_fit_map, dtype=float),
+            "fit_in_zone_map": np.asarray(fit_in_zone_map, dtype=bool),
+            "bin_pass99_map": np.asarray(bin_pass99_map, dtype=bool),
+            "mean_rate_ok_map": np.asarray(mean_rate_ok_map, dtype=bool),
+            "outside_occ_map": np.asarray(outside_occ_map, dtype=bool),
+            "green_bin_mask": np.asarray(green_bin_mask, dtype=bool),
+            "zone_half_width_rad": float(zone_half_width_rad),
+            "inside_frac_threshold": float(inside_frac_threshold),
+        }
+    )
+    return out
+
+
+def _plot_egocentric_bin_polar_grid_panel(
+    *,
+    fig: Any,
+    parent_ax: Any,
+    local_tuning: dict[str, Any] | None,
+    arrow_fields: dict[str, Any] | None,
+    title: str,
+    variant: str = "default",
+) -> dict[str, Any]:
+    empty_out = {
+        "green_ring_count": 0,
+        "valid_bin_mean_mrl": np.nan,
+        "valid_bin_mrl_n": 0,
+    }
+    if parent_ax is None:
+        return dict(empty_out)
+    parent_ax.set_xticks([])
+    parent_ax.set_yticks([])
+    parent_ax.set_frame_on(False)
+    parent_ax.set_title(str(title), fontsize=7, pad=2.0)
+
+    if not isinstance(local_tuning, dict) or not isinstance(arrow_fields, dict):
+        parent_ax.text(
+            0.5,
+            0.5,
+            "No polar bins",
+            ha="center",
+            va="center",
+            transform=parent_ax.transAxes,
+            fontsize=7,
+        )
+        return dict(empty_out)
+
+    x_edges = np.asarray(arrow_fields.get("x_edges", np.array([])), dtype=float)
+    y_edges = np.asarray(arrow_fields.get("y_edges", np.array([])), dtype=float)
+    occupancy = np.asarray(local_tuning.get("occupancy_s", np.array([])), dtype=float)
+    norm_rate = np.asarray(local_tuning.get("normalized_rate", np.array([])), dtype=float)
+    mean_rate_occ = np.asarray(local_tuning.get("mean_rate_occ_hz", np.array([])), dtype=float)
+    occupied_angle_mask = np.asarray(local_tuning.get("occupied_angle_mask", np.array([])), dtype=bool)
+    angle_centers = np.asarray(local_tuning.get("angle_centers", np.array([])), dtype=float).reshape(-1)
+    psi_emp_map = np.asarray(arrow_fields.get("psi_emp_map", np.array([])), dtype=float)
+    mrl_emp_map = np.asarray(arrow_fields.get("mrl_emp_map", np.array([])), dtype=float)
+    psi_fit_map = np.asarray(arrow_fields.get("psi_fit_map", np.array([])), dtype=float)
+    mrl_fit_map = np.asarray(arrow_fields.get("mrl_fit_map", np.array([])), dtype=float)
+    bin_pass99_map = np.asarray(arrow_fields.get("bin_mrl_pass99_map", np.array([])), dtype=bool)
+    arrow_valid_mask = np.asarray(arrow_fields.get("arrow_valid_mask", np.array([])), dtype=bool)
+    plot_rate_map = np.asarray(arrow_fields.get("plot_rate_map", np.array([])), dtype=float)
+
+    if (
+        x_edges.size < 2
+        or y_edges.size < 2
+        or occupancy.ndim != 3
+        or norm_rate.ndim != 3
+        or occupied_angle_mask.ndim != 3
+        or angle_centers.size <= 0
+    ):
+        parent_ax.text(
+            0.5,
+            0.5,
+            "No polar bins",
+            ha="center",
+            va="center",
+            transform=parent_ax.transAxes,
+            fontsize=7,
+        )
+        return dict(empty_out)
+
+    nx = int(x_edges.size - 1)
+    ny = int(y_edges.size - 1)
+    n_ang = int(angle_centers.size)
+    if (
+        nx <= 0
+        or ny <= 0
+        or occupancy.shape != (nx, ny, n_ang)
+        or norm_rate.shape != (nx, ny, n_ang)
+        or occupied_angle_mask.shape != (nx, ny, n_ang)
+        or psi_fit_map.shape != (nx, ny)
+        or mrl_fit_map.shape != (nx, ny)
+        or psi_emp_map.shape != (nx, ny)
+        or mrl_emp_map.shape != (nx, ny)
+        or bin_pass99_map.shape != (nx, ny)
+        or arrow_valid_mask.shape != (nx, ny)
+    ):
+        parent_ax.text(
+            0.5,
+            0.5,
+            "No polar bins",
+            ha="center",
+            va="center",
+            transform=parent_ax.transAxes,
+            fontsize=7,
+        )
+        return dict(empty_out)
+
+    # Keep mini-polar bin visibility consistent with the column-3 spatial map:
+    # if a bin is masked out there, do not draw its mini-polar tile here.
+    if plot_rate_map.shape == (nx, ny):
+        draw_mask = np.isfinite(plot_rate_map)
+    else:
+        draw_mask = np.any(occupied_angle_mask, axis=2)
+
+    theta = np.mod(np.asarray(angle_centers, dtype=float), 2.0 * np.pi)
+    order = np.argsort(theta)
+    theta_s = np.asarray(theta[order], dtype=float)
+    bin_width = float(2.0 * np.pi / max(1, n_ang))
+
+    parent_bbox = parent_ax.get_position(fig)
+    fig_w, fig_h = fig.get_size_inches()
+    fig_aspect_h_over_w = float(fig_h / max(fig_w, 1e-9))
+    tile_h = min(
+        parent_bbox.height / max(ny, 1),
+        parent_bbox.width / max(nx * fig_aspect_h_over_w, 1e-9),
+    )
+    tile_w = tile_h * fig_aspect_h_over_w
+    grid_w = tile_w * nx
+    grid_h = tile_h * ny
+    x0 = float(parent_bbox.x0 + 0.5 * (parent_bbox.width - grid_w))
+    y0 = float(parent_bbox.y0 + 0.5 * (parent_bbox.height - grid_h))
+
+    variant_norm = str(variant).strip().lower()
+    empirical_only_pm45 = variant_norm in {"empirical_only_pm45", "empirical_pm45"}
+    empirical_window_half = float(np.deg2rad(50.0))
+    green_meta: dict[str, Any] | None = None
+    if empirical_only_pm45:
+        tune_alpha_base = 0.06
+        tune_alpha_scale = 0.34
+        empirical_arrow_color = "#0B3D91"
+        green_meta = _compute_empirical_only_green_bin_maps(
+            local_tuning=local_tuning,
+            arrow_fields=arrow_fields,
+            zone_half_width_deg=50.0,
+            inside_frac_threshold=0.4,
+            mean_rate_min_hz=0.5,
+        )
+        if "all" in str(title).lower():
+            parent_ax.text(
+                0.5,
+                1.22,
+                "Green ring: fit in ±50°, pass99, mean_rate>0.5Hz, occ. outside ±50° (edge>=0.4 inside)",
+                ha="center",
+                va="bottom",
+                transform=parent_ax.transAxes,
+                fontsize=6.1,
+                color="#111111",
+            )
+    else:
+        tune_alpha_base = 0.10
+        tune_alpha_scale = 0.50
+        empirical_arrow_color = "black"
+
+    green_ring_count = 0
+    for ix in range(nx):
+        for iy in range(ny):
+            if not bool(draw_mask[ix, iy]):
+                continue
+            axp = fig.add_axes(
+                [
+                    float(x0 + ix * tile_w),
+                    float(y0 + iy * tile_h),
+                    float(tile_w),
+                    float(tile_h),
+                ],
+                projection="polar",
+            )
+
+            occ_curve = np.asarray(occupancy[ix, iy, :], dtype=float)
+            occ_mask = np.asarray(occupied_angle_mask[ix, iy, :], dtype=bool)
+            if occ_curve.size != n_ang or occ_mask.size != n_ang:
+                occ_fan = np.zeros(n_ang, dtype=float)
+            else:
+                occ_vals = np.where(np.isfinite(occ_curve), np.clip(occ_curve, 0.0, None), 0.0)
+                occ_max = float(np.nanmax(occ_vals)) if np.any(np.isfinite(occ_vals)) else 0.0
+                if np.isfinite(occ_max) and occ_max > 0:
+                    occ_norm = occ_vals / occ_max
+                else:
+                    occ_norm = np.zeros_like(occ_vals)
+                occ_fan = np.where(occ_mask, np.clip(occ_norm, 0.0, 1.0), 0.0)
+            occ_fan = np.asarray(occ_fan[order], dtype=float)
+            occ_colors = [
+                (0.50, 0.50, 0.50, float(0.18 + 0.45 * h))
+                for h in occ_fan
+            ]
+            axp.bar(
+                theta_s,
+                occ_fan,
+                width=bin_width,
+                bottom=0.0,
+                align="center",
+                color=occ_colors,
+                edgecolor="none",
+                linewidth=0.0,
+                zorder=1,
+            )
+
+            tune_curve = np.asarray(norm_rate[ix, iy, :], dtype=float)
+            if tune_curve.size != n_ang:
+                tune_fan = np.zeros(n_ang, dtype=float)
+            else:
+                tune_vals = np.where(np.isfinite(tune_curve), np.clip(tune_curve, 0.0, 1.0), 0.0)
+                tune_fan = np.where(occ_mask, tune_vals, 0.0)
+            tune_fan = np.asarray(tune_fan[order], dtype=float)
+            tune_colors = [
+                (0.12, 0.35, 0.82, float(tune_alpha_base + tune_alpha_scale * h))
+                for h in tune_fan
+            ]
+            axp.bar(
+                theta_s,
+                tune_fan,
+                width=bin_width,
+                bottom=0.0,
+                align="center",
+                color=tune_colors,
+                edgecolor="none",
+                linewidth=0.0,
+                zorder=4,
+            )
+
+            if bool(arrow_valid_mask[ix, iy]):
+                theta_fit = float(psi_fit_map[ix, iy])
+                if np.isfinite(theta_fit):
+                    theta_fit_plot = float(np.mod(theta_fit, 2.0 * np.pi))
+                    if not empirical_only_pm45:
+                        theta_sep = float(np.mod(theta_fit + (np.pi / 2.0), 2.0 * np.pi))
+                        for th in (theta_sep, float(np.mod(theta_sep + np.pi, 2.0 * np.pi))):
+                            axp.plot(
+                                [th, th],
+                                [0.0, 1.0],
+                                linestyle=(0, (2.0, 2.0)),
+                                color="black",
+                                linewidth=0.45,
+                                alpha=0.8,
+                                zorder=6,
+                            )
+                    # Match column-3 fitted arrow behavior: directional arrow with fixed length.
+                    r_fit = 0.95
+                    ann_fit = axp.annotate(
+                        "",
+                        xy=(theta_fit_plot, r_fit),
+                        xytext=(theta_fit_plot, 0.0),
+                        arrowprops=dict(
+                            arrowstyle="->",
+                            color="#D62728",
+                            linewidth=0.7,
+                            mutation_scale=2.2,
+                            shrinkA=0.0,
+                            shrinkB=0.0,
+                        ),
+                        zorder=9,
+                    )
+                    ann_fit.set_clip_on(False)
+
+                theta_emp = float(psi_emp_map[ix, iy])
+                r_emp = float(np.clip(mrl_emp_map[ix, iy], 0.0, 1.0))
+                if np.isfinite(theta_emp) and np.isfinite(r_emp) and r_emp > 0:
+                    theta_plot = float(np.mod(theta_emp, 2.0 * np.pi))
+                    highlight_green_ring = False
+                    if empirical_only_pm45:
+                        theta_plus = float(np.mod(theta_plot + empirical_window_half, 2.0 * np.pi))
+                        theta_minus = float(np.mod(theta_plot - empirical_window_half, 2.0 * np.pi))
+                        for th in (theta_plus, theta_minus):
+                            axp.plot(
+                                [th, th],
+                                [0.0, 1.0],
+                                linestyle=(0, (2.0, 2.0)),
+                                color="black",
+                                linewidth=0.45,
+                                alpha=0.8,
+                                zorder=6,
+                            )
+                        if isinstance(green_meta, dict) and bool(green_meta.get("ok", False)):
+                            green_map = np.asarray(green_meta.get("green_bin_mask", np.array([])), dtype=bool)
+                            if green_map.shape == (nx, ny):
+                                highlight_green_ring = bool(green_map[int(ix), int(iy)])
+                    ann_emp = axp.annotate(
+                        "",
+                        xy=(theta_plot, r_emp),
+                        xytext=(theta_plot, 0.0),
+                        arrowprops=dict(
+                            arrowstyle="->",
+                            color=empirical_arrow_color,
+                            linewidth=0.7,
+                            mutation_scale=2.4,
+                            shrinkA=0.0,
+                            shrinkB=0.0,
+                        ),
+                        zorder=10,
+                    )
+                    ann_emp.set_clip_on(False)
+                    if empirical_only_pm45 and highlight_green_ring:
+                        axp.spines["polar"].set_linewidth(0.95)
+                        axp.spines["polar"].set_color("#1A9C3D")
+                        green_ring_count += 1
+                    else:
+                        axp.spines["polar"].set_linewidth(0.2)
+                        axp.spines["polar"].set_color((0.0, 0.0, 0.0, 0.2))
+                else:
+                    axp.spines["polar"].set_linewidth(0.2)
+                    axp.spines["polar"].set_color((0.0, 0.0, 0.0, 0.2))
+            else:
+                axp.spines["polar"].set_linewidth(0.2)
+                axp.spines["polar"].set_color((0.0, 0.0, 0.0, 0.2))
+
+            axp.scatter(
+                [0.0],
+                [0.0],
+                s=0.6,
+                c="black",
+                alpha=0.8,
+                linewidths=0.0,
+                edgecolors="none",
+                zorder=12,
+            )
+            axp.set_ylim(0.0, 1.0)
+            axp.grid(False)
+            axp.set_xticks([])
+            axp.set_yticks([])
+    spatial_valid = np.asarray(local_tuning.get("spatial_valid_mask", np.array([])), dtype=bool)
+    if spatial_valid.shape == (nx, ny):
+        valid_bin_mask = spatial_valid
+    else:
+        valid_bin_mask = np.asarray(arrow_valid_mask, dtype=bool)
+    valid_mrl_mask = np.asarray(valid_bin_mask, dtype=bool) & np.isfinite(mrl_emp_map)
+    n_valid_mrl = int(np.sum(valid_mrl_mask))
+    if n_valid_mrl > 0:
+        valid_mrl_mean = float(np.nanmean(np.asarray(mrl_emp_map[valid_mrl_mask], dtype=float)))
+    else:
+        valid_mrl_mean = np.nan
+
+    if empirical_only_pm45:
+        mrl_txt = f"{valid_mrl_mean:.3f}" if np.isfinite(valid_mrl_mean) else "NA"
+        parent_ax.set_title(
+            f"{title}\nValid-bin mean MRL={mrl_txt} (n={int(n_valid_mrl)})",
+            fontsize=7,
+            pad=2.0,
+        )
+    return {
+        "green_ring_count": int(green_ring_count),
+        "valid_bin_mean_mrl": float(valid_mrl_mean) if np.isfinite(valid_mrl_mean) else np.nan,
+        "valid_bin_mrl_n": int(n_valid_mrl),
+    }
+
+
 def _plot_egocentric_per_cell_summary_figure(
     *,
     category: str,
@@ -25678,18 +28023,66 @@ def _plot_egocentric_per_cell_summary_figure(
     mode: str,
     data: dict[str, Any],
     summary_row: dict[str, Any] | None,
+    summary_row_all: dict[str, Any] | None = None,
+    summary_row_ss: dict[str, Any] | None = None,
+    summary_row_cs: dict[str, Any] | None = None,
     params: EgocentricSummaryPlotParams,
     out_base: Path,
 ) -> dict[str, Any]:
-    has_ref = _summary_row_has_best_reference(summary_row)
-    show_curve = bool(has_ref and bool(params.show_empirical_fit_curve))
-    show_spatial_map = bool(has_ref and bool(params.show_spatial_map_with_fitted_arrows))
+    local_all = data.get("local_tuning_all")
+    local_ss = data.get("local_tuning_ss")
+    local_cs = data.get("local_tuning_cs")
+    if local_all is None:
+        local_all = data.get("local_tuning")
+    if local_ss is None:
+        local_ss = data.get("local_tuning")
+    if local_cs is None:
+        local_cs = data.get("local_tuning")
+    summary_row = _filter_egocentric_summary_row_for_tuning_decision(
+        summary_row,
+        local_tuning=local_all,
+        min_valid_bins=5,
+    )
+    summary_row_all = _filter_egocentric_summary_row_for_tuning_decision(
+        summary_row_all,
+        local_tuning=local_all,
+        min_valid_bins=5,
+    )
+    summary_row_ss = _filter_egocentric_summary_row_for_tuning_decision(
+        summary_row_ss,
+        local_tuning=local_ss,
+        min_valid_bins=5,
+    )
+    summary_row_cs = _filter_egocentric_summary_row_for_tuning_decision(
+        summary_row_cs,
+        local_tuning=local_cs,
+        min_valid_bins=5,
+    )
+
+    plot_fit_all = _resolve_plot_fit_params(local_tuning=local_all, summary_row=summary_row)
+    plot_fit_ss = _resolve_plot_fit_params(
+        local_tuning=local_ss,
+        summary_row=(summary_row_ss if isinstance(summary_row_ss, dict) else summary_row),
+    )
+    plot_fit_cs = _resolve_plot_fit_params(
+        local_tuning=local_cs,
+        summary_row=(summary_row_cs if isinstance(summary_row_cs, dict) else summary_row),
+    )
+    has_ref_all = bool(plot_fit_all.get("has_ref", False))
+    has_ref_ss = bool(plot_fit_ss.get("has_ref", False))
+    has_ref_cs = bool(plot_fit_cs.get("has_ref", False))
+    has_ref_any = bool(has_ref_all or has_ref_ss or has_ref_cs)
+    use_multispike_curve_panels = bool(
+        isinstance(summary_row_ss, dict) or isinstance(summary_row_cs, dict)
+    )
+    show_curve = bool(has_ref_any and bool(params.show_empirical_fit_curve))
+    show_spatial_map = bool(has_ref_any and bool(params.show_spatial_map_with_fitted_arrows))
     n_main_panels = 1 + (1 if show_spatial_map else 0) + (1 if show_curve else 0)
     if n_main_panels <= 1:
         base_w = float(params.figsize_no_ref[0])
     else:
         base_w = float(params.figsize_with_ref[0]) + 2.0 * float(max(0, n_main_panels - 2))
-    figsize = (base_w + 4.8, float(params.figsize_with_ref[1]) * 2.8)
+    figsize = (base_w + 6.9, float(params.figsize_with_ref[1]) * 2.8)
 
     fig = plt.figure(figsize=figsize, dpi=int(params.dpi), constrained_layout=False)
     width_ratios: list[float] = [0.28, 1.0]  # [small donut, trajectory]
@@ -25697,7 +28090,7 @@ def _plot_egocentric_per_cell_summary_figure(
         width_ratios.append(1.15)
     if show_curve:
         width_ratios.append(1.0)
-    width_ratios.extend([1.0, 1.0])  # preferred / non-preferred columns
+    width_ratios.extend([1.0, 1.0, 1.05, 1.05])  # preferred / non-preferred / mini-polar columns
     n_cols = len(width_ratios)
     gs = fig.add_gridspec(
         6,
@@ -25725,30 +28118,54 @@ def _plot_egocentric_per_cell_summary_figure(
         ax_map_ss = fig.add_subplot(gs[2, map_col])
         ax_map_cs = fig.add_subplot(gs[3, map_col])
     ax_curve = None
+    ax_curve_all = None
+    ax_curve_ss = None
+    ax_curve_cs = None
     if show_curve:
-        if curve_polar:
-            ax_curve = fig.add_subplot(gs[1, curve_col], projection="polar")
+        if use_multispike_curve_panels:
+            if curve_polar:
+                ax_curve_all = fig.add_subplot(gs[1, curve_col], projection="polar")
+                ax_curve_ss = fig.add_subplot(gs[2, curve_col], projection="polar")
+                ax_curve_cs = fig.add_subplot(gs[3, curve_col], projection="polar")
+            else:
+                ax_curve_all = fig.add_subplot(gs[1, curve_col])
+                ax_curve_ss = fig.add_subplot(gs[2, curve_col])
+                ax_curve_cs = fig.add_subplot(gs[3, curve_col])
         else:
-            ax_curve = fig.add_subplot(gs[1, curve_col])
+            if curve_polar:
+                ax_curve = fig.add_subplot(gs[1, curve_col], projection="polar")
+            else:
+                ax_curve = fig.add_subplot(gs[1, curve_col])
 
-    pref_col = n_cols - 2
-    nonpref_col = n_cols - 1
+    pref_col = n_cols - 4
+    nonpref_col = n_cols - 3
+    polar_col = n_cols - 2
+    polar_emp_col = n_cols - 1
     ax_pref_rows = [fig.add_subplot(gs[row, pref_col]) for row in range(1, 6)]
     ax_nonpref_rows = [fig.add_subplot(gs[row, nonpref_col]) for row in range(1, 6)]
+    ax_binpolar_all = fig.add_subplot(gs[1, polar_col])
+    ax_binpolar_ss = fig.add_subplot(gs[2, polar_col])
+    ax_binpolar_cs = fig.add_subplot(gs[3, polar_col])
+    ax_binpolar_emp_all = fig.add_subplot(gs[1, polar_emp_col])
+    ax_binpolar_emp_ss = fig.add_subplot(gs[2, polar_emp_col])
+    ax_binpolar_emp_cs = fig.add_subplot(gs[3, polar_emp_col])
 
     n_subplots = int(
         1  # donut
         + 3  # trajectory rows: all/ss/cs
         + (3 if show_spatial_map else 0)  # spatial rows: all/ss/cs
-        + (1 if show_curve else 0)  # top-right curve
+        + (
+            3 if (show_curve and use_multispike_curve_panels)
+            else (1 if show_curve else 0)
+        )  # curve panel(s)
         + 10  # preferred / non-preferred rows (5x2)
+        + 3  # mini-polar rows (all/ss/cs)
+        + 3  # empirical-only mini-polar rows (all/ss/cs)
     )
 
     cmap = plt.get_cmap(str(params.cmap))
     norm = plt.Normalize(vmin=float(params.angle_vmin), vmax=float(params.angle_vmax))
     width_cm, height_cm = float(params.arena_size_cm[0]), float(params.arena_size_cm[1])
-    plot_fit = _resolve_plot_fit_params(local_tuning=data.get("local_tuning"), summary_row=summary_row)
-
     traj_x = np.asarray(data.get("traj_x", np.array([])), dtype=float)
     traj_y = np.asarray(data.get("traj_y", np.array([])), dtype=float)
     spike_x_all = np.asarray(data.get("spike_x", np.array([])), dtype=float)
@@ -25763,6 +28180,7 @@ def _plot_egocentric_per_cell_summary_figure(
     binned_all = data.get("binned_all")
     binned_ss = data.get("binned_ss")
     binned_cs = data.get("binned_cs")
+    pf_mask_ref = data.get("place_field_mask_ref", None)
     theta_amp_bin = np.asarray(data.get("theta_amp_bin", np.array([])), dtype=float).reshape(-1)
     slow_vm_bin = np.asarray(data.get("slow_vm_bin", np.array([])), dtype=float).reshape(-1)
     x_frames_full = np.asarray(data.get("x_frames", np.array([])), dtype=float).reshape(-1)
@@ -25773,13 +28191,9 @@ def _plot_egocentric_per_cell_summary_figure(
     theta_slow_frame_mask = np.asarray(data.get("theta_slow_frame_mask", np.array([])), dtype=bool).reshape(-1)
     frame_rate_local = _coerce_float_or_nan(data.get("frame_rate", np.nan))
 
-    local_all = data.get("local_tuning_all")
-    local_ss = data.get("local_tuning_ss")
-    local_cs = data.get("local_tuning_cs")
-
-    arrow_fields_all = _compute_spatial_arrow_fields(local_tuning=local_all, fit_info=plot_fit, params=params)
-    arrow_fields_ss = _compute_spatial_arrow_fields(local_tuning=local_ss, fit_info=plot_fit, params=params)
-    arrow_fields_cs = _compute_spatial_arrow_fields(local_tuning=local_cs, fit_info=plot_fit, params=params)
+    arrow_fields_all = _compute_spatial_arrow_fields(local_tuning=local_all, fit_info=plot_fit_all, params=params)
+    arrow_fields_ss = _compute_spatial_arrow_fields(local_tuning=local_ss, fit_info=plot_fit_ss, params=params)
+    arrow_fields_cs = _compute_spatial_arrow_fields(local_tuning=local_cs, fit_info=plot_fit_cs, params=params)
 
     def _plot_traj_panel(ax: Any, sx: np.ndarray, sy: np.ndarray, hd_vals: np.ndarray, title: str) -> None:
         ax.plot(
@@ -25808,14 +28222,21 @@ def _plot_egocentric_per_cell_summary_figure(
     _plot_traj_panel(ax_psi_ss, spike_x_ss, spike_y_ss, spike_hd_ss, "Trajectory + SS (head direction)")
     _plot_traj_panel(ax_psi_cs, spike_x_cs, spike_y_cs, spike_hd_cs, "Trajectory + CS (head direction)")
 
-    if ax_curve is not None:
+    def _plot_curve_panel(
+        ax_curve_local: Any,
+        local_for_curve: dict[str, Any] | None,
+        fit_for_curve: dict[str, Any],
+        title_prefix: str,
+    ) -> None:
+        if ax_curve_local is None:
+            return
         if curve_polar:
-            ax_curve.set_theta_zero_location("N")
-            ax_curve.set_theta_direction(1)
+            ax_curve_local.set_theta_zero_location("N")
+            ax_curve_local.set_theta_direction(1)
         curve_data = _compute_empirical_vs_fitted_rh_curve(
-            local_tuning=data.get("local_tuning"),
-            summary_row=summary_row,
-            resolved_fit=plot_fit,
+            local_tuning=local_for_curve,
+            summary_row=None,
+            resolved_fit=fit_for_curve,
         )
         n_valid_bins_emp = 0
         if isinstance(curve_data, dict):
@@ -25830,9 +28251,17 @@ def _plot_egocentric_per_cell_summary_figure(
                 order = np.argsort(theta)
                 theta_s = np.asarray(theta[order], dtype=float)
                 emp_s = np.asarray(empirical[order], dtype=float)
-                emp_sem_s = np.asarray(empirical_sem[order], dtype=float) if empirical_sem.size == ang.size else np.full_like(emp_s, np.nan)
+                emp_sem_s = (
+                    np.asarray(empirical_sem[order], dtype=float)
+                    if empirical_sem.size == ang.size
+                    else np.full_like(emp_s, np.nan)
+                )
                 fit_s = np.asarray(fitted[order], dtype=float)
-                fit_sem_s = np.asarray(fitted_sem[order], dtype=float) if fitted_sem.size == ang.size else np.full_like(fit_s, np.nan)
+                fit_sem_s = (
+                    np.asarray(fitted_sem[order], dtype=float)
+                    if fitted_sem.size == ang.size
+                    else np.full_like(fit_s, np.nan)
+                )
                 if curve_polar:
                     theta_closed = np.concatenate([theta_s, np.array([theta_s[0] + 2.0 * np.pi], dtype=float)])
                     emp_closed = np.concatenate([emp_s, np.array([emp_s[0]], dtype=float)])
@@ -25840,24 +28269,12 @@ def _plot_egocentric_per_cell_summary_figure(
                     if np.any(np.isfinite(emp_sem_closed)):
                         lo = emp_closed - np.where(np.isfinite(emp_sem_closed), emp_sem_closed, 0.0)
                         hi = emp_closed + np.where(np.isfinite(emp_sem_closed), emp_sem_closed, 0.0)
-                        ax_curve.fill_between(
-                            theta_closed,
-                            lo,
-                            hi,
-                            color="#1F77B4",
-                            alpha=0.18,
-                            linewidth=0.0,
-                            zorder=1,
+                        ax_curve_local.fill_between(
+                            theta_closed, lo, hi, color="#1F77B4", alpha=0.18, linewidth=0.0, zorder=1
                         )
-                    ax_curve.plot(
-                        theta_closed,
-                        emp_closed,
-                        "o-",
-                        color="#1F77B4",
-                        linewidth=1.0,
-                        markersize=2.8,
-                        label="Empirical",
-                        zorder=3,
+                    ax_curve_local.plot(
+                        theta_closed, emp_closed, "o-", color="#1F77B4", linewidth=1.0, markersize=2.8,
+                        label="Empirical", zorder=3
                     )
                     if np.any(np.isfinite(fit_s)):
                         fit_closed = np.concatenate([fit_s, np.array([fit_s[0]], dtype=float)])
@@ -25865,23 +28282,11 @@ def _plot_egocentric_per_cell_summary_figure(
                         if np.any(np.isfinite(fit_sem_closed)):
                             lo = fit_closed - np.where(np.isfinite(fit_sem_closed), fit_sem_closed, 0.0)
                             hi = fit_closed + np.where(np.isfinite(fit_sem_closed), fit_sem_closed, 0.0)
-                            ax_curve.fill_between(
-                                theta_closed,
-                                lo,
-                                hi,
-                                color="#D62728",
-                                alpha=0.12,
-                                linewidth=0.0,
-                                zorder=1,
+                            ax_curve_local.fill_between(
+                                theta_closed, lo, hi, color="#D62728", alpha=0.12, linewidth=0.0, zorder=1
                             )
-                        ax_curve.plot(
-                            theta_closed,
-                            fit_closed,
-                            "-",
-                            color="#D62728",
-                            linewidth=1.2,
-                            label="Fitted RH",
-                            zorder=2,
+                        ax_curve_local.plot(
+                            theta_closed, fit_closed, "-", color="#D62728", linewidth=1.2, label="Fitted RH", zorder=2
                         )
                 else:
                     theta_deg = np.rad2deg(theta_s)
@@ -25891,24 +28296,12 @@ def _plot_egocentric_per_cell_summary_figure(
                     if np.any(np.isfinite(emp_sem_closed)):
                         lo = emp_closed - np.where(np.isfinite(emp_sem_closed), emp_sem_closed, 0.0)
                         hi = emp_closed + np.where(np.isfinite(emp_sem_closed), emp_sem_closed, 0.0)
-                        ax_curve.fill_between(
-                            theta_deg_closed,
-                            lo,
-                            hi,
-                            color="#1F77B4",
-                            alpha=0.18,
-                            linewidth=0.0,
-                            zorder=1,
+                        ax_curve_local.fill_between(
+                            theta_deg_closed, lo, hi, color="#1F77B4", alpha=0.18, linewidth=0.0, zorder=1
                         )
-                    ax_curve.plot(
-                        theta_deg_closed,
-                        emp_closed,
-                        "o-",
-                        color="#1F77B4",
-                        linewidth=1.0,
-                        markersize=2.8,
-                        label="Empirical",
-                        zorder=3,
+                    ax_curve_local.plot(
+                        theta_deg_closed, emp_closed, "o-", color="#1F77B4", linewidth=1.0, markersize=2.8,
+                        label="Empirical", zorder=3
                     )
                     if np.any(np.isfinite(fit_s)):
                         fit_closed = np.concatenate([fit_s, np.array([fit_s[0]], dtype=float)])
@@ -25916,76 +28309,67 @@ def _plot_egocentric_per_cell_summary_figure(
                         if np.any(np.isfinite(fit_sem_closed)):
                             lo = fit_closed - np.where(np.isfinite(fit_sem_closed), fit_sem_closed, 0.0)
                             hi = fit_closed + np.where(np.isfinite(fit_sem_closed), fit_sem_closed, 0.0)
-                            ax_curve.fill_between(
-                                theta_deg_closed,
-                                lo,
-                                hi,
-                                color="#D62728",
-                                alpha=0.12,
-                                linewidth=0.0,
-                                zorder=1,
+                            ax_curve_local.fill_between(
+                                theta_deg_closed, lo, hi, color="#D62728", alpha=0.12, linewidth=0.0, zorder=1
                             )
-                        ax_curve.plot(
-                            theta_deg_closed,
-                            fit_closed,
-                            "-",
-                            color="#D62728",
-                            linewidth=1.2,
-                            label="Fitted RH",
-                            zorder=2,
+                        ax_curve_local.plot(
+                            theta_deg_closed, fit_closed, "-", color="#D62728", linewidth=1.2, label="Fitted RH", zorder=2
                         )
             finite_vals = np.concatenate(
-                [
-                    empirical[np.isfinite(empirical)],
-                    fitted[np.isfinite(fitted)],
-                    np.array([1.0], dtype=float),
-                ]
+                [empirical[np.isfinite(empirical)], fitted[np.isfinite(fitted)], np.array([1.0], dtype=float)]
             )
-            if finite_vals.size > 0:
-                rmax = float(np.nanmax(finite_vals))
-                if not np.isfinite(rmax) or rmax <= 0:
-                    rmax = 1.0
-            else:
+            rmax = float(np.nanmax(finite_vals)) if finite_vals.size > 0 else 1.0
+            if (not np.isfinite(rmax)) or rmax <= 0:
                 rmax = 1.0
-            ax_curve.set_ylim(0.0, max(1.05, 1.15 * rmax))
+            ax_curve_local.set_ylim(0.0, max(1.05, 1.15 * rmax))
         else:
             if curve_polar:
-                ax_curve.text(0.0, 0.0, "No valid\ncurve data", ha="center", va="center", fontsize=7)
+                ax_curve_local.text(0.0, 0.0, "No valid\ncurve data", ha="center", va="center", fontsize=7)
             else:
-                ax_curve.text(0.5, 0.5, "No valid\ncurve data", ha="center", va="center", fontsize=7, transform=ax_curve.transAxes)
-            ax_curve.set_ylim(0.0, 1.1)
+                ax_curve_local.text(
+                    0.5, 0.5, "No valid\ncurve data", ha="center", va="center", fontsize=7, transform=ax_curve_local.transAxes
+                )
+            ax_curve_local.set_ylim(0.0, 1.1)
 
         if curve_polar:
             th = np.linspace(0.0, 2.0 * np.pi, 361, dtype=float)
-            ax_curve.plot(th, np.ones_like(th), color="#888888", linewidth=0.6, linestyle="--", alpha=0.7)
+            ax_curve_local.plot(th, np.ones_like(th), color="#888888", linewidth=0.6, linestyle="--", alpha=0.7)
             tick_angles = np.deg2rad(np.array([0.0, 90.0, 180.0, 270.0], dtype=float))
-            ax_curve.set_xticks(tick_angles)
-            ax_curve.set_xticklabels(["0", "90", "180", "270"], fontsize=6)
-            ax_curve.set_title("Empirical vs fitted EB radial", fontsize=7, pad=10)
-            ax_curve.set_rlabel_position(22.5)
+            ax_curve_local.set_xticks(tick_angles)
+            ax_curve_local.set_xticklabels(["0", "90", "180", "270"], fontsize=6)
+            ax_curve_local.set_title(f"{title_prefix} EB radial", fontsize=7, pad=10)
+            ax_curve_local.set_rlabel_position(22.5)
         else:
-            ax_curve.set_xlim(0.0, 360.0)
-            ax_curve.set_xticks([0.0, 90.0, 180.0, 270.0, 360.0])
-            ax_curve.set_xticklabels(["0", "90", "180", "270", "360"], fontsize=6)
-            ax_curve.set_title(
-                f"Empirical vs fitted EB (mean±SEM, n_bins={int(n_valid_bins_emp)})",
+            ax_curve_local.set_xlim(0.0, 360.0)
+            ax_curve_local.set_xticks([0.0, 90.0, 180.0, 270.0, 360.0])
+            ax_curve_local.set_xticklabels(["0", "90", "180", "270", "360"], fontsize=6)
+            ax_curve_local.set_title(
+                f"{title_prefix} EB (mean±SEM, n_bins={int(n_valid_bins_emp)})",
                 fontsize=7,
                 pad=6,
             )
-            ax_curve.set_xlabel("EB angle (deg)", fontsize=7)
-            ax_curve.set_ylabel("Norm. rate", fontsize=7)
-
-        ax_curve.tick_params(labelsize=6)
-        ax_curve.grid(alpha=0.25, linewidth=0.5)
+            ax_curve_local.set_xlabel("EB angle (deg)", fontsize=7)
+            ax_curve_local.set_ylabel("Norm. rate", fontsize=7)
+        ax_curve_local.tick_params(labelsize=6)
+        ax_curve_local.grid(alpha=0.25, linewidth=0.5)
         try:
-            ax_curve.legend(loc="best", fontsize=6, frameon=False)
+            ax_curve_local.legend(loc="best", fontsize=6, frameon=False)
         except Exception:
             pass
+
+    if show_curve:
+        if use_multispike_curve_panels:
+            _plot_curve_panel(ax_curve_all, local_all, plot_fit_all, "All empirical vs fitted")
+            _plot_curve_panel(ax_curve_ss, local_ss, plot_fit_ss, "SS empirical vs fitted")
+            _plot_curve_panel(ax_curve_cs, local_cs, plot_fit_cs, "CS empirical vs fitted")
+        else:
+            _plot_curve_panel(ax_curve, local_all, plot_fit_all, "Empirical vs fitted")
 
     def _plot_spatial_map_panel(
         ax: Any,
         local: dict[str, Any] | None,
         arrow_fields: dict[str, Any],
+        fit_panel: dict[str, Any] | None,
         title: str,
     ) -> None:
         if ax is None:
@@ -26018,8 +28402,9 @@ def _plot_egocentric_per_cell_summary_figure(
             cbar.ax.tick_params(labelsize=6, length=2.0)
             cbar.set_label("Hz", fontsize=7)
 
-            x_ref = _coerce_float_or_nan(plot_fit.get("best_x_ref", np.nan))
-            y_ref = _coerce_float_or_nan(plot_fit.get("best_y_ref", np.nan))
+            fit_use = fit_panel if isinstance(fit_panel, dict) else {}
+            x_ref = _coerce_float_or_nan(fit_use.get("best_x_ref", np.nan))
+            y_ref = _coerce_float_or_nan(fit_use.get("best_y_ref", np.nan))
             if np.isfinite(x_ref) and np.isfinite(y_ref):
                 ax.scatter(
                     [x_ref],
@@ -26151,10 +28536,91 @@ def _plot_egocentric_per_cell_summary_figure(
         ax.set_title(str(title), fontsize=7)
         return im_obj
 
+    def _overlay_pf_mask_reference(ax: Any, pf_mask: Any) -> None:
+        if ax is None:
+            return
+        try:
+            arr = np.asarray(pf_mask, dtype=bool)
+        except Exception:
+            return
+        if arr.ndim != 2 or arr.size == 0 or (not np.any(arr)):
+            return
+        # Match plot_selected_cells_figure contour style using padded mask + extent.
+        padded_mask = np.pad(arr.astype(float), pad_width=1, mode="constant", constant_values=0.0)
+        bin_size = float(width_cm) / float(arr.shape[0])
+        padded_extent = (-bin_size, width_cm + bin_size, -bin_size, height_cm + bin_size)
+        ax.contour(
+            np.asarray(padded_mask, dtype=float).T,
+            levels=[0.5],
+            colors=["magenta"],
+            linewidths=0.8,
+            linestyles="solid",
+            extent=padded_extent,
+            origin="lower",
+            zorder=8,
+        )
+
     if show_spatial_map:
-        _plot_spatial_map_panel(ax_map_all, local_all, arrow_fields_all, "Spatial FR + arrows (All)")
-        _plot_spatial_map_panel(ax_map_ss, local_ss, arrow_fields_ss, "SS rate + arrows")
-        _plot_spatial_map_panel(ax_map_cs, local_cs, arrow_fields_cs, "CS rate + arrows")
+        _plot_spatial_map_panel(ax_map_all, local_all, arrow_fields_all, plot_fit_all, "Spatial FR + arrows (All)")
+        _plot_spatial_map_panel(ax_map_ss, local_ss, arrow_fields_ss, plot_fit_ss, "SS rate + arrows")
+        _plot_spatial_map_panel(ax_map_cs, local_cs, arrow_fields_cs, plot_fit_cs, "CS rate + arrows")
+    _plot_egocentric_bin_polar_grid_panel(
+        fig=fig,
+        parent_ax=ax_binpolar_all,
+        local_tuning=local_all,
+        arrow_fields=arrow_fields_all,
+        title="Bin polar (All)",
+        variant="default",
+    )
+    _plot_egocentric_bin_polar_grid_panel(
+        fig=fig,
+        parent_ax=ax_binpolar_ss,
+        local_tuning=local_ss,
+        arrow_fields=arrow_fields_ss,
+        title="Bin polar (SS)",
+        variant="default",
+    )
+    _plot_egocentric_bin_polar_grid_panel(
+        fig=fig,
+        parent_ax=ax_binpolar_cs,
+        local_tuning=local_cs,
+        arrow_fields=arrow_fields_cs,
+        title="Bin polar (CS)",
+        variant="default",
+    )
+    emp_meta_all = _plot_egocentric_bin_polar_grid_panel(
+        fig=fig,
+        parent_ax=ax_binpolar_emp_all,
+        local_tuning=local_all,
+        arrow_fields=arrow_fields_all,
+        title="Bin polar emp-only (All)",
+        variant="empirical_only_pm45",
+    )
+    emp_meta_ss = _plot_egocentric_bin_polar_grid_panel(
+        fig=fig,
+        parent_ax=ax_binpolar_emp_ss,
+        local_tuning=local_ss,
+        arrow_fields=arrow_fields_ss,
+        title="Bin polar emp-only (SS)",
+        variant="empirical_only_pm45",
+    )
+    emp_meta_cs = _plot_egocentric_bin_polar_grid_panel(
+        fig=fig,
+        parent_ax=ax_binpolar_emp_cs,
+        local_tuning=local_cs,
+        arrow_fields=arrow_fields_cs,
+        title="Bin polar emp-only (CS)",
+        variant="empirical_only_pm45",
+    )
+    green_ring_count_all = int((emp_meta_all or {}).get("green_ring_count", 0))
+    green_ring_count_ss = int((emp_meta_ss or {}).get("green_ring_count", 0))
+    green_ring_count_cs = int((emp_meta_cs or {}).get("green_ring_count", 0))
+    valid_bin_mean_mrl_all = _coerce_float_or_nan((emp_meta_all or {}).get("valid_bin_mean_mrl", np.nan))
+    valid_bin_mean_mrl_ss = _coerce_float_or_nan((emp_meta_ss or {}).get("valid_bin_mean_mrl", np.nan))
+    valid_bin_mean_mrl_cs = _coerce_float_or_nan((emp_meta_cs or {}).get("valid_bin_mean_mrl", np.nan))
+    valid_bin_mrl_n_all = int((emp_meta_all or {}).get("valid_bin_mrl_n", 0))
+    valid_bin_mrl_n_ss = int((emp_meta_ss or {}).get("valid_bin_mrl_n", 0))
+    valid_bin_mrl_n_cs = int((emp_meta_cs or {}).get("valid_bin_mrl_n", 0))
 
     for ax in [ax_psi_all, ax_psi_ss, ax_psi_cs]:
         if ax is None:
@@ -26174,7 +28640,7 @@ def _plot_egocentric_per_cell_summary_figure(
     if use_placecell_split:
         split_pc = _compute_placecell_style_preferred_nonpreferred_maps(
             data=data,
-            fit_info=plot_fit,
+            fit_info=plot_fit_all,
             params=params,
         )
         local_split = {
@@ -26292,6 +28758,9 @@ def _plot_egocentric_per_cell_summary_figure(
             cmap_name=row_cmap,
             norm_obj=split_norm,
         )
+        if row_name == "All":
+            _overlay_pf_mask_reference(ax_pref_rows[row_idx], pf_mask_ref)
+            _overlay_pf_mask_reference(ax_nonpref_rows[row_idx], pf_mask_ref)
         cbar_mappable = im_nonpref if im_nonpref is not None else im_pref
         if cbar_mappable is not None:
             cbar = fig.colorbar(
@@ -26320,22 +28789,69 @@ def _plot_egocentric_per_cell_summary_figure(
     pass100 = _format_pass_value((summary_row or {}).get("pass_100"))
     real_mrl = _coerce_float_or_nan((summary_row or {}).get("real_mrl", np.nan))
     real_mrl_txt = f"{real_mrl:.3f}" if np.isfinite(real_mrl) else "NA"
-    title = (
-        f"{category} | {animal_id} | cell{int(cell_idx) + 1:03d} | "
-        f"real_mrl={real_mrl_txt}"
-    )
-    if bool(plot_fit.get("theta_pi_flipped_for_plot", False)):
-        title += " | plot_theta_flipped_pi"
-    if not has_ref:
-        title += " | NO_BEST_REF"
-    fig.suptitle(title, fontsize=8, y=0.972)
-    _draw_colored_pass_header(
+
+    row_all_for_title = summary_row_all if isinstance(summary_row_all, dict) else summary_row
+    pass99_all_txt = _format_pass_value((row_all_for_title or {}).get("pass_99"))
+    pass99_ss_txt = _format_pass_value((summary_row_ss or {}).get("pass_99"))
+    pass99_cs_txt = _format_pass_value((summary_row_cs or {}).get("pass_99"))
+    pass95_all_txt = _format_pass_value((row_all_for_title or {}).get("pass_95"))
+    pass100_all_txt = _format_pass_value((row_all_for_title or {}).get("pass_100"))
+    pass95_ss_txt = _format_pass_value((summary_row_ss or {}).get("pass_95"))
+    pass100_ss_txt = _format_pass_value((summary_row_ss or {}).get("pass_100"))
+    pass95_cs_txt = _format_pass_value((summary_row_cs or {}).get("pass_95"))
+    pass100_cs_txt = _format_pass_value((summary_row_cs or {}).get("pass_100"))
+
+    real_mrl_all = _coerce_float_or_nan((row_all_for_title or {}).get("real_mrl", np.nan))
+    real_mrl_ss = _coerce_float_or_nan((summary_row_ss or {}).get("real_mrl", np.nan))
+    real_mrl_cs = _coerce_float_or_nan((summary_row_cs or {}).get("real_mrl", np.nan))
+    real_mrl_all_txt = f"{real_mrl_all:.3f}" if np.isfinite(real_mrl_all) else "NA"
+    real_mrl_ss_txt = f"{real_mrl_ss:.3f}" if np.isfinite(real_mrl_ss) else "NA"
+    real_mrl_cs_txt = f"{real_mrl_cs:.3f}" if np.isfinite(real_mrl_cs) else "NA"
+
+    title_main = f"{category} | {animal_id} | cell{int(cell_idx) + 1:03d}"
+    if bool(plot_fit_all.get("theta_pi_flipped_for_plot", False)):
+        title_main += " | plot_theta_flipped_pi"
+    if not has_ref_any:
+        title_main += " | NO_BEST_REF"
+
+    fig.suptitle(title_main, fontsize=7.0, y=0.992, va="top")
+    _draw_colored_pass99_group_line(
         fig=fig,
-        pass95=str(pass95),
-        pass99=str(pass99),
-        pass100=str(pass100),
-        y=0.945,
-        fontsize=8.0,
+        pass99_all=pass99_all_txt,
+        pass99_ss=pass99_ss_txt,
+        pass99_cs=pass99_cs_txt,
+        y=0.975,
+        fontsize=6.8,
+    )
+    _draw_colored_pass_triplet_line(
+        fig=fig,
+        label="all: ",
+        real_mrl_txt=real_mrl_all_txt,
+        pass95=pass95_all_txt,
+        pass99=pass99_all_txt,
+        pass100=pass100_all_txt,
+        y=0.958,
+        fontsize=6.6,
+    )
+    _draw_colored_pass_triplet_line(
+        fig=fig,
+        label="SS: ",
+        real_mrl_txt=real_mrl_ss_txt,
+        pass95=pass95_ss_txt,
+        pass99=pass99_ss_txt,
+        pass100=pass100_ss_txt,
+        y=0.941,
+        fontsize=6.6,
+    )
+    _draw_colored_pass_triplet_line(
+        fig=fig,
+        label="CS: ",
+        real_mrl_txt=real_mrl_cs_txt,
+        pass95=pass95_cs_txt,
+        pass99=pass99_cs_txt,
+        pass100=pass100_cs_txt,
+        y=0.924,
+        fontsize=6.6,
     )
 
     saved_paths: list[str] = []
@@ -26350,12 +28866,21 @@ def _plot_egocentric_per_cell_summary_figure(
     plt.close(fig)
 
     return {
-        "has_best_reference": bool(has_ref),
+        "has_best_reference": bool(has_ref_any),
         "n_subplots": int(n_subplots),
         "real_mrl": float(real_mrl) if np.isfinite(real_mrl) else np.nan,
         "pass_95": pass95,
         "pass_99": pass99,
         "pass_100": pass100,
+        "green_ring_count_all": int(green_ring_count_all),
+        "green_ring_count_ss": int(green_ring_count_ss),
+        "green_ring_count_cs": int(green_ring_count_cs),
+        "valid_bin_mean_mrl_all": float(valid_bin_mean_mrl_all) if np.isfinite(valid_bin_mean_mrl_all) else np.nan,
+        "valid_bin_mean_mrl_ss": float(valid_bin_mean_mrl_ss) if np.isfinite(valid_bin_mean_mrl_ss) else np.nan,
+        "valid_bin_mean_mrl_cs": float(valid_bin_mean_mrl_cs) if np.isfinite(valid_bin_mean_mrl_cs) else np.nan,
+        "valid_bin_mrl_n_all": int(valid_bin_mrl_n_all),
+        "valid_bin_mrl_n_ss": int(valid_bin_mrl_n_ss),
+        "valid_bin_mrl_n_cs": int(valid_bin_mrl_n_cs),
         "saved_paths": saved_paths,
     }
 

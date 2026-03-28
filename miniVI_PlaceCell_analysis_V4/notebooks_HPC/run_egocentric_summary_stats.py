@@ -34,6 +34,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+from utils.placecell_pipeline import _filter_egocentric_summary_row_by_valid_bins
 
 # Default color palette for categories
 DEFAULT_COLORS = {
@@ -82,6 +83,7 @@ def load_results_from_npz(results_dir, manifest, categories):
         row['category'] = cat
         row.setdefault('animal_id', cell_info['animal_id'])
         row.setdefault('cell_idx', cell_info['cell_idx'])
+        row = _filter_egocentric_summary_row_by_valid_bins(row, min_valid_bins=5)
 
         if cat in categories:
             rows.append(row)
@@ -96,8 +98,12 @@ def _coerce_bool(v):
     if isinstance(v, (bool, np.bool_)):
         return bool(v)
     if isinstance(v, (int, float, np.integer, np.floating)):
+        if not np.isfinite(float(v)):
+            return False
         return bool(v)
     s = str(v).strip().lower()
+    if s in ('nan', 'na', 'none', ''):
+        return False
     return s in ('true', '1', 'yes')
 
 

@@ -8796,7 +8796,7 @@ def plot_place_field_traversal_trials(
                 trial_color = session_colors[session_idx]
         # Build trial label with direction type
         trial_type = valid_traversal_types[trial_idx] if trial_idx < len(valid_traversal_types) else "?"
-        type_label = trial_type.upper() if trial_type in ("cw", "ccw") else ""
+        type_label = _format_trial_type_label(trial_type)
         trial_label = f"{trial_idx + 1}" + (
             f" {type_label}" if type_label and not bool(trajectory_direction_label_top) else ""
         )
@@ -9845,6 +9845,12 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
     trajectory_color_cmap = kwargs.pop("trajectory_color_cmap", None)
     trajectory_color_vmin = kwargs.pop("trajectory_color_vmin", None)
     trajectory_color_vmax = kwargs.pop("trajectory_color_vmax", None)
+    trial_type_label_map = kwargs.pop("trial_type_label_map", None)
+    trajectory_spatial_bin_hd_overlays_by_trial = kwargs.pop("trajectory_spatial_bin_hd_overlays_by_trial", None)
+    trajectory_spatial_bin_hd_overlay_scale_cm = float(kwargs.pop("trajectory_spatial_bin_hd_overlay_scale_cm", 2.5))
+    trajectory_spatial_bin_hd_overlay_valid_color = str(kwargs.pop("trajectory_spatial_bin_hd_overlay_valid_color", "#4D4D4D"))
+    trajectory_spatial_bin_hd_overlay_green_color = str(kwargs.pop("trajectory_spatial_bin_hd_overlay_green_color", "#1A9C3D"))
+    trajectory_spatial_bin_hd_overlay_alpha = float(kwargs.pop("trajectory_spatial_bin_hd_overlay_alpha", 0.9))
     pf_occupancy_mask = kwargs.pop("pf_occupancy_mask", None)
     show_pf_centered_pct = bool(kwargs.pop("show_pf_centered_pct", True))
     pf_mask_shape_ref = np.asarray(place_field_mask, dtype=bool).shape
@@ -9947,6 +9953,16 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
             fontname="Arial",
             color="black",
         )
+
+    def _format_trial_type_label(raw_type):
+        key = str(raw_type).strip().lower()
+        if isinstance(trial_type_label_map, dict) and key in trial_type_label_map:
+            return str(trial_type_label_map.get(key, ""))
+        if key in {"cw", "ccw"}:
+            return key.upper()
+        if key in {"p", "np"}:
+            return key.upper()
+        return ""
 
     trace_z = _safe_zscore(trace, zscore_traces)
     theta_z = _safe_zscore(theta_vm, zscore_traces)
@@ -10594,7 +10610,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                 trial_color = session_colors[session_idx]
         # Build trial label with direction type
         trial_type = valid_traversal_types[trial_idx] if trial_idx < len(valid_traversal_types) else "?"
-        type_label = trial_type.upper() if trial_type in ("cw", "ccw") else ""
+        type_label = _format_trial_type_label(trial_type)
         trial_label = f"{trial_idx + 1}" + (
             f" {type_label}" if type_label and not bool(trajectory_direction_label_top) else ""
         )
@@ -10892,6 +10908,54 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                     linewidth=0.6,
                     zorder=1,
                 )
+
+        if (
+            isinstance(trajectory_spatial_bin_hd_overlays_by_trial, (list, tuple))
+            and trial_idx < len(trajectory_spatial_bin_hd_overlays_by_trial)
+        ):
+            overlay_obj = trajectory_spatial_bin_hd_overlays_by_trial[trial_idx]
+            if isinstance(overlay_obj, dict):
+                ov_x = np.asarray(overlay_obj.get("x", np.array([])), dtype=float).reshape(-1)
+                ov_y = np.asarray(overlay_obj.get("y", np.array([])), dtype=float).reshape(-1)
+                ov_ang = np.asarray(overlay_obj.get("angle", np.array([])), dtype=float).reshape(-1)
+                ov_green = np.asarray(overlay_obj.get("is_green", np.array([])), dtype=bool).reshape(-1)
+                n_ov = int(min(ov_x.size, ov_y.size, ov_ang.size))
+                if n_ov > 0:
+                    if ov_green.size < n_ov:
+                        ov_green = np.pad(
+                            ov_green,
+                            (0, n_ov - ov_green.size),
+                            mode="constant",
+                            constant_values=False,
+                        )
+                    for kk in range(n_ov):
+                        x0 = float(ov_x[kk])
+                        y0 = float(ov_y[kk])
+                        a0 = float(ov_ang[kk])
+                        if not (np.isfinite(x0) and np.isfinite(y0) and np.isfinite(a0)):
+                            continue
+                        is_green = bool(ov_green[kk])
+                        arrow_col = "#0B3D91"
+                        # Keep arrows visible but compact (~3x smaller than prior setting).
+                        scale = float(max(0.25, trajectory_spatial_bin_hd_overlay_scale_cm / 3.0))
+                        dx = float(np.cos(a0) * scale)
+                        dy = float(np.sin(a0) * scale)
+                        from matplotlib.patches import FancyArrowPatch
+
+                        arrow = FancyArrowPatch(
+                            (x0, y0),
+                            (x0 + dx, y0 + dy),
+                            arrowstyle="->",
+                            mutation_scale=(5.8 if is_green else 5.2),
+                            linewidth=(0.8 if is_green else 0.7),
+                            color=arrow_col,
+                            facecolor="none",
+                            edgecolor=arrow_col,
+                            alpha=float(np.clip(trajectory_spatial_bin_hd_overlay_alpha, 0.0, 1.0)),
+                            zorder=(12 if is_green else 11),
+                        )
+                        arrow.set_clip_on(True)
+                        ax_traj.add_patch(arrow)
 
         avg_n = 5
 
@@ -13076,7 +13140,8 @@ def plot_place_field_traversal_trials_with_average(
                 trial_color = session_colors[session_idx]
         # Build trial label with direction type
         trial_type = valid_traversal_types[trial_idx] if trial_idx < len(valid_traversal_types) else "?"
-        type_label = trial_type.upper() if trial_type in ("cw", "ccw") else ""
+        type_key = str(trial_type).strip().lower()
+        type_label = type_key.upper() if type_key in ("cw", "ccw", "p", "np") else ""
         trial_label = f"{trial_idx + 1}" + (
             f" {type_label}" if type_label and not bool(trajectory_direction_label_top) else ""
         )
