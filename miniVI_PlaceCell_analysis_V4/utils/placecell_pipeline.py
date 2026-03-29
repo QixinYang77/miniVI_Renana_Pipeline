@@ -29,6 +29,7 @@ import nbformat
 from nbclient import NotebookClient
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
+from matplotlib.collections import LineCollection
 import numpy as np
 from scipy import optimize, signal
 from scipy import stats as scipy_stats
@@ -41,6 +42,9 @@ from utils.placecell_core import *  # noqa: F401,F403
 
 PIPELINE_VERSION = "1.3.2"
 MANIFEST_FILENAME = "ckii_pipeline_manifest_v1.json"
+# Keep preferred/non-preferred split maps aligned with empirical-only mini-polar
+# zone checks (column 8 in per-cell egocentric summary figures).
+EGOCENTRIC_PREF_HALF_WIDTH_DEG = 50.0
 
 POOLED_FIGURE_TASKS: dict[str, dict[str, Any]] = {
     "CellType_Distribution_PieChart": {
@@ -348,6 +352,7 @@ class EgocentricSummaryPlotParams:
     local_spatial_bin_cm: float = 2.0
     n_angle_bins: int = 10
     occupancy_threshold_s: float = 0.5
+    occupancy_threshold_split_s: float = 0.1
     min_occupied_angle_bins: int = 5
     min_mean_rate_hz: float = 0.5
     only_plot_spikes_in_valid_spatial_bins: bool = True
@@ -383,7 +388,10 @@ class EgocentricSummaryPlotParams:
     theta_slow_min_duration_s: float = 0.25
     theta_slow_merge_gap_s: float = 0.0
     split_maps_placecell_style: bool = True
+    split_preferred_angle_source: str = "fit"  # "fit"(red) or "empirical"(blue)
+    split_preferred_half_width_deg: float = EGOCENTRIC_PREF_HALF_WIDTH_DEG
     split_map_bin_size_cm: float | None = None
+    pf_overlay_area_threshold: float = 0.25  # coarse bin in-PF if overlap area ratio >= threshold
     pc_bin_size_cm: float = 1.5
     pc_smooth_sigma: float = 2.0
     pc_occ_smooth_sigma: float = 2.0
@@ -394,6 +402,7 @@ class EgocentricSummaryPlotParams:
     pc_speed_threshold_cm_s: float = 3.0
     pc_min_duration_s: float = 0.25
     pc_merge_gap_s: float = 0.0
+    hd_vel_corr_method: str = "normalized_dot"  # "normalized_dot" | "mean_raw_dot"
     summary_df: Any | None = None
 
 
@@ -6060,7 +6069,33 @@ def generate_trial_by_trial_plc_plots(
                 )
                 category_counters[category_name]["skipped_or_error"] += 1
 
-    summary_df = pd.DataFrame(summary_rows)
+    summary_columns = [
+        "category",
+        "animal_id",
+        "cell_idx",
+        "cell_num",
+        "pf_rank",
+        "status",
+        "n_detected_traversals",
+        "n_classified_traversals",
+        "n_preferred_traversals",
+        "n_nonpreferred_traversals",
+        "n_unclassified_traversals",
+        "preferred_fraction_threshold",
+        "preferred_half_width_deg",
+        "min_covered_green_bins",
+        "traversal_bin_selection_mode",
+        "preferred_angle_source",
+        "fit_angle_fallback_to_empirical",
+        "classification_frame_selection_mode",
+        "classification_drz_segment_mode",
+        "classification_phase_signed_drz_filter",
+        "classification_speed_threshold_used",
+        "first_n_minutes",
+        "min_valid_traversal_duration_s",
+        "message",
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
     if save_summary_csv:
         summary_df.to_csv(summary_csv, index=False)
 
@@ -6501,7 +6536,33 @@ def generate_distance_defined_trial_by_trial_plc_plots(
                 )
                 category_counters[category_name]["skipped_or_error"] += 1
 
-    summary_df = pd.DataFrame(summary_rows)
+    summary_columns = [
+        "category",
+        "animal_id",
+        "cell_idx",
+        "cell_num",
+        "pf_rank",
+        "status",
+        "n_detected_traversals",
+        "n_classified_traversals",
+        "n_preferred_traversals",
+        "n_nonpreferred_traversals",
+        "n_unclassified_traversals",
+        "preferred_fraction_threshold",
+        "preferred_half_width_deg",
+        "min_covered_green_bins",
+        "traversal_bin_selection_mode",
+        "preferred_angle_source",
+        "fit_angle_fallback_to_empirical",
+        "classification_frame_selection_mode",
+        "classification_drz_segment_mode",
+        "classification_phase_signed_drz_filter",
+        "classification_speed_threshold_used",
+        "first_n_minutes",
+        "min_valid_traversal_duration_s",
+        "message",
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
     if save_summary_csv:
         summary_df.to_csv(summary_csv, index=False)
 
@@ -7750,7 +7811,33 @@ def generate_distance_defined_trials_and_dataset(
             block["n_entries"] = int(len(block["entries"]))
         dataset[cat] = category_payload
 
-    summary_df = pd.DataFrame(summary_rows)
+    summary_columns = [
+        "category",
+        "animal_id",
+        "cell_idx",
+        "cell_num",
+        "pf_rank",
+        "status",
+        "n_detected_traversals",
+        "n_classified_traversals",
+        "n_preferred_traversals",
+        "n_nonpreferred_traversals",
+        "n_unclassified_traversals",
+        "preferred_fraction_threshold",
+        "preferred_half_width_deg",
+        "min_covered_green_bins",
+        "traversal_bin_selection_mode",
+        "preferred_angle_source",
+        "fit_angle_fallback_to_empirical",
+        "classification_frame_selection_mode",
+        "classification_drz_segment_mode",
+        "classification_phase_signed_drz_filter",
+        "classification_speed_threshold_used",
+        "first_n_minutes",
+        "min_valid_traversal_duration_s",
+        "message",
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
     if save_summary_csv:
         summary_df.to_csv(summary_csv, index=False)
 
@@ -21067,7 +21154,12 @@ def _load_egocentric_npz_summary_lookup(
 
 
 def _load_selected_cells_from_egocentric_csplus_svgs(csplus_svg_dir: Path) -> list[tuple[str, int]]:
-    pat = re.compile(r"^(?P<animal>.+)_cell(?P<cell>\d+)_egocentric_summary_any99_3spike\.svg$", re.IGNORECASE)
+    # Accept threshold-tagged exports from per-cell egocentric summaries, e.g.
+    # "..._egocentric_summary_any99_3spike.svg", "..._egocentric_summary_any100_3spike.svg".
+    pat = re.compile(
+        r"^(?P<animal>.+)_cell(?P<cell>\d+)_egocentric_summary_any\d+_3spike\.svg$",
+        re.IGNORECASE,
+    )
     out: list[tuple[str, int]] = []
     if not Path(csplus_svg_dir).exists():
         return out
@@ -22265,7 +22357,33 @@ def generate_drz_trials_and_dataset_egocentric_preferred_nonpreferred(
         }
     dataset["CSplus"] = category_payload
 
-    summary_df = pd.DataFrame(summary_rows)
+    summary_columns = [
+        "category",
+        "animal_id",
+        "cell_idx",
+        "cell_num",
+        "pf_rank",
+        "status",
+        "n_detected_traversals",
+        "n_classified_traversals",
+        "n_preferred_traversals",
+        "n_nonpreferred_traversals",
+        "n_unclassified_traversals",
+        "preferred_fraction_threshold",
+        "preferred_half_width_deg",
+        "min_covered_green_bins",
+        "traversal_bin_selection_mode",
+        "preferred_angle_source",
+        "fit_angle_fallback_to_empirical",
+        "classification_frame_selection_mode",
+        "classification_drz_segment_mode",
+        "classification_phase_signed_drz_filter",
+        "classification_speed_threshold_used",
+        "first_n_minutes",
+        "min_valid_traversal_duration_s",
+        "message",
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
     if bool(save_summary_csv):
         figure_root.mkdir(parents=True, exist_ok=True)
         summary_df.to_csv(summary_csv, index=False)
@@ -23660,8 +23778,8 @@ def _wrap_angle_to_pi(angle_rad: np.ndarray | float) -> np.ndarray | float:
 
 
 def _to_compass_display_angle(angle_rad: np.ndarray | float) -> np.ndarray | float:
-    """Rotate angles for display so North is 0, West is +90, South is 180, East is 270."""
-    out = _wrap_angle_to_pi(np.asarray(angle_rad, dtype=float) - (np.pi / 2.0))
+    """Display angles in math convention: East 0, North +90, West ±180, South -90."""
+    out = _wrap_angle_to_pi(np.asarray(angle_rad, dtype=float))
     if np.isscalar(angle_rad):
         return float(np.asarray(out).reshape(-1)[0])
     return np.asarray(out, dtype=float)
@@ -25011,6 +25129,8 @@ def run_pooled_egocentric_tuning_analysis_old(
         raise ValueError("n_angle_bins must be >= 2.")
     if float(params.speed_min_cm_s) < 0 or float(params.speed_max_cm_s) <= float(params.speed_min_cm_s):
         raise ValueError("speed bounds must satisfy 0 <= speed_min_cm_s < speed_max_cm_s.")
+    if float(getattr(params, "occupancy_threshold_split_s", 0.1)) < 0:
+        raise ValueError("occupancy_threshold_split_s must be >= 0.")
     if params.first_n_minutes is not None and float(params.first_n_minutes) <= 0:
         raise ValueError("first_n_minutes must be > 0 when provided.")
     if int(params.n_restarts) < 1:
@@ -25528,6 +25648,58 @@ def _compute_empirical_hd_arrow_fields_for_valid_bins(
     out["spatial_valid_mask"] = np.asarray(spatial_valid, dtype=bool)
     out["psi_emp_map"] = np.asarray(psi_emp, dtype=float)
     out["mrl_emp_map"] = np.asarray(mrl_emp, dtype=float)
+    return out
+
+
+def _compute_empirical_direction_lookup_all_bins(
+    *,
+    local_tuning: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {
+        "x_edges": np.array([], dtype=float),
+        "y_edges": np.array([], dtype=float),
+        "dir_map": np.array([], dtype=float),
+    }
+    if not isinstance(local_tuning, dict):
+        return out
+
+    x_edges = np.asarray(local_tuning.get("x_edges", np.array([])), dtype=float)
+    y_edges = np.asarray(local_tuning.get("y_edges", np.array([])), dtype=float)
+    norm_rate = np.asarray(local_tuning.get("normalized_rate", np.array([])), dtype=float)
+    angle_centers = np.asarray(local_tuning.get("angle_centers", np.array([])), dtype=float).reshape(-1)
+    if x_edges.size < 2 or y_edges.size < 2:
+        return out
+    nx = int(x_edges.size - 1)
+    ny = int(y_edges.size - 1)
+    dir_map = np.full((nx, ny), np.nan, dtype=float)
+    if (
+        norm_rate.ndim != 3
+        or norm_rate.shape[0] != nx
+        or norm_rate.shape[1] != ny
+        or norm_rate.shape[2] != angle_centers.size
+        or angle_centers.size <= 0
+    ):
+        out["x_edges"] = np.asarray(x_edges, dtype=float)
+        out["y_edges"] = np.asarray(y_edges, dtype=float)
+        out["dir_map"] = np.asarray(dir_map, dtype=float)
+        return out
+
+    for ix in range(nx):
+        for iy in range(ny):
+            curve = np.asarray(norm_rate[ix, iy, :], dtype=float)
+            ok = np.isfinite(curve) & np.isfinite(angle_centers) & (curve >= 0)
+            if np.sum(ok) <= 0:
+                continue
+            w = curve[ok]
+            w_sum = float(np.sum(w))
+            if (not np.isfinite(w_sum)) or w_sum <= 0:
+                continue
+            vec = np.sum(w * np.exp(1j * angle_centers[ok])) / w_sum
+            dir_map[ix, iy] = float(np.angle(vec))
+
+    out["x_edges"] = np.asarray(x_edges, dtype=float)
+    out["y_edges"] = np.asarray(y_edges, dtype=float)
+    out["dir_map"] = np.asarray(dir_map, dtype=float)
     return out
 
 
@@ -26158,6 +26330,7 @@ def _extract_egocentric_plot_timeseries(
         params=params,
     )
     pf_mask_ref = None
+    pf_components_ref: list[np.ndarray] = []
     if isinstance(analysis, dict):
         try:
             _pf = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
@@ -26165,6 +26338,16 @@ def _extract_egocentric_plot_timeseries(
                 pf_mask_ref = np.asarray(_pf, dtype=bool)
         except Exception:
             pf_mask_ref = None
+        try:
+            for comp in list(analysis.get("place_field_components", []) or []):
+                m = np.asarray((comp or {}).get("mask", []), dtype=bool)
+                if m.ndim == 2 and m.size > 0 and np.any(m):
+                    pf_components_ref.append(np.asarray(m, dtype=bool))
+        except Exception:
+            pf_components_ref = list(pf_components_ref)
+    if (len(pf_components_ref) <= 0) and isinstance(pf_mask_ref, np.ndarray):
+        if pf_mask_ref.ndim == 2 and pf_mask_ref.size > 0 and np.any(pf_mask_ref):
+            pf_components_ref = [np.asarray(pf_mask_ref, dtype=bool)]
 
     def _load_trace_for_theta_slow() -> np.ndarray:
         # Match plot_selected_cells_figure / spatial_analysis_full path:
@@ -26363,6 +26546,7 @@ def _extract_egocentric_plot_timeseries(
         "place_field_mask_ref": (
             np.asarray(pf_mask_ref, dtype=bool) if isinstance(pf_mask_ref, np.ndarray) else None
         ),
+        "place_field_components_ref": [np.asarray(m, dtype=bool) for m in pf_components_ref],
         "theta_amp_bin": np.asarray(theta_amp_bin, dtype=float),
         "slow_vm_bin": np.asarray(slow_vm_bin, dtype=float),
         "n_valid_spikes_before_spatial_filter": int(all_plot["n_before_spatial"]),
@@ -26394,13 +26578,13 @@ def _draw_egocentric_donut_colorbar(
     values = np.linspace(float(norm.vmin), float(norm.vmax), nseg, dtype=float)[None, :]
     cmap = plt.get_cmap(str(cmap_name))
     ax.pcolormesh(theta_grid, r_grid, values, cmap=cmap, norm=norm, shading="auto")
-    ax.set_theta_zero_location("N")
+    ax.set_theta_zero_location("E")
     ax.set_theta_direction(1)
     ax.set_yticks([])
     ax.set_ylim(0.0, float(outer_radius) + 0.05)
     tick_angles = np.deg2rad(np.array([0.0, 90.0, 180.0, 270.0], dtype=float))
     ax.set_xticks(tick_angles)
-    ax.set_xticklabels(["0", "90", "180", "270"], fontsize=6)
+    ax.set_xticklabels(["0", "90", "180", "-90"], fontsize=6)
     ax.grid(False)
     ax.set_title("Angle (deg)", fontsize=7, pad=8)
 
@@ -26959,6 +27143,10 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
     data: dict[str, Any],
     fit_info: dict[str, Any],
     params: EgocentricSummaryPlotParams,
+    preferred_angle_source: str = "fit",
+    preferred_lookup_specs: dict[str, dict[str, Any]] | None = None,
+    preferred_half_width_deg: float = EGOCENTRIC_PREF_HALF_WIDTH_DEG,
+    apply_min_occupancy_mask: bool = True,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "ok": False,
@@ -26972,6 +27160,9 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
         "theta": {"preferred_map": np.array([], dtype=float), "nonpreferred_map": np.array([], dtype=float)},
         "slow": {"preferred_map": np.array([], dtype=float), "nonpreferred_map": np.array([], dtype=float)},
     }
+    split_source = str(preferred_angle_source).strip().lower()
+    if split_source not in {"fit", "empirical"}:
+        split_source = "fit"
 
     pcfg = data.get("placecell_map_params", {})
     if not isinstance(pcfg, dict):
@@ -27013,6 +27204,11 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
     speed_threshold = _coerce_float_or_nan(pcfg.get("speed_threshold", np.nan))
     min_duration_s = _coerce_float_or_nan(pcfg.get("min_duration_s", np.nan))
     merge_gap_s = _coerce_float_or_nan(pcfg.get("merge_gap_s", np.nan))
+    split_occ_threshold_s = _coerce_float_or_nan(getattr(params, "occupancy_threshold_split_s", np.nan))
+    if (not np.isfinite(split_occ_threshold_s)) or split_occ_threshold_s < 0:
+        split_occ_threshold_s = _coerce_float_or_nan(getattr(params, "occupancy_threshold_s", np.nan))
+    if (not np.isfinite(split_occ_threshold_s)) or split_occ_threshold_s < 0:
+        split_occ_threshold_s = 0.1
 
     if not np.isfinite(width_real):
         width_real = float(params.arena_size_cm[0])
@@ -27059,7 +27255,12 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
     x_ref = _coerce_float_or_nan(fit_info.get("best_x_ref", np.nan))
     y_ref = _coerce_float_or_nan(fit_info.get("best_y_ref", np.nan))
     theta = _coerce_float_or_nan(fit_info.get("best_theta", np.nan))
-    if not (np.isfinite(x_ref) and np.isfinite(y_ref) and np.isfinite(theta)):
+    fit_has_ref = bool(np.isfinite(x_ref) and np.isfinite(y_ref) and np.isfinite(theta))
+    fit_dir_map = np.full((nx, ny), np.nan, dtype=float)
+    if fit_has_ref:
+        alpha = np.arctan2(float(y_ref) - yy, float(x_ref) - xx)
+        fit_dir_map = _wrap_angle_to_pi(alpha - float(theta))
+    elif split_source == "fit":
         out["reason"] = "missing_fit_reference"
         nan_map = np.full((nx, ny), np.nan, dtype=float)
         out["x_edges"] = np.asarray(x_edges, dtype=float)
@@ -27071,9 +27272,6 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
                 "nonpreferred_map": np.asarray(nan_map, dtype=float),
             }
         return out
-
-    alpha = np.arctan2(float(y_ref) - yy, float(x_ref) - xx)
-    red_dir_map = _wrap_angle_to_pi(alpha - float(theta))
 
     valid_frames = (
         np.isfinite(x_arr)
@@ -27111,7 +27309,7 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
         nan_map = np.full((nx, ny), np.nan, dtype=float)
         out["x_edges"] = np.asarray(x_edges, dtype=float)
         out["y_edges"] = np.asarray(y_edges, dtype=float)
-        out["red_dir_map"] = np.asarray(red_dir_map, dtype=float)
+        out["red_dir_map"] = np.asarray(fit_dir_map, dtype=float)
         for key in ("all", "ss", "cs", "theta", "slow"):
             out[key] = {
                 "preferred_map": np.asarray(nan_map, dtype=float),
@@ -27119,41 +27317,86 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
             }
         return out
 
-    xi_mv = _digitize_with_upper_edge_inclusive(x_arr[moving_idx], x_edges)
-    yi_mv = _digitize_with_upper_edge_inclusive(y_arr[moving_idx], y_edges)
-    in_bounds = (
-        (xi_mv >= 0)
-        & (yi_mv >= 0)
-        & (xi_mv < nx)
-        & (yi_mv < ny)
-    )
-    dir_mv = dir_arr[moving_idx]
-    finite_mv = np.isfinite(dir_mv) & np.isfinite(x_arr[moving_idx]) & np.isfinite(y_arr[moving_idx])
-    keep_mv = in_bounds & finite_mv
-    pref_idx = np.array([], dtype=int)
-    nonpref_idx = np.array([], dtype=int)
-    if np.any(keep_mv):
+    x_mv = np.asarray(x_arr[moving_idx], dtype=float)
+    y_mv = np.asarray(y_arr[moving_idx], dtype=float)
+    dir_mv = np.asarray(dir_arr[moving_idx], dtype=float)
+    finite_mv = np.isfinite(dir_mv) & np.isfinite(x_mv) & np.isfinite(y_mv)
+    pref_half_width_rad = float(np.deg2rad(float(preferred_half_width_deg)))
+
+    def _resolve_lookup_spec(
+        key: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # Default fallback uses old fit-based reference on split-map bins.
+        fallback = (
+            np.asarray(x_edges, dtype=float),
+            np.asarray(y_edges, dtype=float),
+            np.asarray(fit_dir_map, dtype=float),
+        )
+        if split_source != "empirical" or not isinstance(preferred_lookup_specs, dict):
+            return fallback
+        spec = preferred_lookup_specs.get(str(key), {})
+        if not isinstance(spec, dict):
+            return fallback
+        x_lookup = np.asarray(spec.get("x_edges", np.array([])), dtype=float)
+        y_lookup = np.asarray(spec.get("y_edges", np.array([])), dtype=float)
+        dir_lookup = np.asarray(spec.get("dir_map", np.array([])), dtype=float)
+        if x_lookup.size < 2 or y_lookup.size < 2:
+            return fallback
+        nx_lookup = int(x_lookup.size - 1)
+        ny_lookup = int(y_lookup.size - 1)
+        if dir_lookup.shape != (nx_lookup, ny_lookup):
+            return fallback
+        return np.asarray(x_lookup, dtype=float), np.asarray(y_lookup, dtype=float), np.asarray(dir_lookup, dtype=float)
+
+    def _build_split_masks_from_lookup(
+        x_lookup: np.ndarray,
+        y_lookup: np.ndarray,
+        dir_lookup: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pref_mask_local = np.zeros(n_frames, dtype=bool)
+        nonpref_mask_local = np.zeros(n_frames, dtype=bool)
+        xi_mv = _digitize_with_upper_edge_inclusive(x_mv, x_lookup)
+        yi_mv = _digitize_with_upper_edge_inclusive(y_mv, y_lookup)
+        in_bounds = (
+            (xi_mv >= 0)
+            & (yi_mv >= 0)
+            & (xi_mv < int(x_lookup.size - 1))
+            & (yi_mv < int(y_lookup.size - 1))
+        )
+        keep_mv = in_bounds & finite_mv
+        if not np.any(keep_mv):
+            return pref_mask_local, nonpref_mask_local
         idx_use = moving_idx[keep_mv]
         ii = xi_mv[keep_mv].astype(int)
         jj = yi_mv[keep_mv].astype(int)
         dirs = dir_mv[keep_mv]
-        ref = red_dir_map[ii, jj]
+        ref = dir_lookup[ii, jj]
         has_ref = np.isfinite(ref)
-        if np.any(has_ref):
-            idx_use = idx_use[has_ref]
-            dirs = dirs[has_ref]
-            ref = ref[has_ref]
-            delta = _wrap_angle_to_pi(dirs - ref)
-            is_pref = np.abs(delta) <= (np.pi / 4.0 + 1e-12)
-            pref_idx = np.asarray(idx_use[is_pref], dtype=int)
-            nonpref_idx = np.asarray(idx_use[~is_pref], dtype=int)
+        if not np.any(has_ref):
+            return pref_mask_local, nonpref_mask_local
+        idx_use = idx_use[has_ref]
+        dirs = dirs[has_ref]
+        ref = ref[has_ref]
+        delta = _wrap_angle_to_pi(dirs - ref)
+        is_pref = np.abs(delta) <= (pref_half_width_rad + 1e-12)
+        if np.any(is_pref):
+            pref_mask_local[np.asarray(idx_use[is_pref], dtype=int)] = True
+        if np.any(~is_pref):
+            nonpref_mask_local[np.asarray(idx_use[~is_pref], dtype=int)] = True
+        return pref_mask_local, nonpref_mask_local
 
-    pref_mask = np.zeros(n_frames, dtype=bool)
-    nonpref_mask = np.zeros(n_frames, dtype=bool)
-    if pref_idx.size > 0:
-        pref_mask[pref_idx] = True
-    if nonpref_idx.size > 0:
-        nonpref_mask[nonpref_idx] = True
+    x_lookup_all, y_lookup_all, dir_lookup_all = _resolve_lookup_spec("all")
+    x_lookup_ss, y_lookup_ss, dir_lookup_ss = _resolve_lookup_spec("ss")
+    x_lookup_cs, y_lookup_cs, dir_lookup_cs = _resolve_lookup_spec("cs")
+    pref_mask_all, nonpref_mask_all = _build_split_masks_from_lookup(
+        x_lookup_all, y_lookup_all, dir_lookup_all
+    )
+    pref_mask_ss, nonpref_mask_ss = _build_split_masks_from_lookup(
+        x_lookup_ss, y_lookup_ss, dir_lookup_ss
+    )
+    pref_mask_cs, nonpref_mask_cs = _build_split_masks_from_lookup(
+        x_lookup_cs, y_lookup_cs, dir_lookup_cs
+    )
 
     def _compute_occ_and_low_mask(split_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         idx = np.where(np.asarray(split_mask, dtype=bool))[0]
@@ -27168,10 +27411,8 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
             occ_map = core.gaussian_filter(occ_raw, sigma=float(occ_smooth_sigma), mode="constant")
         else:
             occ_map = np.asarray(occ_raw, dtype=float)
-        if use_smoothed_occ_mask:
-            low_occ = occ_map < float(min_occupancy_s)
-        else:
-            low_occ = occ_raw < float(min_occupancy_s)
+        # Split-map validity is defined only by split occupancy in this map.
+        low_occ = np.asarray(occ_raw, dtype=float) < float(split_occ_threshold_s)
         return np.asarray(occ_map, dtype=float), np.asarray(low_occ, dtype=bool)
 
     def _rate_map_for_spikes(
@@ -27188,7 +27429,8 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
             spk = spk[np.asarray(split_mask[spk], dtype=bool)]
         if spk.size == 0:
             out_map = np.zeros((nx, ny), dtype=float)
-            out_map[np.asarray(low_occ_mask, dtype=bool)] = np.nan
+            if bool(apply_min_occupancy_mask):
+                out_map[np.asarray(low_occ_mask, dtype=bool)] = np.nan
             return np.asarray(out_map, dtype=float)
         spk_counts, _, _ = np.histogram2d(x_arr[spk], y_arr[spk], bins=[x_edges, y_edges])
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -27199,7 +27441,8 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
             smooth_map = core.gaussian_filter(raw_map, sigma=float(smooth_sigma), mode="constant")
         else:
             smooth_map = np.asarray(raw_map, dtype=float)
-        smooth_map[np.asarray(low_occ_mask, dtype=bool)] = np.nan
+        if bool(apply_min_occupancy_mask):
+            smooth_map[np.asarray(low_occ_mask, dtype=bool)] = np.nan
         return np.asarray(smooth_map, dtype=float)
 
     def _mean_map_for_values(
@@ -27227,34 +27470,45 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
         with np.errstate(divide="ignore", invalid="ignore"):
             mean_map = np.asarray(sums, dtype=float) / np.asarray(counts, dtype=float)
         mean_map[np.asarray(counts, dtype=float) == 0] = np.nan
-        mean_map[np.asarray(low_occ_mask, dtype=bool)] = np.nan
+        if bool(apply_min_occupancy_mask):
+            mean_map[np.asarray(low_occ_mask, dtype=bool)] = np.nan
         return np.asarray(mean_map, dtype=float)
 
-    pref_occ_map, pref_low_occ = _compute_occ_and_low_mask(pref_mask)
-    nonpref_occ_map, nonpref_low_occ = _compute_occ_and_low_mask(nonpref_mask)
+    pref_occ_map_all, pref_low_occ_all = _compute_occ_and_low_mask(pref_mask_all)
+    nonpref_occ_map_all, nonpref_low_occ_all = _compute_occ_and_low_mask(nonpref_mask_all)
+    pref_occ_map_ss, pref_low_occ_ss = _compute_occ_and_low_mask(pref_mask_ss)
+    nonpref_occ_map_ss, nonpref_low_occ_ss = _compute_occ_and_low_mask(nonpref_mask_ss)
+    pref_occ_map_cs, pref_low_occ_cs = _compute_occ_and_low_mask(pref_mask_cs)
+    nonpref_occ_map_cs, nonpref_low_occ_cs = _compute_occ_and_low_mask(nonpref_mask_cs)
 
     out["x_edges"] = np.asarray(x_edges, dtype=float)
     out["y_edges"] = np.asarray(y_edges, dtype=float)
-    out["red_dir_map"] = np.asarray(red_dir_map, dtype=float)
+    out["red_dir_map"] = np.asarray(fit_dir_map, dtype=float)
     out["all"] = {
-        "preferred_map": _rate_map_for_spikes(raw_all, pref_mask, pref_occ_map, pref_low_occ),
-        "nonpreferred_map": _rate_map_for_spikes(raw_all, nonpref_mask, nonpref_occ_map, nonpref_low_occ),
+        "preferred_map": _rate_map_for_spikes(raw_all, pref_mask_all, pref_occ_map_all, pref_low_occ_all),
+        "nonpreferred_map": _rate_map_for_spikes(raw_all, nonpref_mask_all, nonpref_occ_map_all, nonpref_low_occ_all),
+        "preferred_occupancy_s": np.asarray(pref_occ_map_all, dtype=float),
+        "nonpreferred_occupancy_s": np.asarray(nonpref_occ_map_all, dtype=float),
     }
     out["ss"] = {
-        "preferred_map": _rate_map_for_spikes(raw_ss, pref_mask, pref_occ_map, pref_low_occ),
-        "nonpreferred_map": _rate_map_for_spikes(raw_ss, nonpref_mask, nonpref_occ_map, nonpref_low_occ),
+        "preferred_map": _rate_map_for_spikes(raw_ss, pref_mask_ss, pref_occ_map_ss, pref_low_occ_ss),
+        "nonpreferred_map": _rate_map_for_spikes(raw_ss, nonpref_mask_ss, nonpref_occ_map_ss, nonpref_low_occ_ss),
+        "preferred_occupancy_s": np.asarray(pref_occ_map_ss, dtype=float),
+        "nonpreferred_occupancy_s": np.asarray(nonpref_occ_map_ss, dtype=float),
     }
     out["cs"] = {
-        "preferred_map": _rate_map_for_spikes(raw_cs, pref_mask, pref_occ_map, pref_low_occ),
-        "nonpreferred_map": _rate_map_for_spikes(raw_cs, nonpref_mask, nonpref_occ_map, nonpref_low_occ),
+        "preferred_map": _rate_map_for_spikes(raw_cs, pref_mask_cs, pref_occ_map_cs, pref_low_occ_cs),
+        "nonpreferred_map": _rate_map_for_spikes(raw_cs, nonpref_mask_cs, nonpref_occ_map_cs, nonpref_low_occ_cs),
+        "preferred_occupancy_s": np.asarray(pref_occ_map_cs, dtype=float),
+        "nonpreferred_occupancy_s": np.asarray(nonpref_occ_map_cs, dtype=float),
     }
     out["theta"] = {
-        "preferred_map": _mean_map_for_values(theta_vals, pref_mask, pref_low_occ),
-        "nonpreferred_map": _mean_map_for_values(theta_vals, nonpref_mask, nonpref_low_occ),
+        "preferred_map": _mean_map_for_values(theta_vals, pref_mask_all, pref_low_occ_all),
+        "nonpreferred_map": _mean_map_for_values(theta_vals, nonpref_mask_all, nonpref_low_occ_all),
     }
     out["slow"] = {
-        "preferred_map": _mean_map_for_values(slow_vals, pref_mask, pref_low_occ),
-        "nonpreferred_map": _mean_map_for_values(slow_vals, nonpref_mask, nonpref_low_occ),
+        "preferred_map": _mean_map_for_values(slow_vals, pref_mask_all, pref_low_occ_all),
+        "nonpreferred_map": _mean_map_for_values(slow_vals, nonpref_mask_all, nonpref_low_occ_all),
     }
     out["ok"] = True
     out["reason"] = "ok"
@@ -27269,6 +27523,7 @@ def _compute_preferred_nonpreferred_split_maps(
     occupancy_threshold_s: float,
     values_by_bin: np.ndarray | None = None,
     time_weighted_values: bool = False,
+    preferred_half_width_deg: float = EGOCENTRIC_PREF_HALF_WIDTH_DEG,
 ) -> dict[str, Any]:
     if not isinstance(local_tuning, dict):
         return {
@@ -27325,6 +27580,7 @@ def _compute_preferred_nonpreferred_split_maps(
     nonpref_occ = np.zeros((nx, ny), dtype=float)
     pref_num = np.zeros((nx, ny), dtype=float)
     nonpref_num = np.zeros((nx, ny), dtype=float)
+    pref_half_width_rad = float(np.deg2rad(float(preferred_half_width_deg)))
 
     use_idx = np.where(
         valid_bin
@@ -27360,7 +27616,7 @@ def _compute_preferred_nonpreferred_split_maps(
                 vals = vals[has_ref]
                 ref_dirs = ref_dirs[has_ref]
                 delta = _wrap_angle_to_pi(dirs - ref_dirs)
-                pref_mask = np.abs(delta) <= (np.pi / 4.0 + 1e-12)
+                pref_mask = np.abs(delta) <= (pref_half_width_rad + 1e-12)
                 nonpref_mask = ~pref_mask
                 if np.any(pref_mask):
                     np.add.at(pref_occ, (ii[pref_mask], jj[pref_mask]), dts[pref_mask])
@@ -27401,6 +27657,7 @@ def _compute_preferred_nonpreferred_split_maps_framewise(
     frame_mask: np.ndarray,
     frame_rate: float,
     occupancy_threshold_s: float,
+    preferred_half_width_deg: float = EGOCENTRIC_PREF_HALF_WIDTH_DEG,
 ) -> dict[str, Any]:
     if not isinstance(local_tuning, dict):
         return {
@@ -27454,6 +27711,7 @@ def _compute_preferred_nonpreferred_split_maps_framewise(
     nonpref_num = np.zeros((nx, ny), dtype=float)
     pref_count = np.zeros((nx, ny), dtype=float)
     nonpref_count = np.zeros((nx, ny), dtype=float)
+    pref_half_width_rad = float(np.deg2rad(float(preferred_half_width_deg)))
 
     use = np.where(
         msk
@@ -27485,7 +27743,7 @@ def _compute_preferred_nonpreferred_split_maps_framewise(
                 val = val[has_ref]
                 ref = ref[has_ref]
                 delta = _wrap_angle_to_pi(ang - ref)
-                pref = np.abs(delta) <= (np.pi / 4.0 + 1e-12)
+                pref = np.abs(delta) <= (pref_half_width_rad + 1e-12)
                 nonpref = ~pref
                 if np.any(pref):
                     np.add.at(pref_occ, (ii[pref], jj[pref]), dt_frame)
@@ -27681,6 +27939,7 @@ def _plot_egocentric_bin_polar_grid_panel(
     arrow_fields: dict[str, Any] | None,
     title: str,
     variant: str = "default",
+    preferred_half_width_deg: float = EGOCENTRIC_PREF_HALF_WIDTH_DEG,
 ) -> dict[str, Any]:
     empty_out = {
         "green_ring_count": 0,
@@ -27794,7 +28053,10 @@ def _plot_egocentric_bin_polar_grid_panel(
 
     variant_norm = str(variant).strip().lower()
     empirical_only_pm45 = variant_norm in {"empirical_only_pm45", "empirical_pm45"}
-    empirical_window_half = float(np.deg2rad(50.0))
+    zone_half_width_deg = float(preferred_half_width_deg)
+    if (not np.isfinite(zone_half_width_deg)) or zone_half_width_deg <= 0:
+        zone_half_width_deg = float(EGOCENTRIC_PREF_HALF_WIDTH_DEG)
+    empirical_window_half = float(np.deg2rad(zone_half_width_deg))
     green_meta: dict[str, Any] | None = None
     if empirical_only_pm45:
         tune_alpha_base = 0.06
@@ -27803,7 +28065,7 @@ def _plot_egocentric_bin_polar_grid_panel(
         green_meta = _compute_empirical_only_green_bin_maps(
             local_tuning=local_tuning,
             arrow_fields=arrow_fields,
-            zone_half_width_deg=50.0,
+            zone_half_width_deg=float(zone_half_width_deg),
             inside_frac_threshold=0.4,
             mean_rate_min_hz=0.5,
         )
@@ -27811,7 +28073,11 @@ def _plot_egocentric_bin_polar_grid_panel(
             parent_ax.text(
                 0.5,
                 1.22,
-                "Green ring: fit in ±50°, pass99, mean_rate>0.5Hz, occ. outside ±50° (edge>=0.4 inside)",
+                (
+                    "Green ring: fit in "
+                    f"±{float(zone_half_width_deg):g}°, pass99, mean_rate>0.5Hz, "
+                    f"occ. outside ±{float(zone_half_width_deg):g}° (edge>=0.4 inside)"
+                ),
                 ha="center",
                 va="bottom",
                 transform=parent_ax.transAxes,
@@ -28090,7 +28356,7 @@ def _plot_egocentric_per_cell_summary_figure(
         width_ratios.append(1.15)
     if show_curve:
         width_ratios.append(1.0)
-    width_ratios.extend([1.0, 1.0, 1.05, 1.05])  # preferred / non-preferred / mini-polar columns
+    width_ratios.extend([1.0, 1.0, 1.05, 1.05])  # preferred / non-preferred / velocity-map / mini-polar(emp-only)
     n_cols = len(width_ratios)
     gs = fig.add_gridspec(
         6,
@@ -28121,6 +28387,8 @@ def _plot_egocentric_per_cell_summary_figure(
     ax_curve_all = None
     ax_curve_ss = None
     ax_curve_cs = None
+    ax_occ_pref_debug = None
+    ax_occ_nonpref_debug = None
     if show_curve:
         if use_multispike_curve_panels:
             if curve_polar:
@@ -28129,23 +28397,26 @@ def _plot_egocentric_per_cell_summary_figure(
                 ax_curve_cs = fig.add_subplot(gs[3, curve_col], projection="polar")
             else:
                 ax_curve_all = fig.add_subplot(gs[1, curve_col])
-                ax_curve_ss = fig.add_subplot(gs[2, curve_col])
-                ax_curve_cs = fig.add_subplot(gs[3, curve_col])
+                ax_curve_ss = fig.add_subplot(gs[2, curve_col], sharex=ax_curve_all, sharey=ax_curve_all)
+                ax_curve_cs = fig.add_subplot(gs[3, curve_col], sharex=ax_curve_all, sharey=ax_curve_all)
         else:
             if curve_polar:
                 ax_curve = fig.add_subplot(gs[1, curve_col], projection="polar")
             else:
                 ax_curve = fig.add_subplot(gs[1, curve_col])
+        # Debug occupancy maps beneath the curve panels.
+        ax_occ_pref_debug = fig.add_subplot(gs[4, curve_col])
+        ax_occ_nonpref_debug = fig.add_subplot(gs[5, curve_col])
 
     pref_col = n_cols - 4
     nonpref_col = n_cols - 3
-    polar_col = n_cols - 2
+    vel_col = n_cols - 2
     polar_emp_col = n_cols - 1
     ax_pref_rows = [fig.add_subplot(gs[row, pref_col]) for row in range(1, 6)]
     ax_nonpref_rows = [fig.add_subplot(gs[row, nonpref_col]) for row in range(1, 6)]
-    ax_binpolar_all = fig.add_subplot(gs[1, polar_col])
-    ax_binpolar_ss = fig.add_subplot(gs[2, polar_col])
-    ax_binpolar_cs = fig.add_subplot(gs[3, polar_col])
+    ax_velmap_all = fig.add_subplot(gs[1, vel_col])
+    ax_velmap_ss = fig.add_subplot(gs[2, vel_col])
+    ax_velmap_cs = fig.add_subplot(gs[3, vel_col])
     ax_binpolar_emp_all = fig.add_subplot(gs[1, polar_emp_col])
     ax_binpolar_emp_ss = fig.add_subplot(gs[2, polar_emp_col])
     ax_binpolar_emp_cs = fig.add_subplot(gs[3, polar_emp_col])
@@ -28158,8 +28429,9 @@ def _plot_egocentric_per_cell_summary_figure(
             3 if (show_curve and use_multispike_curve_panels)
             else (1 if show_curve else 0)
         )  # curve panel(s)
+        + (2 if show_curve else 0)  # occupancy debug panels (pref/nonpref)
         + 10  # preferred / non-preferred rows (5x2)
-        + 3  # mini-polar rows (all/ss/cs)
+        + 3  # velocity-map rows (all/ss/cs)
         + 3  # empirical-only mini-polar rows (all/ss/cs)
     )
 
@@ -28181,15 +28453,32 @@ def _plot_egocentric_per_cell_summary_figure(
     binned_ss = data.get("binned_ss")
     binned_cs = data.get("binned_cs")
     pf_mask_ref = data.get("place_field_mask_ref", None)
+    pf_components_ref_raw = data.get("place_field_components_ref", [])
+    pf_components_ref: list[np.ndarray] = []
+    if isinstance(pf_components_ref_raw, (list, tuple)):
+        for _m in pf_components_ref_raw:
+            try:
+                _arr = np.asarray(_m, dtype=bool)
+            except Exception:
+                continue
+            if _arr.ndim == 2 and _arr.size > 0 and np.any(_arr):
+                pf_components_ref.append(np.asarray(_arr, dtype=bool))
     theta_amp_bin = np.asarray(data.get("theta_amp_bin", np.array([])), dtype=float).reshape(-1)
     slow_vm_bin = np.asarray(data.get("slow_vm_bin", np.array([])), dtype=float).reshape(-1)
     x_frames_full = np.asarray(data.get("x_frames", np.array([])), dtype=float).reshape(-1)
     y_frames_full = np.asarray(data.get("y_frames", np.array([])), dtype=float).reshape(-1)
+    speed_frames_full = np.asarray(data.get("speed_frames", np.array([])), dtype=float).reshape(-1)
+    bad_mask_frames = np.asarray(data.get("bad_mask_frames", np.array([])), dtype=bool).reshape(-1)
     dir_frames_full = np.asarray(data.get("dir_frames", np.array([])), dtype=float).reshape(-1)
     theta_amp_frames = np.asarray(data.get("theta_amp_frames", np.array([])), dtype=float).reshape(-1)
     slow_vm_frames = np.asarray(data.get("slow_vm_frames", np.array([])), dtype=float).reshape(-1)
     theta_slow_frame_mask = np.asarray(data.get("theta_slow_frame_mask", np.array([])), dtype=bool).reshape(-1)
     frame_rate_local = _coerce_float_or_nan(data.get("frame_rate", np.nan))
+    placecell_map_params_full = (
+        dict(data.get("placecell_map_params", {}))
+        if isinstance(data.get("placecell_map_params", {}), dict)
+        else {}
+    )
 
     arrow_fields_all = _compute_spatial_arrow_fields(local_tuning=local_all, fit_info=plot_fit_all, params=params)
     arrow_fields_ss = _compute_spatial_arrow_fields(local_tuning=local_ss, fit_info=plot_fit_ss, params=params)
@@ -28231,7 +28520,7 @@ def _plot_egocentric_per_cell_summary_figure(
         if ax_curve_local is None:
             return
         if curve_polar:
-            ax_curve_local.set_theta_zero_location("N")
+            ax_curve_local.set_theta_zero_location("E")
             ax_curve_local.set_theta_direction(1)
         curve_data = _compute_empirical_vs_fitted_rh_curve(
             local_tuning=local_for_curve,
@@ -28247,7 +28536,12 @@ def _plot_egocentric_per_cell_summary_figure(
             fitted_sem = np.asarray(curve_data.get("fitted_sem", np.array([])), dtype=float)
             n_valid_bins_emp = int(curve_data.get("n_valid_spatial_bins_empirical", 0))
             if ang.size > 0:
-                theta = np.mod(_to_compass_display_angle(ang), 2.0 * np.pi)
+                theta_display = np.asarray(_to_compass_display_angle(ang), dtype=float)
+                theta = (
+                    np.mod(theta_display, 2.0 * np.pi)
+                    if curve_polar
+                    else np.asarray(theta_display, dtype=float)
+                )
                 order = np.argsort(theta)
                 theta_s = np.asarray(theta[order], dtype=float)
                 emp_s = np.asarray(empirical[order], dtype=float)
@@ -28290,30 +28584,25 @@ def _plot_egocentric_per_cell_summary_figure(
                         )
                 else:
                     theta_deg = np.rad2deg(theta_s)
-                    theta_deg_closed = np.concatenate([theta_deg, np.array([theta_deg[0] + 360.0], dtype=float)])
-                    emp_closed = np.concatenate([emp_s, np.array([emp_s[0]], dtype=float)])
-                    emp_sem_closed = np.concatenate([emp_sem_s, np.array([emp_sem_s[0]], dtype=float)])
-                    if np.any(np.isfinite(emp_sem_closed)):
-                        lo = emp_closed - np.where(np.isfinite(emp_sem_closed), emp_sem_closed, 0.0)
-                        hi = emp_closed + np.where(np.isfinite(emp_sem_closed), emp_sem_closed, 0.0)
+                    if np.any(np.isfinite(emp_sem_s)):
+                        lo = emp_s - np.where(np.isfinite(emp_sem_s), emp_sem_s, 0.0)
+                        hi = emp_s + np.where(np.isfinite(emp_sem_s), emp_sem_s, 0.0)
                         ax_curve_local.fill_between(
-                            theta_deg_closed, lo, hi, color="#1F77B4", alpha=0.18, linewidth=0.0, zorder=1
+                            theta_deg, lo, hi, color="#1F77B4", alpha=0.18, linewidth=0.0, zorder=1
                         )
                     ax_curve_local.plot(
-                        theta_deg_closed, emp_closed, "o-", color="#1F77B4", linewidth=1.0, markersize=2.8,
+                        theta_deg, emp_s, "o-", color="#1F77B4", linewidth=1.0, markersize=2.8,
                         label="Empirical", zorder=3
                     )
                     if np.any(np.isfinite(fit_s)):
-                        fit_closed = np.concatenate([fit_s, np.array([fit_s[0]], dtype=float)])
-                        fit_sem_closed = np.concatenate([fit_sem_s, np.array([fit_sem_s[0]], dtype=float)])
-                        if np.any(np.isfinite(fit_sem_closed)):
-                            lo = fit_closed - np.where(np.isfinite(fit_sem_closed), fit_sem_closed, 0.0)
-                            hi = fit_closed + np.where(np.isfinite(fit_sem_closed), fit_sem_closed, 0.0)
+                        if np.any(np.isfinite(fit_sem_s)):
+                            lo = fit_s - np.where(np.isfinite(fit_sem_s), fit_sem_s, 0.0)
+                            hi = fit_s + np.where(np.isfinite(fit_sem_s), fit_sem_s, 0.0)
                             ax_curve_local.fill_between(
-                                theta_deg_closed, lo, hi, color="#D62728", alpha=0.12, linewidth=0.0, zorder=1
+                                theta_deg, lo, hi, color="#D62728", alpha=0.12, linewidth=0.0, zorder=1
                             )
                         ax_curve_local.plot(
-                            theta_deg_closed, fit_closed, "-", color="#D62728", linewidth=1.2, label="Fitted RH", zorder=2
+                            theta_deg, fit_s, "-", color="#D62728", linewidth=1.2, label="Fitted RH", zorder=2
                         )
             finite_vals = np.concatenate(
                 [empirical[np.isfinite(empirical)], fitted[np.isfinite(fitted)], np.array([1.0], dtype=float)]
@@ -28336,13 +28625,13 @@ def _plot_egocentric_per_cell_summary_figure(
             ax_curve_local.plot(th, np.ones_like(th), color="#888888", linewidth=0.6, linestyle="--", alpha=0.7)
             tick_angles = np.deg2rad(np.array([0.0, 90.0, 180.0, 270.0], dtype=float))
             ax_curve_local.set_xticks(tick_angles)
-            ax_curve_local.set_xticklabels(["0", "90", "180", "270"], fontsize=6)
+            ax_curve_local.set_xticklabels(["0", "90", "180", "-90"], fontsize=6)
             ax_curve_local.set_title(f"{title_prefix} EB radial", fontsize=7, pad=10)
             ax_curve_local.set_rlabel_position(22.5)
         else:
-            ax_curve_local.set_xlim(0.0, 360.0)
-            ax_curve_local.set_xticks([0.0, 90.0, 180.0, 270.0, 360.0])
-            ax_curve_local.set_xticklabels(["0", "90", "180", "270", "360"], fontsize=6)
+            ax_curve_local.set_xlim(-180.0, 180.0)
+            ax_curve_local.set_xticks([-180.0, -90.0, 0.0, 90.0, 180.0])
+            ax_curve_local.set_xticklabels(["-180", "-90", "0", "90", "180"], fontsize=6)
             ax_curve_local.set_title(
                 f"{title_prefix} EB (mean±SEM, n_bins={int(n_valid_bins_emp)})",
                 fontsize=7,
@@ -28350,8 +28639,13 @@ def _plot_egocentric_per_cell_summary_figure(
             )
             ax_curve_local.set_xlabel("EB angle (deg)", fontsize=7)
             ax_curve_local.set_ylabel("Norm. rate", fontsize=7)
+            ax_curve_local.axhline(1.0, color="#888888", linewidth=0.8, linestyle="--", alpha=0.9, zorder=0)
+            ax_curve_local.grid(False)
+            ax_curve_local.spines["top"].set_visible(False)
+            ax_curve_local.spines["right"].set_visible(False)
         ax_curve_local.tick_params(labelsize=6)
-        ax_curve_local.grid(alpha=0.25, linewidth=0.5)
+        if curve_polar:
+            ax_curve_local.grid(False)
         try:
             ax_curve_local.legend(loc="best", fontsize=6, frameon=False)
         except Exception:
@@ -28497,6 +28791,306 @@ def _plot_egocentric_per_cell_summary_figure(
         ax.tick_params(labelsize=6, length=2.0)
         ax.set_title(str(title), fontsize=7)
 
+    hd_vel_corr_method = str(getattr(params, "hd_vel_corr_method", "normalized_dot")).strip().lower()
+    if hd_vel_corr_method not in {"normalized_dot", "mean_raw_dot"}:
+        hd_vel_corr_method = "normalized_dot"
+
+    def _compute_moving_velocity_payload() -> dict[str, Any]:
+        n_frames = int(x_frames_full.size)
+        out = {
+            "ok": False,
+            "valid_frames": np.zeros(n_frames, dtype=bool),
+            "moving_mask": np.zeros(n_frames, dtype=bool),
+            "vx_frames": np.full(n_frames, np.nan, dtype=float),
+            "vy_frames": np.full(n_frames, np.nan, dtype=float),
+        }
+        if n_frames <= 0:
+            return out
+        if (
+            y_frames_full.size != n_frames
+            or speed_frames_full.size != n_frames
+            or (bad_mask_frames.size not in {0, n_frames})
+        ):
+            return out
+        bad_use = (
+            np.asarray(bad_mask_frames, dtype=bool)
+            if bad_mask_frames.size == n_frames
+            else np.zeros(n_frames, dtype=bool)
+        )
+        valid_frames = (
+            np.isfinite(x_frames_full)
+            & np.isfinite(y_frames_full)
+            & np.isfinite(speed_frames_full)
+            & (~bad_use)
+        )
+        if params.first_n_minutes is not None and np.isfinite(frame_rate_local) and frame_rate_local > 0:
+            cutoff = int(np.floor(float(params.first_n_minutes) * 60.0 * float(frame_rate_local)))
+            cutoff = max(1, min(n_frames, cutoff))
+            if cutoff < n_frames:
+                valid_frames[cutoff:] = False
+        speed_for_epochs = np.asarray(speed_frames_full, dtype=float).copy()
+        speed_for_epochs[~valid_frames] = np.nan
+        try:
+            speed_smooth, _, moving_idx = core._compute_moving_epochs(
+                speed_for_epochs,
+                float(frame_rate_local),
+                kernel_size=int(max(1, int(getattr(params, "pc_kernel_size", 51)))),
+                filter_type=str(getattr(params, "pc_filter_type", "boxcar")),
+                speed_threshold=float(getattr(params, "pc_speed_threshold_cm_s", 3.0)),
+                min_duration_s=float(getattr(params, "pc_min_duration_s", 0.25)),
+                merge_gap_s=float(getattr(params, "pc_merge_gap_s", 0.0)),
+            )
+        except Exception:
+            return out
+        speed_smooth = np.asarray(speed_smooth, dtype=float).reshape(-1)
+        if speed_smooth.size != n_frames:
+            return out
+        moving_idx = np.asarray(moving_idx, dtype=int).reshape(-1)
+        moving_mask = np.zeros(n_frames, dtype=bool)
+        if moving_idx.size > 0:
+            moving_idx = moving_idx[(moving_idx >= 0) & (moving_idx < n_frames)]
+            if moving_idx.size > 0:
+                moving_mask[moving_idx] = True
+        moving_mask &= valid_frames
+
+        dx = np.gradient(np.asarray(x_frames_full, dtype=float))
+        dy = np.gradient(np.asarray(y_frames_full, dtype=float))
+        travel_angle = np.arctan2(dy, dx)
+        vx = speed_smooth * np.cos(travel_angle)
+        vy = speed_smooth * np.sin(travel_angle)
+        bad_comp = (~valid_frames) | (~np.isfinite(vx)) | (~np.isfinite(vy))
+        vx = np.asarray(vx, dtype=float)
+        vy = np.asarray(vy, dtype=float)
+        vx[bad_comp] = np.nan
+        vy[bad_comp] = np.nan
+        out["ok"] = True
+        out["valid_frames"] = np.asarray(valid_frames, dtype=bool)
+        out["moving_mask"] = np.asarray(moving_mask, dtype=bool)
+        out["vx_frames"] = np.asarray(vx, dtype=float)
+        out["vy_frames"] = np.asarray(vy, dtype=float)
+        return out
+
+    moving_velocity = _compute_moving_velocity_payload()
+
+    def _compute_velocity_bin_maps(x_edges: np.ndarray, y_edges: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        tx = np.asarray(x_edges, dtype=float)
+        ty = np.asarray(y_edges, dtype=float)
+        nx = int(max(tx.size - 1, 0))
+        ny = int(max(ty.size - 1, 0))
+        vx_map = np.full((nx, ny), np.nan, dtype=float)
+        vy_map = np.full((nx, ny), np.nan, dtype=float)
+        cnt_map = np.zeros((nx, ny), dtype=float)
+        if (not bool(moving_velocity.get("ok", False))) or nx <= 0 or ny <= 0:
+            return vx_map, vy_map, cnt_map
+        moving_mask = np.asarray(moving_velocity.get("moving_mask", np.array([])), dtype=bool).reshape(-1)
+        vx_frames = np.asarray(moving_velocity.get("vx_frames", np.array([])), dtype=float).reshape(-1)
+        vy_frames = np.asarray(moving_velocity.get("vy_frames", np.array([])), dtype=float).reshape(-1)
+        n_frames = int(x_frames_full.size)
+        if moving_mask.size != n_frames or vx_frames.size != n_frames or vy_frames.size != n_frames:
+            return vx_map, vy_map, cnt_map
+        keep = (
+            moving_mask
+            & np.isfinite(x_frames_full)
+            & np.isfinite(y_frames_full)
+            & np.isfinite(vx_frames)
+            & np.isfinite(vy_frames)
+        )
+        if not np.any(keep):
+            return vx_map, vy_map, cnt_map
+        xi = _digitize_with_upper_edge_inclusive(np.asarray(x_frames_full[keep], dtype=float), tx)
+        yi = _digitize_with_upper_edge_inclusive(np.asarray(y_frames_full[keep], dtype=float), ty)
+        in_bounds = (xi >= 0) & (yi >= 0) & (xi < nx) & (yi < ny)
+        if not np.any(in_bounds):
+            return vx_map, vy_map, cnt_map
+        ii = xi[in_bounds].astype(int)
+        jj = yi[in_bounds].astype(int)
+        flat = ii * ny + jj
+        vx_vals = np.asarray(vx_frames[keep], dtype=float)[in_bounds]
+        vy_vals = np.asarray(vy_frames[keep], dtype=float)[in_bounds]
+        vx_sum = np.bincount(flat, weights=vx_vals, minlength=nx * ny).astype(float)
+        vy_sum = np.bincount(flat, weights=vy_vals, minlength=nx * ny).astype(float)
+        cnt = np.bincount(flat, minlength=nx * ny).astype(float)
+        ok = cnt > 0
+        if np.any(ok):
+            vx_flat = vx_map.reshape(-1)
+            vy_flat = vy_map.reshape(-1)
+            vx_flat[ok] = vx_sum[ok] / cnt[ok]
+            vy_flat[ok] = vy_sum[ok] / cnt[ok]
+            cnt_map = cnt.reshape(nx, ny)
+        return np.asarray(vx_map, dtype=float), np.asarray(vy_map, dtype=float), np.asarray(cnt_map, dtype=float)
+
+    vel_vx_all, vel_vy_all, vel_cnt_all = _compute_velocity_bin_maps(np.asarray(arrow_fields_all.get("x_edges", np.array([])), dtype=float), np.asarray(arrow_fields_all.get("y_edges", np.array([])), dtype=float))
+    vel_vx_ss, vel_vy_ss, vel_cnt_ss = _compute_velocity_bin_maps(np.asarray(arrow_fields_ss.get("x_edges", np.array([])), dtype=float), np.asarray(arrow_fields_ss.get("y_edges", np.array([])), dtype=float))
+    vel_vx_cs, vel_vy_cs, vel_cnt_cs = _compute_velocity_bin_maps(np.asarray(arrow_fields_cs.get("x_edges", np.array([])), dtype=float), np.asarray(arrow_fields_cs.get("y_edges", np.array([])), dtype=float))
+
+    def _compute_hd_velocity_correlation(
+        arrow_fields: dict[str, Any],
+        vel_vx_map: np.ndarray,
+        vel_vy_map: np.ndarray,
+        method: str,
+    ) -> tuple[float, int]:
+        psi_emp = np.asarray(arrow_fields.get("psi_emp_map", np.array([])), dtype=float)
+        mrl_emp = np.asarray(arrow_fields.get("mrl_emp_map", np.array([])), dtype=float)
+        valid_map = np.asarray(arrow_fields.get("arrow_valid_mask", np.array([])), dtype=bool)
+        if (
+            psi_emp.ndim != 2
+            or mrl_emp.shape != psi_emp.shape
+            or valid_map.shape != psi_emp.shape
+            or vel_vx_map.shape != psi_emp.shape
+            or vel_vy_map.shape != psi_emp.shape
+        ):
+            return np.nan, 0
+        hd_x = np.cos(psi_emp) * np.clip(mrl_emp, 0.0, 1.0)
+        hd_y = np.sin(psi_emp) * np.clip(mrl_emp, 0.0, 1.0)
+        vel_mag = np.sqrt((vel_vx_map ** 2) + (vel_vy_map ** 2))
+        hd_mag = np.sqrt((hd_x ** 2) + (hd_y ** 2))
+        keep = (
+            np.asarray(valid_map, dtype=bool)
+            & np.isfinite(hd_x) & np.isfinite(hd_y)
+            & np.isfinite(vel_vx_map) & np.isfinite(vel_vy_map)
+            & (hd_mag > 0) & (vel_mag > 0)
+        )
+        n_keep = int(np.sum(keep))
+        if n_keep <= 0:
+            return np.nan, 0
+        dot = (hd_x * vel_vx_map) + (hd_y * vel_vy_map)
+        if str(method) == "mean_raw_dot":
+            return float(np.nanmean(dot[keep])), int(n_keep)
+        denom = np.sum(hd_mag[keep] * vel_mag[keep])
+        if (not np.isfinite(denom)) or denom <= 0:
+            return np.nan, int(n_keep)
+        return float(np.sum(dot[keep]) / float(denom)), int(n_keep)
+
+    def _plot_velocity_reference_map_panel(
+        ax: Any,
+        arrow_fields: dict[str, Any],
+        fit_panel: dict[str, Any] | None,
+        vel_vx_map: np.ndarray,
+        vel_vy_map: np.ndarray,
+        vel_cnt_map: np.ndarray,
+        title: str,
+    ) -> None:
+        if ax is None or not isinstance(arrow_fields, dict):
+            return
+        x_edges = np.asarray(arrow_fields.get("x_edges", np.array([])), dtype=float)
+        y_edges = np.asarray(arrow_fields.get("y_edges", np.array([])), dtype=float)
+        x_centers = np.asarray(arrow_fields.get("x_centers", np.array([])), dtype=float)
+        y_centers = np.asarray(arrow_fields.get("y_centers", np.array([])), dtype=float)
+        plot_rate = np.asarray(arrow_fields.get("plot_rate_map", np.array([])), dtype=float)
+        psi_emp_map = np.asarray(arrow_fields.get("psi_emp_map", np.array([])), dtype=float)
+        mrl_emp_map = np.asarray(arrow_fields.get("mrl_emp_map", np.array([])), dtype=float)
+        arrow_valid_mask = np.asarray(arrow_fields.get("arrow_valid_mask", np.array([])), dtype=bool)
+        if plot_rate.ndim == 2 and x_edges.size >= 2 and y_edges.size >= 2:
+            map_vals = np.ma.masked_invalid(np.asarray(plot_rate.T, dtype=float))
+            im = ax.pcolormesh(
+                np.asarray(x_edges, dtype=float),
+                np.asarray(y_edges, dtype=float),
+                map_vals,
+                shading="flat",
+                cmap="viridis",
+            )
+            cbar = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.02)
+            cbar.ax.tick_params(labelsize=6, length=2.0)
+            cbar.set_label("Hz", fontsize=7)
+            fit_use = fit_panel if isinstance(fit_panel, dict) else {}
+            x_ref = _coerce_float_or_nan(fit_use.get("best_x_ref", np.nan))
+            y_ref = _coerce_float_or_nan(fit_use.get("best_y_ref", np.nan))
+            if np.isfinite(x_ref) and np.isfinite(y_ref):
+                ax.scatter(
+                    [x_ref], [y_ref],
+                    s=float(params.ref_marker_size),
+                    c="#FF2D95",
+                    edgecolors="black",
+                    linewidths=0.8,
+                    zorder=3,
+                )
+            if (
+                arrow_valid_mask.ndim == 2
+                and psi_emp_map.shape == arrow_valid_mask.shape
+                and mrl_emp_map.shape == arrow_valid_mask.shape
+                and vel_vx_map.shape == arrow_valid_mask.shape
+                and vel_vy_map.shape == arrow_valid_mask.shape
+                and vel_cnt_map.shape == arrow_valid_mask.shape
+                and x_centers.size == arrow_valid_mask.shape[0]
+                and y_centers.size == arrow_valid_mask.shape[1]
+            ):
+                ij = np.argwhere(arrow_valid_mask)
+                if ij.size > 0:
+                    base_len = float(params.local_spatial_bin_cm) * 0.35 * 1.5
+                    vel_mag_map = np.sqrt((vel_vx_map ** 2) + (vel_vy_map ** 2))
+                    vel_valid = np.isfinite(vel_mag_map) & (vel_mag_map > 0) & np.isfinite(vel_cnt_map) & (vel_cnt_map > 0)
+                    vmax = float(np.nanmax(vel_mag_map[vel_valid])) if np.any(vel_valid) else np.nan
+                    qx_red: list[float] = []
+                    qy_red: list[float] = []
+                    qu_red: list[float] = []
+                    qv_red: list[float] = []
+                    qx_emp: list[float] = []
+                    qy_emp: list[float] = []
+                    qu_emp: list[float] = []
+                    qv_emp: list[float] = []
+                    for ix, iy in ij:
+                        x0 = float(x_centers[int(ix)])
+                        y0 = float(y_centers[int(iy)])
+                        psi_emp = float(psi_emp_map[int(ix), int(iy)])
+                        mrl_emp = float(mrl_emp_map[int(ix), int(iy)])
+                        if np.isfinite(psi_emp) and np.isfinite(mrl_emp):
+                            emp_len = float(base_len * np.clip(mrl_emp, 0.0, 1.0))
+                            if emp_len > 0:
+                                qx_emp.append(x0); qy_emp.append(y0)
+                                qu_emp.append(float(emp_len * np.cos(psi_emp)))
+                                qv_emp.append(float(emp_len * np.sin(psi_emp)))
+                        vx = float(vel_vx_map[int(ix), int(iy)])
+                        vy = float(vel_vy_map[int(ix), int(iy)])
+                        vm = float(np.sqrt((vx ** 2) + (vy ** 2)))
+                        if np.isfinite(vx) and np.isfinite(vy) and np.isfinite(vm) and vm > 0 and np.isfinite(vmax) and vmax > 0:
+                            scale = float(np.clip(vm / vmax, 0.0, 1.0))
+                            qx_red.append(x0); qy_red.append(y0)
+                            qu_red.append(float(base_len * scale * (vx / vm)))
+                            qv_red.append(float(base_len * scale * (vy / vm)))
+                    if len(qx_red) > 0:
+                        ax.quiver(
+                            np.asarray(qx_red, dtype=float),
+                            np.asarray(qy_red, dtype=float),
+                            np.asarray(qu_red, dtype=float),
+                            np.asarray(qv_red, dtype=float),
+                            angles="xy",
+                            scale_units="xy",
+                            scale=1.0,
+                            color="#D62728",
+                            width=0.006,
+                            headwidth=3.0,
+                            headlength=4.0,
+                            headaxislength=3.0,
+                            alpha=0.95,
+                            zorder=4,
+                        )
+                    if len(qx_emp) > 0:
+                        ax.quiver(
+                            np.asarray(qx_emp, dtype=float),
+                            np.asarray(qy_emp, dtype=float),
+                            np.asarray(qu_emp, dtype=float),
+                            np.asarray(qv_emp, dtype=float),
+                            angles="xy",
+                            scale_units="xy",
+                            scale=1.0,
+                            color="white",
+                            width=0.0045,
+                            headwidth=3.0,
+                            headlength=4.0,
+                            headaxislength=3.0,
+                            alpha=0.95,
+                            zorder=5,
+                        )
+        else:
+            ax.text(0.5, 0.5, "No spatial map", ha="center", va="center", transform=ax.transAxes, fontsize=7)
+        ax.set_xlim(0.0, width_cm)
+        ax.set_ylim(0.0, height_cm)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x (cm)", fontsize=7)
+        ax.set_ylabel("y (cm)", fontsize=7)
+        ax.tick_params(labelsize=6, length=2.0)
+        ax.set_title(str(title), fontsize=7)
+
     def _plot_split_heatmap_panel(
         *,
         ax: Any,
@@ -28536,7 +29130,231 @@ def _plot_egocentric_per_cell_summary_figure(
         ax.set_title(str(title), fontsize=7)
         return im_obj
 
-    def _overlay_pf_mask_reference(ax: Any, pf_mask: Any) -> None:
+    def _plot_split_occupancy_debug_panel(
+        *,
+        ax: Any,
+        local: dict[str, Any] | None,
+        occ_map: np.ndarray,
+        title: str,
+    ) -> Any | None:
+        if ax is None:
+            return None
+        im_obj = None
+        if not isinstance(local, dict):
+            ax.text(0.5, 0.5, "No occupancy map", ha="center", va="center", transform=ax.transAxes, fontsize=7)
+        else:
+            x_edges = np.asarray(local.get("x_edges", np.array([])), dtype=float)
+            y_edges = np.asarray(local.get("y_edges", np.array([])), dtype=float)
+            arr = np.asarray(occ_map, dtype=float)
+            if arr.ndim == 2 and x_edges.size >= 2 and y_edges.size >= 2 and np.any(np.isfinite(arr)):
+                vals = np.ma.masked_invalid(np.asarray(arr.T, dtype=float))
+                im_obj = ax.pcolormesh(
+                    np.asarray(x_edges, dtype=float),
+                    np.asarray(y_edges, dtype=float),
+                    vals,
+                    shading="flat",
+                    cmap="Blues",
+                )
+                x_centers = 0.5 * (np.asarray(x_edges[:-1], dtype=float) + np.asarray(x_edges[1:], dtype=float))
+                y_centers = 0.5 * (np.asarray(y_edges[:-1], dtype=float) + np.asarray(y_edges[1:], dtype=float))
+                for ix in range(int(arr.shape[0])):
+                    for iy in range(int(arr.shape[1])):
+                        v = float(arr[ix, iy])
+                        if not np.isfinite(v):
+                            continue
+                        ax.text(
+                            float(x_centers[ix]),
+                            float(y_centers[iy]),
+                            f"{v:.1f}",
+                            ha="center",
+                            va="center",
+                            fontsize=5.5,
+                            color="black",
+                            zorder=4,
+                        )
+            else:
+                ax.text(0.5, 0.5, "No occupancy bins", ha="center", va="center", transform=ax.transAxes, fontsize=7)
+        ax.set_xlim(0.0, width_cm)
+        ax.set_ylim(0.0, height_cm)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x (cm)", fontsize=7)
+        ax.set_ylabel("y (cm)", fontsize=7)
+        ax.tick_params(labelsize=6, length=2.0)
+        ax.set_title(str(title), fontsize=7)
+        return im_obj
+
+    def _infer_pf_mask_source_edges(pf_mask_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        nx, ny = int(pf_mask_arr.shape[0]), int(pf_mask_arr.shape[1])
+        px = np.asarray(placecell_map_params_full.get("x_edges", np.array([])), dtype=float)
+        py = np.asarray(placecell_map_params_full.get("y_edges", np.array([])), dtype=float)
+        if px.size == nx + 1 and py.size == ny + 1:
+            return px, py
+        pbin = _coerce_float_or_nan(placecell_map_params_full.get("bin_size", np.nan))
+        if np.isfinite(pbin) and pbin > 0:
+            sx = np.asarray(_make_arena_edges(float(width_cm), float(pbin)), dtype=float)
+            sy = np.asarray(_make_arena_edges(float(height_cm), float(pbin)), dtype=float)
+            if sx.size == nx + 1 and sy.size == ny + 1:
+                return sx, sy
+        # Prefer native local-tuning edges when dimensions match; this keeps PF mapping
+        # consistent with the bins used to compute split maps.
+        lx = np.asarray((local_all or {}).get("x_edges", np.array([])), dtype=float) if isinstance(local_all, dict) else np.array([], dtype=float)
+        ly = np.asarray((local_all or {}).get("y_edges", np.array([])), dtype=float) if isinstance(local_all, dict) else np.array([], dtype=float)
+        if lx.size == nx + 1 and ly.size == ny + 1:
+            return lx, ly
+        return (
+            np.linspace(0.0, float(width_cm), nx + 1, dtype=float),
+            np.linspace(0.0, float(height_cm), ny + 1, dtype=float),
+        )
+
+    def _resample_mask_overlap_area_threshold(
+        source_mask: np.ndarray,
+        source_x_edges: np.ndarray,
+        source_y_edges: np.ndarray,
+        target_x_edges: np.ndarray,
+        target_y_edges: np.ndarray,
+        min_overlap_fraction: float,
+    ) -> np.ndarray:
+        src = np.asarray(source_mask, dtype=bool)
+        sx = np.asarray(source_x_edges, dtype=float)
+        sy = np.asarray(source_y_edges, dtype=float)
+        tx = np.asarray(target_x_edges, dtype=float)
+        ty = np.asarray(target_y_edges, dtype=float)
+        out = np.zeros((max(tx.size - 1, 0), max(ty.size - 1, 0)), dtype=bool)
+        if src.ndim != 2 or sx.size < 2 or sy.size < 2 or tx.size < 2 or ty.size < 2:
+            return out
+        if src.shape != (sx.size - 1, sy.size - 1):
+            return out
+        thr = _coerce_float_or_nan(min_overlap_fraction)
+        if (not np.isfinite(thr)) or thr < 0:
+            thr = 0.25
+        thr = float(np.clip(thr, 0.0, 1.0))
+        sx0 = np.asarray(sx[:-1], dtype=float)
+        sx1 = np.asarray(sx[1:], dtype=float)
+        sy0 = np.asarray(sy[:-1], dtype=float)
+        sy1 = np.asarray(sy[1:], dtype=float)
+        for ix in range(int(tx.size - 1)):
+            tx0 = float(tx[ix]); tx1 = float(tx[ix + 1])
+            x_overlap = np.where((sx0 < tx1) & (sx1 > tx0))[0]
+            if x_overlap.size == 0:
+                continue
+            for iy in range(int(ty.size - 1)):
+                ty0 = float(ty[iy]); ty1 = float(ty[iy + 1])
+                y_overlap = np.where((sy0 < ty1) & (sy1 > ty0))[0]
+                if y_overlap.size == 0:
+                    continue
+                target_area = float(max(0.0, tx1 - tx0) * max(0.0, ty1 - ty0))
+                if target_area <= 0:
+                    continue
+                overlap_area = 0.0
+                for sx_i in x_overlap:
+                    x0 = max(float(sx0[int(sx_i)]), tx0)
+                    x1 = min(float(sx1[int(sx_i)]), tx1)
+                    ox = float(x1 - x0)
+                    if ox <= 0:
+                        continue
+                    for sy_i in y_overlap:
+                        if not bool(src[int(sx_i), int(sy_i)]):
+                            continue
+                        y0 = max(float(sy0[int(sy_i)]), ty0)
+                        y1 = min(float(sy1[int(sy_i)]), ty1)
+                        oy = float(y1 - y0)
+                        if oy <= 0:
+                            continue
+                        overlap_area += float(ox * oy)
+                if (overlap_area / target_area) >= thr:
+                    out[ix, iy] = True
+        return np.asarray(out, dtype=bool)
+
+    def _draw_mask_contour(
+        *,
+        ax: Any,
+        mask_bool: np.ndarray,
+        x_edges: np.ndarray,
+        y_edges: np.ndarray,
+        color: str,
+        linewidth: float,
+        zorder: float,
+    ) -> None:
+        if ax is None:
+            return
+        arr = np.asarray(mask_bool, dtype=bool)
+        xe = np.asarray(x_edges, dtype=float)
+        ye = np.asarray(y_edges, dtype=float)
+        if arr.ndim != 2 or arr.size == 0 or (not np.any(arr)):
+            return
+        if xe.size != int(arr.shape[0]) + 1 or ye.size != int(arr.shape[1]) + 1:
+            return
+        segments: list[list[tuple[float, float]]] = []
+        nx, ny = int(arr.shape[0]), int(arr.shape[1])
+        for ix in range(nx):
+            for iy in range(ny):
+                if not bool(arr[ix, iy]):
+                    continue
+                x0 = float(xe[ix]); x1 = float(xe[ix + 1])
+                y0 = float(ye[iy]); y1 = float(ye[iy + 1])
+                # Left edge
+                if ix == 0 or (not bool(arr[ix - 1, iy])):
+                    segments.append([(x0, y0), (x0, y1)])
+                # Right edge
+                if ix == nx - 1 or (not bool(arr[ix + 1, iy])):
+                    segments.append([(x1, y0), (x1, y1)])
+                # Bottom edge
+                if iy == 0 or (not bool(arr[ix, iy - 1])):
+                    segments.append([(x0, y0), (x1, y0)])
+                # Top edge
+                if iy == ny - 1 or (not bool(arr[ix, iy + 1])):
+                    segments.append([(x0, y1), (x1, y1)])
+        if len(segments) <= 0:
+            return
+        lc = LineCollection(
+            segments,
+            colors=[str(color)],
+            linewidths=float(linewidth),
+            linestyles="solid",
+            zorder=float(zorder),
+        )
+        ax.add_collection(lc)
+
+    def _draw_mask_contour_legacy(
+        *,
+        ax: Any,
+        mask_bool: np.ndarray,
+        x_edges: np.ndarray,
+        y_edges: np.ndarray,
+        color: str,
+        linewidth: float,
+        zorder: float,
+    ) -> None:
+        if ax is None:
+            return
+        arr = np.asarray(mask_bool, dtype=bool)
+        xe = np.asarray(x_edges, dtype=float)
+        ye = np.asarray(y_edges, dtype=float)
+        if arr.ndim != 2 or arr.size == 0 or (not np.any(arr)):
+            return
+        if xe.size != int(arr.shape[0]) + 1 or ye.size != int(arr.shape[1]) + 1:
+            return
+        padded_mask = np.pad(arr.astype(float), pad_width=1, mode="constant", constant_values=0.0)
+        bin_x = float((xe[-1] - xe[0]) / arr.shape[0]) if arr.shape[0] > 0 else 1.0
+        bin_y = float((ye[-1] - ye[0]) / arr.shape[1]) if arr.shape[1] > 0 else 1.0
+        padded_extent = (float(xe[0] - bin_x), float(xe[-1] + bin_x), float(ye[0] - bin_y), float(ye[-1] + bin_y))
+        ax.contour(
+            np.asarray(padded_mask, dtype=float).T,
+            levels=[0.5],
+            colors=[str(color)],
+            linewidths=float(linewidth),
+            linestyles="solid",
+            extent=padded_extent,
+            origin="lower",
+            zorder=float(zorder),
+        )
+
+    def _overlay_pf_mask_reference(
+        ax: Any,
+        pf_mask: Any,
+        target_local: dict[str, Any] | None = None,
+        pf_components: list[np.ndarray] | None = None,
+    ) -> None:
         if ax is None:
             return
         try:
@@ -28545,49 +29363,133 @@ def _plot_egocentric_per_cell_summary_figure(
             return
         if arr.ndim != 2 or arr.size == 0 or (not np.any(arr)):
             return
-        # Match plot_selected_cells_figure contour style using padded mask + extent.
-        padded_mask = np.pad(arr.astype(float), pad_width=1, mode="constant", constant_values=0.0)
-        bin_size = float(width_cm) / float(arr.shape[0])
-        padded_extent = (-bin_size, width_cm + bin_size, -bin_size, height_cm + bin_size)
-        ax.contour(
-            np.asarray(padded_mask, dtype=float).T,
-            levels=[0.5],
-            colors=["magenta"],
-            linewidths=0.8,
-            linestyles="solid",
-            extent=padded_extent,
-            origin="lower",
-            zorder=8,
+
+        sx, sy = _infer_pf_mask_source_edges(arr)
+        _draw_mask_contour_legacy(
+            ax=ax,
+            mask_bool=np.asarray(arr, dtype=bool),
+            x_edges=np.asarray(sx, dtype=float),
+            y_edges=np.asarray(sy, dtype=float),
+            color="white",
+            linewidth=0.9,
+            zorder=9.0,
         )
+
+        if isinstance(target_local, dict):
+            tx = np.asarray(target_local.get("x_edges", np.array([])), dtype=float)
+            ty = np.asarray(target_local.get("y_edges", np.array([])), dtype=float)
+            if tx.size >= 2 and ty.size >= 2:
+                comps_use: list[np.ndarray] = []
+                if isinstance(pf_components, list):
+                    for cm in pf_components:
+                        try:
+                            m = np.asarray(cm, dtype=bool)
+                        except Exception:
+                            continue
+                        if m.ndim == 2 and m.size > 0 and np.any(m):
+                            comps_use.append(np.asarray(m, dtype=bool))
+                if len(comps_use) <= 0:
+                    comps_use = [np.asarray(arr, dtype=bool)]
+
+                primary_mask = np.asarray(comps_use[0], dtype=bool)
+                secondary_union = None
+                if len(comps_use) > 1:
+                    same_shape = [np.asarray(m, dtype=bool) for m in comps_use[1:] if np.asarray(m, dtype=bool).shape == primary_mask.shape]
+                    if len(same_shape) > 0:
+                        secondary_union = np.any(np.stack(same_shape, axis=0), axis=0)
+
+                prim_sx, prim_sy = _infer_pf_mask_source_edges(primary_mask)
+                primary_coarse = _resample_mask_overlap_area_threshold(
+                    source_mask=np.asarray(primary_mask, dtype=bool),
+                    source_x_edges=np.asarray(prim_sx, dtype=float),
+                    source_y_edges=np.asarray(prim_sy, dtype=float),
+                    target_x_edges=np.asarray(tx, dtype=float),
+                    target_y_edges=np.asarray(ty, dtype=float),
+                    min_overlap_fraction=float(getattr(params, "pf_overlay_area_threshold", 0.25)),
+                )
+                _draw_mask_contour(
+                    ax=ax,
+                    mask_bool=np.asarray(primary_coarse, dtype=bool),
+                    x_edges=np.asarray(tx, dtype=float),
+                    y_edges=np.asarray(ty, dtype=float),
+                    color="magenta",
+                    linewidth=0.8,
+                    zorder=8.0,
+                )
+                if secondary_union is not None:
+                    sec_sx, sec_sy = _infer_pf_mask_source_edges(np.asarray(secondary_union, dtype=bool))
+                    secondary_coarse = _resample_mask_overlap_area_threshold(
+                        source_mask=np.asarray(secondary_union, dtype=bool),
+                        source_x_edges=np.asarray(sec_sx, dtype=float),
+                        source_y_edges=np.asarray(sec_sy, dtype=float),
+                        target_x_edges=np.asarray(tx, dtype=float),
+                        target_y_edges=np.asarray(ty, dtype=float),
+                        min_overlap_fraction=float(getattr(params, "pf_overlay_area_threshold", 0.25)),
+                    )
+                    # Enforce coarse-bin exclusivity: overlapping bins belong to primary.
+                    secondary_coarse = np.asarray(secondary_coarse, dtype=bool) & (~np.asarray(primary_coarse, dtype=bool))
+                    _draw_mask_contour(
+                        ax=ax,
+                        mask_bool=np.asarray(secondary_coarse, dtype=bool),
+                        x_edges=np.asarray(tx, dtype=float),
+                        y_edges=np.asarray(ty, dtype=float),
+                        color="cyan",
+                        linewidth=0.8,
+                        zorder=8.0,
+                    )
 
     if show_spatial_map:
         _plot_spatial_map_panel(ax_map_all, local_all, arrow_fields_all, plot_fit_all, "Spatial FR + arrows (All)")
         _plot_spatial_map_panel(ax_map_ss, local_ss, arrow_fields_ss, plot_fit_ss, "SS rate + arrows")
         _plot_spatial_map_panel(ax_map_cs, local_cs, arrow_fields_cs, plot_fit_cs, "CS rate + arrows")
-    _plot_egocentric_bin_polar_grid_panel(
-        fig=fig,
-        parent_ax=ax_binpolar_all,
-        local_tuning=local_all,
+    _plot_velocity_reference_map_panel(
+        ax=ax_velmap_all,
         arrow_fields=arrow_fields_all,
-        title="Bin polar (All)",
-        variant="default",
+        fit_panel=plot_fit_all,
+        vel_vx_map=np.asarray(vel_vx_all, dtype=float),
+        vel_vy_map=np.asarray(vel_vy_all, dtype=float),
+        vel_cnt_map=np.asarray(vel_cnt_all, dtype=float),
+        title="HD(emp, white) + velocity(red) (All)",
     )
-    _plot_egocentric_bin_polar_grid_panel(
-        fig=fig,
-        parent_ax=ax_binpolar_ss,
-        local_tuning=local_ss,
+    _plot_velocity_reference_map_panel(
+        ax=ax_velmap_ss,
         arrow_fields=arrow_fields_ss,
-        title="Bin polar (SS)",
-        variant="default",
+        fit_panel=plot_fit_ss,
+        vel_vx_map=np.asarray(vel_vx_ss, dtype=float),
+        vel_vy_map=np.asarray(vel_vy_ss, dtype=float),
+        vel_cnt_map=np.asarray(vel_cnt_ss, dtype=float),
+        title="HD(emp, white) + velocity(red) (SS)",
     )
-    _plot_egocentric_bin_polar_grid_panel(
-        fig=fig,
-        parent_ax=ax_binpolar_cs,
-        local_tuning=local_cs,
+    _plot_velocity_reference_map_panel(
+        ax=ax_velmap_cs,
         arrow_fields=arrow_fields_cs,
-        title="Bin polar (CS)",
-        variant="default",
+        fit_panel=plot_fit_cs,
+        vel_vx_map=np.asarray(vel_vx_cs, dtype=float),
+        vel_vy_map=np.asarray(vel_vy_cs, dtype=float),
+        vel_cnt_map=np.asarray(vel_cnt_cs, dtype=float),
+        title="HD(emp, white) + velocity(red) (CS)",
     )
+    hd_vel_corr_all, hd_vel_corr_n_all = _compute_hd_velocity_correlation(
+        arrow_fields=arrow_fields_all,
+        vel_vx_map=np.asarray(vel_vx_all, dtype=float),
+        vel_vy_map=np.asarray(vel_vy_all, dtype=float),
+        method=str(hd_vel_corr_method),
+    )
+    hd_vel_corr_ss, hd_vel_corr_n_ss = _compute_hd_velocity_correlation(
+        arrow_fields=arrow_fields_ss,
+        vel_vx_map=np.asarray(vel_vx_ss, dtype=float),
+        vel_vy_map=np.asarray(vel_vy_ss, dtype=float),
+        method=str(hd_vel_corr_method),
+    )
+    hd_vel_corr_cs, hd_vel_corr_n_cs = _compute_hd_velocity_correlation(
+        arrow_fields=arrow_fields_cs,
+        vel_vx_map=np.asarray(vel_vx_cs, dtype=float),
+        vel_vy_map=np.asarray(vel_vy_cs, dtype=float),
+        method=str(hd_vel_corr_method),
+    )
+    split_half_width_deg = float(getattr(params, "split_preferred_half_width_deg", EGOCENTRIC_PREF_HALF_WIDTH_DEG))
+    if (not np.isfinite(split_half_width_deg)) or split_half_width_deg <= 0:
+        split_half_width_deg = float(EGOCENTRIC_PREF_HALF_WIDTH_DEG)
     emp_meta_all = _plot_egocentric_bin_polar_grid_panel(
         fig=fig,
         parent_ax=ax_binpolar_emp_all,
@@ -28595,6 +29497,7 @@ def _plot_egocentric_per_cell_summary_figure(
         arrow_fields=arrow_fields_all,
         title="Bin polar emp-only (All)",
         variant="empirical_only_pm45",
+        preferred_half_width_deg=float(split_half_width_deg),
     )
     emp_meta_ss = _plot_egocentric_bin_polar_grid_panel(
         fig=fig,
@@ -28603,6 +29506,7 @@ def _plot_egocentric_per_cell_summary_figure(
         arrow_fields=arrow_fields_ss,
         title="Bin polar emp-only (SS)",
         variant="empirical_only_pm45",
+        preferred_half_width_deg=float(split_half_width_deg),
     )
     emp_meta_cs = _plot_egocentric_bin_polar_grid_panel(
         fig=fig,
@@ -28611,6 +29515,7 @@ def _plot_egocentric_per_cell_summary_figure(
         arrow_fields=arrow_fields_cs,
         title="Bin polar emp-only (CS)",
         variant="empirical_only_pm45",
+        preferred_half_width_deg=float(split_half_width_deg),
     )
     green_ring_count_all = int((emp_meta_all or {}).get("green_ring_count", 0))
     green_ring_count_ss = int((emp_meta_ss or {}).get("green_ring_count", 0))
@@ -28632,16 +29537,77 @@ def _plot_egocentric_per_cell_summary_figure(
         ax.set_ylabel("y (cm)", fontsize=7)
         ax.tick_params(labelsize=6, length=2.0)
 
-    red_dir_all = np.asarray(arrow_fields_all.get("psi_fit_map", np.array([])), dtype=float)
-    red_dir_ss = np.asarray(arrow_fields_ss.get("psi_fit_map", np.array([])), dtype=float)
-    red_dir_cs = np.asarray(arrow_fields_cs.get("psi_fit_map", np.array([])), dtype=float)
+    split_source = str(getattr(params, "split_preferred_angle_source", "fit")).strip().lower()
+    if split_source not in {"fit", "empirical"}:
+        split_source = "fit"
+    fit_dir_all = np.asarray(arrow_fields_all.get("psi_fit_map", np.array([])), dtype=float)
+    fit_dir_ss = np.asarray(arrow_fields_ss.get("psi_fit_map", np.array([])), dtype=float)
+    fit_dir_cs = np.asarray(arrow_fields_cs.get("psi_fit_map", np.array([])), dtype=float)
+    emp_dir_all = np.asarray(arrow_fields_all.get("psi_emp_map", np.array([])), dtype=float)
+    emp_dir_ss = np.asarray(arrow_fields_ss.get("psi_emp_map", np.array([])), dtype=float)
+    emp_dir_cs = np.asarray(arrow_fields_cs.get("psi_emp_map", np.array([])), dtype=float)
+    split_dir_all = np.asarray(emp_dir_all if split_source == "empirical" else fit_dir_all, dtype=float)
+    split_dir_ss = np.asarray(emp_dir_ss if split_source == "empirical" else fit_dir_ss, dtype=float)
+    split_dir_cs = np.asarray(emp_dir_cs if split_source == "empirical" else fit_dir_cs, dtype=float)
 
     use_placecell_split = bool(getattr(params, "split_maps_placecell_style", True))
+    debug_pref_occ_map = np.array([], dtype=float)
+    debug_nonpref_occ_map = np.array([], dtype=float)
+    debug_local_occ = None
     if use_placecell_split:
+        def _build_empirical_lookup_spec(
+            local_tuning_obj: dict[str, Any] | None,
+            fallback_fields: dict[str, Any] | None,
+        ) -> dict[str, np.ndarray]:
+            if isinstance(local_tuning_obj, dict):
+                lookup_all_bins = _compute_empirical_direction_lookup_all_bins(local_tuning=local_tuning_obj)
+                x_all = np.asarray(lookup_all_bins.get("x_edges", np.array([])), dtype=float)
+                y_all = np.asarray(lookup_all_bins.get("y_edges", np.array([])), dtype=float)
+                d_all = np.asarray(lookup_all_bins.get("dir_map", np.array([])), dtype=float)
+                if (
+                    x_all.size >= 2
+                    and y_all.size >= 2
+                    and d_all.shape == (int(x_all.size - 1), int(y_all.size - 1))
+                ):
+                    return {
+                        "x_edges": np.asarray(x_all, dtype=float),
+                        "y_edges": np.asarray(y_all, dtype=float),
+                        "dir_map": np.asarray(d_all, dtype=float),
+                    }
+                emp_fields = _compute_empirical_hd_arrow_fields_for_valid_bins(local_tuning=local_tuning_obj)
+                x_emp = np.asarray(emp_fields.get("x_edges", np.array([])), dtype=float)
+                y_emp = np.asarray(emp_fields.get("y_edges", np.array([])), dtype=float)
+                d_emp = np.asarray(emp_fields.get("psi_emp_map", np.array([])), dtype=float)
+                if (
+                    x_emp.size >= 2
+                    and y_emp.size >= 2
+                    and d_emp.shape == (int(x_emp.size - 1), int(y_emp.size - 1))
+                ):
+                    return {
+                        "x_edges": np.asarray(x_emp, dtype=float),
+                        "y_edges": np.asarray(y_emp, dtype=float),
+                        "dir_map": np.asarray(d_emp, dtype=float),
+                    }
+            fb = fallback_fields if isinstance(fallback_fields, dict) else {}
+            return {
+                "x_edges": np.asarray(fb.get("x_edges", np.array([])), dtype=float),
+                "y_edges": np.asarray(fb.get("y_edges", np.array([])), dtype=float),
+                "dir_map": np.asarray(fb.get("psi_emp_map", np.array([])), dtype=float),
+            }
+
+        preferred_lookup_specs = {
+            "all": _build_empirical_lookup_spec(local_all, arrow_fields_all),
+            "ss": _build_empirical_lookup_spec(local_ss, arrow_fields_ss),
+            "cs": _build_empirical_lookup_spec(local_cs, arrow_fields_cs),
+        }
         split_pc = _compute_placecell_style_preferred_nonpreferred_maps(
             data=data,
             fit_info=plot_fit_all,
             params=params,
+            preferred_angle_source=split_source,
+            preferred_lookup_specs=preferred_lookup_specs,
+            preferred_half_width_deg=float(split_half_width_deg),
+            apply_min_occupancy_mask=True,  # mask invalid bins separately in pref/non-pref maps
         )
         local_split = {
             "x_edges": np.asarray(split_pc.get("x_edges", np.array([])), dtype=float),
@@ -28654,34 +29620,40 @@ def _plot_egocentric_per_cell_summary_figure(
             ("Theta", local_split, dict(split_pc.get("theta", {})), "magma"),
             ("Slow Vm", local_split, dict(split_pc.get("slow", {})), "coolwarm"),
         ]
+        debug_pref_occ_map = np.asarray(split_pc.get("all", {}).get("preferred_occupancy_s", np.array([])), dtype=float)
+        debug_nonpref_occ_map = np.asarray(split_pc.get("all", {}).get("nonpreferred_occupancy_s", np.array([])), dtype=float)
+        debug_local_occ = dict(local_split)
     else:
         split_all = _compute_preferred_nonpreferred_split_maps(
             binned=binned_all,
             local_tuning=local_all,
-            red_dir_map=red_dir_all,
+            red_dir_map=split_dir_all,
             occupancy_threshold_s=float(params.occupancy_threshold_s),
             values_by_bin=None,
             time_weighted_values=False,
+            preferred_half_width_deg=float(split_half_width_deg),
         )
         split_ss = _compute_preferred_nonpreferred_split_maps(
             binned=binned_ss,
             local_tuning=local_ss,
-            red_dir_map=red_dir_ss,
+            red_dir_map=split_dir_ss,
             occupancy_threshold_s=float(params.occupancy_threshold_s),
             values_by_bin=None,
             time_weighted_values=False,
+            preferred_half_width_deg=float(split_half_width_deg),
         )
         split_cs = _compute_preferred_nonpreferred_split_maps(
             binned=binned_cs,
             local_tuning=local_cs,
-            red_dir_map=red_dir_cs,
+            red_dir_map=split_dir_cs,
             occupancy_threshold_s=float(params.occupancy_threshold_s),
             values_by_bin=None,
             time_weighted_values=False,
+            preferred_half_width_deg=float(split_half_width_deg),
         )
         split_theta = _compute_preferred_nonpreferred_split_maps_framewise(
             local_tuning=local_all,
-            red_dir_map=red_dir_all,
+            red_dir_map=split_dir_all,
             x_frames=x_frames_full,
             y_frames=y_frames_full,
             angle_frames=dir_frames_full,
@@ -28689,10 +29661,11 @@ def _plot_egocentric_per_cell_summary_figure(
             frame_mask=theta_slow_frame_mask,
             frame_rate=float(frame_rate_local if np.isfinite(frame_rate_local) else 1.0),
             occupancy_threshold_s=float(params.occupancy_threshold_s),
+            preferred_half_width_deg=float(split_half_width_deg),
         )
         split_slow = _compute_preferred_nonpreferred_split_maps_framewise(
             local_tuning=local_all,
-            red_dir_map=red_dir_all,
+            red_dir_map=split_dir_all,
             x_frames=x_frames_full,
             y_frames=y_frames_full,
             angle_frames=dir_frames_full,
@@ -28700,6 +29673,7 @@ def _plot_egocentric_per_cell_summary_figure(
             frame_mask=theta_slow_frame_mask,
             frame_rate=float(frame_rate_local if np.isfinite(frame_rate_local) else 1.0),
             occupancy_threshold_s=float(params.occupancy_threshold_s),
+            preferred_half_width_deg=float(split_half_width_deg),
         )
 
         split_rows = [
@@ -28709,9 +29683,52 @@ def _plot_egocentric_per_cell_summary_figure(
             ("Theta", local_all, split_theta, "magma"),
             ("Slow Vm", local_all, split_slow, "coolwarm"),
         ]
+        debug_pref_occ_map = np.asarray(split_all.get("preferred_occupancy_s", np.array([])), dtype=float)
+        debug_nonpref_occ_map = np.asarray(split_all.get("nonpreferred_occupancy_s", np.array([])), dtype=float)
+        debug_local_occ = local_all if isinstance(local_all, dict) else None
+
+    if ax_occ_pref_debug is not None and ax_occ_nonpref_debug is not None:
+        _plot_split_occupancy_debug_panel(
+            ax=ax_occ_pref_debug,
+            local=debug_local_occ if isinstance(debug_local_occ, dict) else None,
+            occ_map=np.asarray(debug_pref_occ_map, dtype=float),
+            title="Preferred occupancy (s)",
+        )
+        _plot_split_occupancy_debug_panel(
+            ax=ax_occ_nonpref_debug,
+            local=debug_local_occ if isinstance(debug_local_occ, dict) else None,
+            occ_map=np.asarray(debug_nonpref_occ_map, dtype=float),
+            title="Non-preferred occupancy (s)",
+        )
+
+    split_occ_threshold_s = _coerce_float_or_nan(getattr(params, "occupancy_threshold_split_s", np.nan))
+    if (not np.isfinite(split_occ_threshold_s)) or split_occ_threshold_s < 0:
+        split_occ_threshold_s = _coerce_float_or_nan(getattr(params, "occupancy_threshold_s", np.nan))
+    if (not np.isfinite(split_occ_threshold_s)) or split_occ_threshold_s < 0:
+        split_occ_threshold_s = 0.1
+    pref_occ_ref = np.array([], dtype=float)
+    nonpref_occ_ref = np.array([], dtype=float)
+    if len(split_rows) > 0 and isinstance(split_rows[0][2], dict):
+        first_row_maps = split_rows[0][2]
+        pref_occ_ref = np.asarray(first_row_maps.get("preferred_occupancy_s", np.array([])), dtype=float)
+        nonpref_occ_ref = np.asarray(first_row_maps.get("nonpreferred_occupancy_s", np.array([])), dtype=float)
     for row_idx, (row_name, local_row, split_row, row_cmap) in enumerate(split_rows):
         pref_map = np.asarray(split_row.get("preferred_map", np.array([])), dtype=float)
         nonpref_map = np.asarray(split_row.get("nonpreferred_map", np.array([])), dtype=float)
+        # Column 5/6 validity is driven directly by preferred/non-preferred occupancy:
+        # occupancy below threshold is NaN in the corresponding map.
+        pref_occ = np.asarray(split_row.get("preferred_occupancy_s", np.array([])), dtype=float)
+        nonpref_occ = np.asarray(split_row.get("nonpreferred_occupancy_s", np.array([])), dtype=float)
+        if pref_occ.shape != pref_map.shape and pref_occ_ref.shape == pref_map.shape:
+            pref_occ = np.asarray(pref_occ_ref, dtype=float)
+        if nonpref_occ.shape != nonpref_map.shape and nonpref_occ_ref.shape == nonpref_map.shape:
+            nonpref_occ = np.asarray(nonpref_occ_ref, dtype=float)
+        if pref_occ.shape == pref_map.shape:
+            pref_map = np.asarray(pref_map, dtype=float).copy()
+            pref_map[(~np.isfinite(pref_occ)) | (pref_occ < float(split_occ_threshold_s))] = np.nan
+        if nonpref_occ.shape == nonpref_map.shape:
+            nonpref_map = np.asarray(nonpref_map, dtype=float).copy()
+            nonpref_map[(~np.isfinite(nonpref_occ)) | (nonpref_occ < float(split_occ_threshold_s))] = np.nan
         both_vals = np.concatenate(
             [
                 pref_map[np.isfinite(pref_map)],
@@ -28759,8 +29776,18 @@ def _plot_egocentric_per_cell_summary_figure(
             norm_obj=split_norm,
         )
         if row_name == "All":
-            _overlay_pf_mask_reference(ax_pref_rows[row_idx], pf_mask_ref)
-            _overlay_pf_mask_reference(ax_nonpref_rows[row_idx], pf_mask_ref)
+            _overlay_pf_mask_reference(
+                ax_pref_rows[row_idx],
+                pf_mask_ref,
+                local_row,
+                pf_components=list(pf_components_ref),
+            )
+            _overlay_pf_mask_reference(
+                ax_nonpref_rows[row_idx],
+                pf_mask_ref,
+                local_row,
+                pf_components=list(pf_components_ref),
+            )
         cbar_mappable = im_nonpref if im_nonpref is not None else im_pref
         if cbar_mappable is not None:
             cbar = fig.colorbar(
@@ -28881,6 +29908,13 @@ def _plot_egocentric_per_cell_summary_figure(
         "valid_bin_mrl_n_all": int(valid_bin_mrl_n_all),
         "valid_bin_mrl_n_ss": int(valid_bin_mrl_n_ss),
         "valid_bin_mrl_n_cs": int(valid_bin_mrl_n_cs),
+        "hd_vel_corr_method": str(hd_vel_corr_method),
+        "hd_vel_corr_all": float(hd_vel_corr_all) if np.isfinite(hd_vel_corr_all) else np.nan,
+        "hd_vel_corr_ss": float(hd_vel_corr_ss) if np.isfinite(hd_vel_corr_ss) else np.nan,
+        "hd_vel_corr_cs": float(hd_vel_corr_cs) if np.isfinite(hd_vel_corr_cs) else np.nan,
+        "hd_vel_corr_n_all": int(hd_vel_corr_n_all),
+        "hd_vel_corr_n_ss": int(hd_vel_corr_n_ss),
+        "hd_vel_corr_n_cs": int(hd_vel_corr_n_cs),
         "saved_paths": saved_paths,
     }
 
@@ -28954,6 +29988,23 @@ def generate_egocentric_per_cell_summary_plots(
         )
     ):
         raise ValueError("split_map_bin_size_cm must be > 0 when provided.")
+    split_source = str(getattr(params, "split_preferred_angle_source", "fit")).strip().lower()
+    if split_source not in {"fit", "empirical"}:
+        raise ValueError("split_preferred_angle_source must be 'fit' or 'empirical'.")
+    hd_vel_corr_method = str(getattr(params, "hd_vel_corr_method", "normalized_dot")).strip().lower()
+    if hd_vel_corr_method not in {"normalized_dot", "mean_raw_dot"}:
+        raise ValueError("hd_vel_corr_method must be 'normalized_dot' or 'mean_raw_dot'.")
+    if (
+        (not np.isfinite(float(getattr(params, "split_preferred_half_width_deg", np.nan))))
+        or float(getattr(params, "split_preferred_half_width_deg", np.nan)) <= 0
+    ):
+        raise ValueError("split_preferred_half_width_deg must be > 0.")
+    if (
+        (not np.isfinite(float(getattr(params, "pf_overlay_area_threshold", np.nan))))
+        or float(getattr(params, "pf_overlay_area_threshold", np.nan)) < 0.0
+        or float(getattr(params, "pf_overlay_area_threshold", np.nan)) > 1.0
+    ):
+        raise ValueError("pf_overlay_area_threshold must be in [0, 1].")
     if float(params.pc_smooth_sigma) < 0 or float(params.pc_occ_smooth_sigma) < 0:
         raise ValueError("pc_smooth_sigma and pc_occ_smooth_sigma must be >= 0.")
     if float(params.pc_min_occupancy_s) < 0:

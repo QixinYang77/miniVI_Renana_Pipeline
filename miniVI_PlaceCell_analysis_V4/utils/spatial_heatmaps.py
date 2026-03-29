@@ -142,6 +142,7 @@ def load_pooled_spatial_data(data_folder, folders):
     Returns list of (folder_name, cell_data) tuples for filtering.
     """
     all_cells = []
+    data_folder_abs = os.path.abspath(str(data_folder))
     for folder in folders:
         spatial_path = os.path.join(data_folder, folder, 'spatial_analysis_full.pkl')
         if os.path.exists(spatial_path):
@@ -149,6 +150,7 @@ def load_pooled_spatial_data(data_folder, folders):
                 cells = pickle.load(f)
                 for cell in cells:
                     cell['session'] = folder  # Add session info for filtering
+                    cell['data_folder'] = data_folder_abs
                 all_cells.extend(cells)
                 print(f"Loaded {len(cells)} cells from {folder}")
         else:
@@ -327,6 +329,267 @@ def plot_celltype_distribution_pie(
     return fig, ax
 
 
+def _extract_cell_event_entry(entries: Any, cell_idx: int) -> dict[str, Any] | None:
+    if isinstance(entries, (list, tuple)):
+        idx = int(cell_idx)
+        if 0 <= idx < len(entries) and isinstance(entries[idx], dict):
+            return entries[idx]
+    elif isinstance(entries, dict):
+        return entries
+    return None
+
+
+def _sanitize_and_merge_intervals(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    n_frames: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    starts = np.asarray(starts, dtype=int).ravel()
+    ends = np.asarray(ends, dtype=int).ravel()
+    n = int(min(starts.size, ends.size))
+    if n <= 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    starts = starts[:n]
+    ends = ends[:n]
+    swap = ends < starts
+    if np.any(swap):
+        temp = starts.copy()
+        starts[swap] = ends[swap]
+        ends[swap] = temp[swap]
+
+    if int(n_frames) > 0:
+        starts = np.clip(starts, 0, int(n_frames) - 1)
+        ends = np.clip(ends, 0, int(n_frames) - 1)
+    valid = ends >= starts
+    starts = starts[valid]
+    ends = ends[valid]
+    if starts.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    order = np.argsort(starts, kind="mergesort")
+    starts = starts[order]
+    ends = ends[order]
+
+    merged_starts = [int(starts[0])]
+    merged_ends = [int(ends[0])]
+    for s, e in zip(starts[1:], ends[1:]):
+        s_i = int(s)
+        e_i = int(e)
+        if s_i <= merged_ends[-1] + 1:
+            merged_ends[-1] = max(merged_ends[-1], e_i)
+        else:
+            merged_starts.append(s_i)
+            merged_ends.append(e_i)
+    return np.asarray(merged_starts, dtype=int), np.asarray(merged_ends, dtype=int)
+
+
+def _build_plateau_intervals_from_merged(
+    merged_data: dict[str, Any] | None,
+    *,
+    cell_idx: int,
+    include_long_cb_as_plateau: bool,
+    cb_min_duration_ms: float,
+    n_frames: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not isinstance(merged_data, dict):
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    p_entry = _extract_cell_event_entry(merged_data.get("plateaus_dicts"), int(cell_idx))
+    p_starts = np.asarray(p_entry.get("starts", []), dtype=int) if p_entry is not None else np.array([], dtype=int)
+    p_ends = np.asarray(p_entry.get("ends", []), dtype=int) if p_entry is not None else np.array([], dtype=int)
+
+    cb_starts = np.array([], dtype=int)
+    cb_ends = np.array([], dtype=int)
+    if bool(include_long_cb_as_plateau):
+        thr = float(cb_min_duration_ms)
+        if (not np.isfinite(thr)) or thr <= 0:
+            raise ValueError("plateau_cb_min_duration_ms must be a finite number > 0.")
+        cb_entry = _extract_cell_event_entry(merged_data.get("complex_bursts_dicts"), int(cell_idx))
+        if cb_entry is not None:
+            starts_all = np.asarray(cb_entry.get("starts", []), dtype=int).ravel()
+            ends_all = np.asarray(cb_entry.get("ends", []), dtype=int).ravel()
+            n_cb = int(min(starts_all.size, ends_all.size))
+            if n_cb > 0:
+                starts_all = starts_all[:n_cb]
+                ends_all = ends_all[:n_cb]
+                durs = np.asarray(cb_entry.get("durations_ms", []), dtype=float).ravel()
+                if durs.size == n_cb:
+                    durs_ms = durs
+                else:
+                    frame_rate = float(merged_data.get("frame_rate", np.nan))
+                    if np.isfinite(frame_rate) and frame_rate > 0:
+                        durs_ms = (ends_all - starts_all + 1).astype(float) / frame_rate * 1000.0
+                    else:
+                        durs_ms = np.full(n_cb, np.nan, dtype=float)
+                keep = np.isfinite(durs_ms) & (durs_ms >= thr)
+                cb_starts = starts_all[keep]
+                cb_ends = ends_all[keep]
+
+    starts = np.concatenate([p_starts, cb_starts]) if (p_starts.size or cb_starts.size) else np.array([], dtype=int)
+    ends = np.concatenate([p_ends, cb_ends]) if (p_ends.size or cb_ends.size) else np.array([], dtype=int)
+    return _sanitize_and_merge_intervals(starts, ends, int(n_frames))
+
+
+def _infer_cell_map_shape(cell: dict[str, Any]) -> tuple[int, int]:
+    for key in (
+        "rate_map",
+        "ss_norm_map",
+        "cs_norm_map",
+        "theta_map",
+        "slow_map",
+        "place_field_mask",
+    ):
+        arr = cell.get(key, None)
+        if arr is None:
+            continue
+        arr_np = np.asarray(arr)
+        if arr_np.ndim == 2 and arr_np.shape[0] > 0 and arr_np.shape[1] > 0:
+            return int(arr_np.shape[0]), int(arr_np.shape[1])
+
+    params = cell.get("params", {})
+    width_real = float(params.get("width_real", 35.5))
+    height_real = float(params.get("height_real", 20.0))
+    bin_size = float(params.get("bin_size", 1.5))
+    if (not np.isfinite(bin_size)) or bin_size <= 0:
+        bin_size = 1.5
+    n_x = max(1, int(np.round(width_real / bin_size)))
+    n_y = max(1, int(np.round(height_real / bin_size)))
+    return n_x, n_y
+
+
+def _resolve_merged_data_for_cell(
+    cell: dict[str, Any],
+    *,
+    plateau_data_folder: str | None,
+    merged_cache: dict[str, dict[str, Any] | None],
+    warned_sessions: set[str],
+) -> dict[str, Any] | None:
+    session = str(cell.get("session", "")).strip()
+    if len(session) == 0:
+        return None
+
+    data_root = plateau_data_folder if plateau_data_folder is not None else cell.get("data_folder", None)
+    if not isinstance(data_root, str) or len(data_root.strip()) == 0:
+        if session not in warned_sessions:
+            print(f"Plateau map warning: missing data folder for session '{session}'.")
+            warned_sessions.add(session)
+        return None
+
+    key = f"{os.path.abspath(data_root)}::{session}"
+    if key in merged_cache:
+        return merged_cache[key]
+
+    merged_path = os.path.join(data_root, session, "merged_aligned_data.pkl")
+    if not os.path.exists(merged_path):
+        merged_path = os.path.join(data_root, session, "merged_aligned_data_CS.pkl")
+    if not os.path.exists(merged_path):
+        if session not in warned_sessions:
+            print(f"Plateau map warning: missing merged data for session '{session}'.")
+            warned_sessions.add(session)
+        merged_cache[key] = None
+        return None
+
+    try:
+        with open(merged_path, "rb") as f:
+            merged = pickle.load(f)
+    except Exception:
+        if session not in warned_sessions:
+            print(f"Plateau map warning: failed loading merged data for session '{session}'.")
+            warned_sessions.add(session)
+        merged_cache[key] = None
+        return None
+
+    merged_cache[key] = merged if isinstance(merged, dict) else None
+    return merged_cache[key]
+
+
+def _compute_plateau_occurrence_maps_for_cell(
+    cell: dict[str, Any],
+    *,
+    merged_data: dict[str, Any] | None,
+    include_long_cb_as_plateau: bool,
+    cb_min_duration_ms: float,
+    speed_threshold: float,
+) -> dict[str, np.ndarray]:
+    n_x, n_y = _infer_cell_map_shape(cell)
+    out_all = np.zeros((n_x, n_y), dtype=float)
+    out_moving = np.zeros((n_x, n_y), dtype=float)
+    out_resting = np.zeros((n_x, n_y), dtype=float)
+
+    if not isinstance(merged_data, dict):
+        return {"all": out_all, "moving": out_moving, "resting": out_resting}
+
+    x = np.asarray(merged_data.get("x_neural", []), dtype=float).reshape(-1)
+    y = np.asarray(merged_data.get("y_neural", []), dtype=float).reshape(-1)
+    speed = np.asarray(merged_data.get("speed", np.full_like(x, np.nan)), dtype=float).reshape(-1)
+    n_frames = int(min(x.size, y.size, speed.size))
+    if n_frames <= 0:
+        return {"all": out_all, "moving": out_moving, "resting": out_resting}
+
+    x = x[:n_frames]
+    y = y[:n_frames]
+    speed = speed[:n_frames]
+
+    starts, ends = _build_plateau_intervals_from_merged(
+        merged_data,
+        cell_idx=int(cell.get("cell_idx", -1)),
+        include_long_cb_as_plateau=bool(include_long_cb_as_plateau),
+        cb_min_duration_ms=float(cb_min_duration_ms),
+        n_frames=n_frames,
+    )
+    if starts.size == 0:
+        return {"all": out_all, "moving": out_moving, "resting": out_resting}
+
+    params = cell.get("params", {})
+    width_real = float(params.get("width_real", 35.5))
+    height_real = float(params.get("height_real", 20.0))
+    if (not np.isfinite(width_real)) or width_real <= 0:
+        width_real = 35.5
+    if (not np.isfinite(height_real)) or height_real <= 0:
+        height_real = 20.0
+    x_edges = np.linspace(0.0, width_real, n_x + 1, dtype=float)
+    y_edges = np.linspace(0.0, height_real, n_y + 1, dtype=float)
+
+    def _accumulate_unique(mask: np.ndarray, xi: np.ndarray, yi: np.ndarray, target: np.ndarray) -> None:
+        if not np.any(mask):
+            return
+        keys = np.unique(xi[mask] * n_y + yi[mask])
+        target.reshape(-1)[keys] += 1.0
+
+    thr = float(speed_threshold)
+    for s, e in zip(starts, ends):
+        s_i = int(s)
+        e_i = int(e)
+        if e_i < s_i:
+            continue
+        seg_slice = slice(s_i, e_i + 1)
+        x_seg = x[seg_slice]
+        y_seg = y[seg_slice]
+        sp_seg = speed[seg_slice]
+
+        xi = np.searchsorted(x_edges, x_seg, side="right") - 1
+        yi = np.searchsorted(y_edges, y_seg, side="right") - 1
+        x_right_edge = np.isfinite(x_seg) & np.isclose(x_seg, x_edges[-1], atol=1e-9, rtol=0.0)
+        y_right_edge = np.isfinite(y_seg) & np.isclose(y_seg, y_edges[-1], atol=1e-9, rtol=0.0)
+        xi[x_right_edge] = int(n_x - 1)
+        yi[y_right_edge] = int(n_y - 1)
+
+        valid_xy = np.isfinite(x_seg) & np.isfinite(y_seg)
+        in_bounds = (xi >= 0) & (yi >= 0) & (xi < n_x) & (yi < n_y)
+        valid = valid_xy & in_bounds
+        if not np.any(valid):
+            continue
+
+        moving = valid & np.isfinite(sp_seg) & (sp_seg >= thr)
+        resting = valid & np.isfinite(sp_seg) & (sp_seg < thr)
+        _accumulate_unique(valid, xi, yi, out_all)
+        _accumulate_unique(moving, xi, yi, out_moving)
+        _accumulate_unique(resting, xi, yi, out_resting)
+
+    return {"all": out_all, "moving": out_moving, "resting": out_resting}
+
+
 def plot_selected_cells_figure(
     cell_groups,
     group_names=None,
@@ -350,6 +613,12 @@ def plot_selected_cells_figure(
     show_shape_counts=False,
     shape_ylim=None,
     print_removed_frames=True,
+    include_plateau=True,
+    plateau_state_mode='split',
+    plateau_include_long_cb_as_plateau=True,
+    plateau_cb_min_duration_ms=200.0,
+    plateau_speed_threshold=3.0,
+    plateau_data_folder=None,
 ):
     """
     Plot spatial heatmaps for selected cells in a grid format.
@@ -407,6 +676,19 @@ def plot_selected_cells_figure(
     print_removed_frames : bool
         If True (default), print removed-frame stats per cell (SNR-only and total)
         when available in `spatial_analysis_full.pkl`.
+    include_plateau : bool
+        If True (default), add plateau occurrence heatmap row(s) using merged data.
+    plateau_state_mode : {'split', 'all', 'moving', 'resting'}
+        Plateau row mode. 'split' adds both moving and resting rows.
+    plateau_include_long_cb_as_plateau : bool
+        If True (default), include long complex bursts as plateau intervals.
+    plateau_cb_min_duration_ms : float
+        Minimum CB duration (ms) to include as plateau when enabled (default 200 ms).
+    plateau_speed_threshold : float
+        Speed threshold for moving/resting split: moving >= threshold, resting < threshold.
+    plateau_data_folder : str or None
+        Optional root folder containing per-session merged files. If None, uses per-cell
+        `data_folder` (added by `load_pooled_spatial_data`).
     
     Returns:
     --------
@@ -442,13 +724,40 @@ def plot_selected_cells_figure(
             min_shapes_per_condition_cb = int(min_shapes_per_condition)
     min_shapes_per_condition_ss = int(min_shapes_per_condition_ss)
     min_shapes_per_condition_cb = int(min_shapes_per_condition_cb)
+    include_plateau = bool(include_plateau)
+    plateau_state_mode = str(plateau_state_mode).strip().lower()
+    valid_plateau_modes = {'split', 'all', 'moving', 'resting'}
+    if plateau_state_mode not in valid_plateau_modes:
+        raise ValueError(
+            "plateau_state_mode must be one of {'split', 'all', 'moving', 'resting'}."
+        )
+    if (not np.isfinite(float(plateau_cb_min_duration_ms))) or float(plateau_cb_min_duration_ms) <= 0:
+        raise ValueError("plateau_cb_min_duration_ms must be a finite number > 0.")
+    if not np.isfinite(float(plateau_speed_threshold)):
+        raise ValueError("plateau_speed_threshold must be a finite number.")
+    if plateau_data_folder is not None:
+        plateau_data_folder = os.path.abspath(str(plateau_data_folder))
 
     plot_spike_shapes_overall = bool(plot_spike_shapes_overall)
     if not bool(plot_spike_shapes):
         plot_spike_shapes_overall = False
-    
+
     base_rows = 6  # trajectory, rate map, SS, CS, theta, slow
-    n_rows = base_rows + (2 if plot_spike_shapes else 0)
+    plateau_row_modes: list[tuple[str, str]] = []
+    if include_plateau:
+        if plateau_state_mode == 'split':
+            plateau_row_modes = [('moving', 'Plateau (moving)'), ('resting', 'Plateau (resting)')]
+        elif plateau_state_mode == 'all':
+            plateau_row_modes = [('all', 'Plateau')]
+        elif plateau_state_mode == 'moving':
+            plateau_row_modes = [('moving', 'Plateau')]
+        else:
+            plateau_row_modes = [('resting', 'Plateau')]
+    n_plateau_rows = len(plateau_row_modes)
+    map_rows = base_rows + n_plateau_rows
+    plot_plateau_shapes = bool(include_plateau and plot_spike_shapes)
+    n_shape_rows = (2 if plot_spike_shapes else 0) + (1 if plot_plateau_shapes else 0)
+    n_rows = map_rows + n_shape_rows
     
     # Calculate width ratios
     if use_gaps:
@@ -481,8 +790,12 @@ def plot_selected_cells_figure(
     first_data_col = min(col_to_cell.keys())
     
     # Row indices for optional spike-shape panels
-    shape_row_top = base_rows
-    shape_row_bottom = base_rows + 1
+    plateau_row_by_mode = {
+        mode: (base_rows + idx) for idx, (mode, _) in enumerate(plateau_row_modes)
+    }
+    shape_row_top = map_rows
+    shape_row_bottom = map_rows + 1
+    plateau_shape_row = map_rows + 2
     
     # Get arena dimensions from first cell
     params = all_cells[0]['params']
@@ -514,8 +827,8 @@ def plot_selected_cells_figure(
     # Create axes for data columns only (skip gap columns)
     axes_grid = {}
     
-    # Base rows (maps)
-    for row in range(base_rows):
+    # Base rows (maps + optional plateau rows)
+    for row in range(map_rows):
         for col in range(n_cols):
             if col in gap_cols:
                 continue
@@ -536,6 +849,17 @@ def plot_selected_cells_figure(
             )
             axes_grid[(shape_row_bottom, col)] = fig.add_subplot(
                 gs[shape_row_bottom, col], sharex=anchor_cb, sharey=anchor_cb
+            )
+
+    # Optional plateau-shape row (all plateau traces, no averaging)
+    if plot_plateau_shapes:
+        anchor_plateau = fig.add_subplot(gs[plateau_shape_row, first_data_col])
+        axes_grid[(plateau_shape_row, first_data_col)] = anchor_plateau
+        for col in range(n_cols):
+            if col in gap_cols or col == first_data_col:
+                continue
+            axes_grid[(plateau_shape_row, col)] = fig.add_subplot(
+                gs[plateau_shape_row, col], sharex=anchor_plateau, sharey=anchor_plateau
             )
     
     # Define colors and styling
@@ -581,6 +905,114 @@ def plot_selected_cells_figure(
         cbar.ax.yaxis.set_label_position('right')
         cbar.ax.tick_params(labelsize=5, width=0.4, direction='out', right=True, left=False, labelright=True, labelleft=False)
         return cbar
+
+    plateau_maps_by_cell: dict[int, dict[str, np.ndarray]] = {}
+    merged_data_by_cell: dict[int, dict[str, Any] | None] = {}
+    if include_plateau:
+        merged_cache: dict[str, dict[str, Any] | None] = {}
+        warned_sessions: set[str] = set()
+        for flat_idx, cell in enumerate(all_cells):
+            merged_data = _resolve_merged_data_for_cell(
+                cell,
+                plateau_data_folder=plateau_data_folder,
+                merged_cache=merged_cache,
+                warned_sessions=warned_sessions,
+            )
+            merged_data_by_cell[flat_idx] = merged_data
+            plateau_maps_by_cell[flat_idx] = _compute_plateau_occurrence_maps_for_cell(
+                cell,
+                merged_data=merged_data,
+                include_long_cb_as_plateau=bool(plateau_include_long_cb_as_plateau),
+                cb_min_duration_ms=float(plateau_cb_min_duration_ms),
+                speed_threshold=float(plateau_speed_threshold),
+            )
+
+    plateau_shape_traces_by_cell: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {}
+    plateau_shape_xlim: tuple[float, float] | None = None
+    plateau_shape_ylim: tuple[float, float] | None = None
+    if plot_plateau_shapes:
+        plateau_shape_pre_ms = 40.0
+        plateau_shape_post_ms = 20.0
+        x_min_ms = np.inf
+        x_max_ms = -np.inf
+        y_min_ps = np.inf
+        y_max_ps = -np.inf
+
+        for flat_idx, cell in enumerate(all_cells):
+            merged_data = merged_data_by_cell.get(flat_idx)
+            traces_for_cell: list[tuple[np.ndarray, np.ndarray]] = []
+            if isinstance(merged_data, dict):
+                src = merged_data.get(
+                    "traces_SNR_interpolated",
+                    merged_data.get("traces", []),
+                )
+                ci = int(cell.get("cell_idx", -1))
+                trace = np.array([], dtype=float)
+                if isinstance(src, (list, tuple, np.ndarray)) and 0 <= ci < len(src):
+                    trace = np.asarray(src[ci], dtype=float).reshape(-1)
+                if trace.size > 0:
+                    starts, ends = _build_plateau_intervals_from_merged(
+                        merged_data,
+                        cell_idx=ci,
+                        include_long_cb_as_plateau=bool(plateau_include_long_cb_as_plateau),
+                        cb_min_duration_ms=float(plateau_cb_min_duration_ms),
+                        n_frames=int(trace.size),
+                    )
+                    frame_rate_ps = float(merged_data.get("frame_rate", np.nan))
+                    use_ms = np.isfinite(frame_rate_ps) and frame_rate_ps > 0
+                    if use_ms:
+                        pre_frames = max(0, int(np.ceil(float(plateau_shape_pre_ms) / 1000.0 * float(frame_rate_ps))))
+                        post_frames = max(0, int(np.ceil(float(plateau_shape_post_ms) / 1000.0 * float(frame_rate_ps))))
+                    else:
+                        pre_frames = int(np.ceil(float(plateau_shape_pre_ms)))
+                        post_frames = int(np.ceil(float(plateau_shape_post_ms)))
+                    for s, e in zip(starts, ends):
+                        s_i = int(s)
+                        e_i = int(e)
+                        if e_i < s_i:
+                            continue
+                        seg_start = max(0, s_i - pre_frames)
+                        seg_end = min(int(trace.size) - 1, e_i + post_frames)
+                        if seg_end < seg_start:
+                            continue
+                        seg = np.asarray(trace[seg_start:seg_end + 1], dtype=float)
+                        if seg.size == 0 or not np.any(np.isfinite(seg)):
+                            continue
+                        if use_ms:
+                            frame_idx = np.arange(seg_start, seg_end + 1, dtype=float)
+                            x_ms = (frame_idx - float(s_i)) / float(frame_rate_ps) * 1000.0
+                        else:
+                            frame_idx = np.arange(seg_start, seg_end + 1, dtype=float)
+                            x_ms = frame_idx - float(s_i)
+                        traces_for_cell.append((x_ms, seg))
+                        if x_ms.size:
+                            x_min_ms = min(x_min_ms, float(np.nanmin(x_ms)))
+                            x_max_ms = max(x_max_ms, float(np.nanmax(x_ms)))
+                        finite_seg = seg[np.isfinite(seg)]
+                        if finite_seg.size:
+                            y_min_ps = min(y_min_ps, float(np.nanmin(finite_seg)))
+                            y_max_ps = max(y_max_ps, float(np.nanmax(finite_seg)))
+            plateau_shape_traces_by_cell[flat_idx] = traces_for_cell
+
+        # Fixed display window for plateau-shape row.
+        plateau_shape_xlim = (0.0, 250.0)
+        if np.isfinite(y_min_ps) and np.isfinite(y_max_ps):
+            if y_max_ps == y_min_ps:
+                eps = 1e-3
+                plateau_shape_ylim = (y_min_ps - eps, y_max_ps + eps)
+            else:
+                plateau_shape_ylim = (y_min_ps, y_max_ps)
+        else:
+            plateau_shape_ylim = (-0.2, 1.2)
+
+    # Ensure plateau-shape row uses shared limits (all columns share x/y with anchor).
+    if plot_plateau_shapes:
+        anchor_plateau_ax = axes_grid.get((plateau_shape_row, first_data_col))
+        if anchor_plateau_ax is not None:
+            if plateau_shape_xlim is not None:
+                anchor_plateau_ax.set_xlim(*plateau_shape_xlim)
+            if plateau_shape_ylim is not None:
+                anchor_plateau_ax.set_ylim(*plateau_shape_ylim)
     
     # Prepare shared axes and global limits for spike-shape rows
     shape_xlim = None
@@ -989,8 +1421,46 @@ def plot_selected_cells_figure(
                             ha="center", va="top", fontsize=4, fontname="Arial", color=color)
         if is_last_column and im_slow is not None:
             _add_colorbar(ax_slow, im_slow)
-        
-        # Row 6-7 (optional): Spike shapes
+
+        # Optional plateau occurrence map row(s)
+        if include_plateau:
+            plateau_maps = plateau_maps_by_cell.get(cell_idx, {})
+            for mode, _label in plateau_row_modes:
+                row_idx = plateau_row_by_mode[mode]
+                ax_plateau = axes_grid[(row_idx, display_col)]
+                plateau_map = plateau_maps.get(mode, None)
+                im_plateau = None
+                plateau_max_occ = np.nan
+                if plateau_map is not None and np.any(np.isfinite(plateau_map)):
+                    plateau_masked = ma.masked_where(np.isnan(plateau_map), plateau_map)
+                    plateau_max_occ = float(np.nanmax(plateau_map))
+                    vmax = plateau_max_occ if np.isfinite(plateau_max_occ) and plateau_max_occ > 0 else 1.0
+                    im_plateau = ax_plateau.imshow(
+                        plateau_masked.T,
+                        origin="lower",
+                        extent=extent,
+                        cmap="Reds",
+                        interpolation="nearest",
+                        vmin=0.0,
+                        vmax=vmax,
+                    )
+                _style_map_axis(ax_plateau)
+                occ_text = f"max {plateau_max_occ:g}" if np.isfinite(plateau_max_occ) else "max N/A"
+                ax_plateau.text(
+                    1.0,
+                    -0.02,
+                    occ_text,
+                    transform=ax_plateau.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=4,
+                    fontname="Arial",
+                )
+                if is_last_column and im_plateau is not None:
+                    vmax = float(im_plateau.get_clim()[1])
+                    _add_colorbar(ax_plateau, im_plateau, ticks=[0.0, vmax], ticklabels=["0", "max"])
+
+        # Optional spike-shape rows
         if plot_spike_shapes:
             spike_shapes = cell.get('spike_shapes')
 
@@ -1243,13 +1713,63 @@ def plot_selected_cells_figure(
 
                     _place_bar(shape_ss_x_start, shape_ss_x_end, 10.0 * shape_ss_x_scale, '10 ms')
                     _place_bar(shape_cb_x_start, shape_xlim[1], 50.0 * shape_cb_x_scale, '50 ms')
+
+        if plot_plateau_shapes:
+            ax_plateau_shape = axes_grid[(plateau_shape_row, display_col)]
+            ax_plateau_shape.set_facecolor('white')
+            if plateau_shape_xlim is not None:
+                ax_plateau_shape.set_xlim(*plateau_shape_xlim)
+            if plateau_shape_ylim is not None:
+                ax_plateau_shape.set_ylim(*plateau_shape_ylim)
+            ax_plateau_shape.set_xticks([])
+            ax_plateau_shape.set_yticks([])
+            for spine in ax_plateau_shape.spines.values():
+                spine.set_visible(False)
+
+            for x_ms, seg in plateau_shape_traces_by_cell.get(cell_idx, []):
+                if x_ms.size == 0 or seg.size != x_ms.size:
+                    continue
+                ax_plateau_shape.plot(
+                    x_ms,
+                    seg,
+                    color='red',
+                    alpha=0.5,
+                    linewidth=0.3,
+                    rasterized=True,
+                )
+            if is_first_column:
+                xlims = ax_plateau_shape.get_xlim()
+                ylims = ax_plateau_shape.get_ylim()
+                x0_lim, x1_lim = float(xlims[0]), float(xlims[1])
+                y0_lim, y1_lim = float(ylims[0]), float(ylims[1])
+                x_span = float(x1_lim - x0_lim) if x1_lim != x0_lim else 1.0
+                y_span = float(y1_lim - y0_lim) if y1_lim != y0_lim else 1.0
+                if np.isfinite(x_span) and x_span > 0:
+                    bar_len_ms = float(min(100.0, 0.8 * x_span))
+                    x_left = float(x0_lim + 0.08 * x_span)
+                    x_right = float(x1_lim - 0.08 * x_span)
+                    if x_right <= x_left:
+                        x_left, x_right = x0_lim, x1_lim
+                    x_bar0 = x_left
+                    x_bar1 = x_bar0 + bar_len_ms
+                    if x_bar1 > x_right:
+                        x_bar1 = x_right
+                        x_bar0 = x_bar1 - bar_len_ms
+                    y_bar = float(y0_lim + 0.08 * y_span)
+                    ax_plateau_shape.plot([x_bar0, x_bar1], [y_bar, y_bar], color='black', linewidth=0.8, solid_capstyle='butt')
+                    ax_plateau_shape.text((x_bar0 + x_bar1) / 2, y_bar - 0.06 * y_span, '100 ms',
+                                          ha='center', va='top', fontsize=4, fontname='Arial')
     # Add row labels on first column
     row_labels = ['Trajectory', 'All spikes', 'SS', 'CS', 'Theta', 'Slow Vm']
+    for _, label in plateau_row_modes:
+        row_labels.append(label)
     if plot_spike_shapes:
         if plot_spike_shapes_overall:
             row_labels.extend(['SS shape', 'CB shape'])
         else:
             row_labels.extend(['In-PF shapes', 'Out-PF shapes'])
+    if plot_plateau_shapes:
+        row_labels.append('All plateaus')
     for row_idx, label in enumerate(row_labels):
         axes_grid[(row_idx, first_data_col)].text(-0.15, 0.5, label, 
             transform=axes_grid[(row_idx, first_data_col)].transAxes,
