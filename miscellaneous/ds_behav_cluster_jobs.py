@@ -26,7 +26,7 @@ DEFAULT_CLUSTER_HOST = "loginserver.elsc.huji.ac.il"
 DEFAULT_USERNAME = "qixin.yang"
 DEFAULT_SSH_KEY_PATH = os.path.expanduser("~/.ssh/id_rsa")
 DEFAULT_PIPELINE_WORKDIR = "/ems/elsc-labs/adam-y/qixin.yang/ClusterCode/miniVI_Renana_Pipeline"
-DEFAULT_CONDA_ENV = "adamlab_pipeline"
+DEFAULT_CONDA_ENV = "caiman"
 DEFAULT_OUTPUT_DIR = (
     "/Volumes/adam-lab/Adam-Lab-Shared/Data/renana_malka/All_behavior_videos_mp4"
 )
