@@ -879,14 +879,15 @@ def plot_selected_cells_figure(
         for spine in ax.spines.values():
             spine.set_visible(False)
     
-    def _plot_pf_contour(ax, pf_mask, color, linewidth=0.6, linestyle='solid'):
+    def _plot_pf_contour(ax, pf_mask, color, linewidth=0.6, linestyle='solid', alpha=1.0):
         if pf_mask is None or not np.any(pf_mask):
             return
         padded_mask = np.pad(pf_mask.astype(float), pad_width=1, mode='constant', constant_values=0)
         bin_size = width_real / pf_mask.shape[0]
         padded_extent = (-bin_size, width_real + bin_size, -bin_size, height_real + bin_size)
-        ax.contour(padded_mask.T, levels=[0.5], colors=color, linewidths=linewidth,
-                   linestyles=linestyle, extent=padded_extent, origin="lower")
+        cs = ax.contour(padded_mask.T, levels=[0.5], colors=color, linewidths=linewidth,
+                        linestyles=linestyle, extent=padded_extent, origin="lower",
+                        alpha=alpha)
     
     def _get_sig_marker(p_val):
         if p_val < 0.001: return "***"
@@ -1445,6 +1446,13 @@ def plot_selected_cells_figure(
                         vmax=vmax,
                     )
                 _style_map_axis(ax_plateau)
+                # Overlay the same magenta place field contour as the rate map row
+                pf_mask = cell['place_field_mask']
+                if pf_mask is not None and np.any(pf_mask):
+                    if is_place_cell:
+                        _plot_pf_contour(ax_plateau, pf_mask, "magenta", linewidth=0.3, linestyle='solid', alpha=0.6)
+                    elif p_val < 0.05 and not pf_only_place_cells and plot_putative_PF:
+                        _plot_pf_contour(ax_plateau, pf_mask, "magenta", linewidth=0.3, linestyle='dashed', alpha=0.6)
                 occ_text = f"max {plateau_max_occ:g}" if np.isfinite(plateau_max_occ) else "max N/A"
                 ax_plateau.text(
                     1.0,

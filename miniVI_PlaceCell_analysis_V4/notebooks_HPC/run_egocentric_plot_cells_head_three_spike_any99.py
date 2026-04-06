@@ -807,7 +807,191 @@ def _compute_split_framewise_mean_map(
     return np.asarray(out, dtype=float)
 
 
-def _compute_csplus_pf_split_stats_rows(
+def _compute_split_heading_vector_map(
+    *,
+    x_frames,
+    y_frames,
+    dir_frames,
+    split_mask,
+    valid_frames,
+    x_edges,
+    y_edges,
+):
+    x_arr = np.asarray(x_frames, dtype=float).reshape(-1)
+    y_arr = np.asarray(y_frames, dtype=float).reshape(-1)
+    dir_arr = _wrap_angle_to_pi_local(np.asarray(dir_frames, dtype=float).reshape(-1))
+    split = np.asarray(split_mask, dtype=bool).reshape(-1)
+    valid = np.asarray(valid_frames, dtype=bool).reshape(-1)
+    tx = np.asarray(x_edges, dtype=float)
+    ty = np.asarray(y_edges, dtype=float)
+    nx = int(max(tx.size - 1, 0))
+    ny = int(max(ty.size - 1, 0))
+    vx_out = np.full((nx, ny), np.nan, dtype=float)
+    vy_out = np.full((nx, ny), np.nan, dtype=float)
+    mrl_out = np.full((nx, ny), np.nan, dtype=float)
+    if nx <= 0 or ny <= 0:
+        return vx_out, vy_out, mrl_out
+    n_frames = int(x_arr.size)
+    if (
+        n_frames <= 0
+        or y_arr.size != n_frames
+        or dir_arr.size != n_frames
+        or split.size != n_frames
+        or valid.size != n_frames
+    ):
+        return vx_out, vy_out, mrl_out
+    keep = split & valid & np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(dir_arr)
+    if not np.any(keep):
+        return vx_out, vy_out, mrl_out
+    c = np.cos(dir_arr[keep])
+    s = np.sin(dir_arr[keep])
+    counts, _, _ = np.histogram2d(x_arr[keep], y_arr[keep], bins=[tx, ty])
+    sum_c, _, _ = np.histogram2d(x_arr[keep], y_arr[keep], bins=[tx, ty], weights=c)
+    sum_s, _, _ = np.histogram2d(x_arr[keep], y_arr[keep], bins=[tx, ty], weights=s)
+    counts = np.asarray(counts, dtype=float)
+    sum_c = np.asarray(sum_c, dtype=float)
+    sum_s = np.asarray(sum_s, dtype=float)
+    good = counts > 0
+    if np.any(good):
+        vx_out = np.asarray(vx_out, dtype=float)
+        vy_out = np.asarray(vy_out, dtype=float)
+        mrl_out = np.asarray(mrl_out, dtype=float)
+        vx_out[good] = sum_c[good] / counts[good]
+        vy_out[good] = sum_s[good] / counts[good]
+        mrl_out[good] = np.sqrt((vx_out[good] ** 2) + (vy_out[good] ** 2))
+    return np.asarray(vx_out, dtype=float), np.asarray(vy_out, dtype=float), np.asarray(mrl_out, dtype=float)
+
+
+def _compute_value_heading_mrl_map(
+    *,
+    x_frames,
+    y_frames,
+    dir_frames,
+    value_frames,
+    valid_frames,
+    moving_frames,
+    x_edges,
+    y_edges,
+    frame_rate,
+    n_angle_bins,
+    occupancy_threshold_s,
+    min_occupied_angle_bins,
+    clip_negative_values=False,
+):
+    x_arr = np.asarray(x_frames, dtype=float).reshape(-1)
+    y_arr = np.asarray(y_frames, dtype=float).reshape(-1)
+    dir_arr = _wrap_angle_to_pi_local(np.asarray(dir_frames, dtype=float).reshape(-1))
+    val_arr = np.asarray(value_frames, dtype=float).reshape(-1)
+    valid = np.asarray(valid_frames, dtype=bool).reshape(-1)
+    moving = np.asarray(moving_frames, dtype=bool).reshape(-1)
+    tx = np.asarray(x_edges, dtype=float)
+    ty = np.asarray(y_edges, dtype=float)
+    nx = int(max(tx.size - 1, 0))
+    ny = int(max(ty.size - 1, 0))
+    out = np.full((nx, ny), np.nan, dtype=float)
+    if nx <= 0 or ny <= 0:
+        return out
+    n_frames = int(x_arr.size)
+    if (
+        n_frames <= 0
+        or y_arr.size != n_frames
+        or dir_arr.size != n_frames
+        or val_arr.size != n_frames
+        or valid.size != n_frames
+        or moving.size != n_frames
+    ):
+        return out
+    fr = _safe_float(frame_rate, default=np.nan)
+    if (not np.isfinite(fr)) or fr <= 0:
+        return out
+    n_ang = int(max(2, int(n_angle_bins)))
+    occ_thr_s = _safe_float(occupancy_threshold_s, default=0.0)
+    if (not np.isfinite(occ_thr_s)) or occ_thr_s < 0:
+        occ_thr_s = 0.0
+    min_occ_bins = int(max(1, int(min_occupied_angle_bins)))
+
+    keep = (
+        valid
+        & moving
+        & np.isfinite(x_arr)
+        & np.isfinite(y_arr)
+        & np.isfinite(dir_arr)
+        & np.isfinite(val_arr)
+    )
+    if not np.any(keep):
+        return out
+    xs = np.asarray(x_arr[keep], dtype=float)
+    ys = np.asarray(y_arr[keep], dtype=float)
+    ds = np.asarray(dir_arr[keep], dtype=float)
+    vs = np.asarray(val_arr[keep], dtype=float)
+    xi = _digitize_with_upper_edge_inclusive(xs, tx)
+    yi = _digitize_with_upper_edge_inclusive(ys, ty)
+    angle_edges = np.linspace(-np.pi, np.pi, n_ang + 1, dtype=float)
+    angle_centers = 0.5 * (angle_edges[:-1] + angle_edges[1:])
+    ai = np.searchsorted(angle_edges, ds, side='right') - 1
+    ai = np.mod(ai, n_ang)
+    in_bounds = (
+        (xi >= 0)
+        & (yi >= 0)
+        & (xi < nx)
+        & (yi < ny)
+        & (ai >= 0)
+        & (ai < n_ang)
+    )
+    if not np.any(in_bounds):
+        return out
+    ii = xi[in_bounds].astype(int)
+    jj = yi[in_bounds].astype(int)
+    kk = ai[in_bounds].astype(int)
+    vals = np.asarray(vs[in_bounds], dtype=float)
+
+    flat_idx = (ii * ny + jj) * n_ang + kk
+    n_total = int(nx * ny * n_ang)
+    cnt = np.bincount(flat_idx, minlength=n_total).astype(float).reshape((nx, ny, n_ang))
+    val_sum = np.bincount(flat_idx, weights=vals, minlength=n_total).astype(float).reshape((nx, ny, n_ang))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mean_val = val_sum / cnt
+    mean_val[cnt <= 0] = np.nan
+    occ_s = cnt / float(fr)
+
+    for ix in range(nx):
+        for iy in range(ny):
+            occ_curve = np.asarray(occ_s[ix, iy, :], dtype=float)
+            val_curve = np.asarray(mean_val[ix, iy, :], dtype=float)
+            good = np.isfinite(val_curve) & np.isfinite(occ_curve) & (occ_curve >= float(occ_thr_s))
+            if int(np.sum(good)) < int(min_occ_bins):
+                continue
+            w = np.asarray(val_curve[good], dtype=float)
+            if bool(clip_negative_values):
+                w = np.maximum(w, 0.0)
+            ang = np.asarray(angle_centers[good], dtype=float)
+            finite = np.isfinite(w) & np.isfinite(ang)
+            if not np.any(finite):
+                continue
+            w = w[finite]
+            ang = ang[finite]
+            if bool(clip_negative_values):
+                w = np.maximum(w, 0.0)
+            if w.size <= 0:
+                continue
+            mean_w = float(np.nanmean(w))
+            if (not np.isfinite(mean_w)) or mean_w <= 0:
+                continue
+            w_norm = w / mean_w
+            keep_w = np.isfinite(w_norm) & (w_norm > 0) & np.isfinite(ang)
+            if not np.any(keep_w):
+                continue
+            w_use = np.asarray(w_norm[keep_w], dtype=float)
+            ang_use = np.asarray(ang[keep_w], dtype=float)
+            denom = float(np.sum(w_use))
+            if (not np.isfinite(denom)) or denom <= 0:
+                continue
+            vec = np.sum(w_use * np.exp(1j * ang_use)) / denom
+            out[ix, iy] = float(np.clip(np.abs(vec), 0.0, 1.0))
+    return np.asarray(out, dtype=float)
+
+
+def _compute_pf_split_stats_rows(
     *,
     analysis,
     plot_data,
@@ -822,17 +1006,16 @@ def _compute_csplus_pf_split_stats_rows(
     animal_id,
     cell_idx,
     any_pass_threshold,
+    pass_100_any=False,
     hd_vel_corr_method='normalized_dot',
 ):
-    if str(category) != 'CSplus':
-        return []
     hd_vel_corr_method = str(hd_vel_corr_method).strip().lower()
     if hd_vel_corr_method not in {'normalized_dot', 'mean_raw_dot'}:
         hd_vel_corr_method = 'normalized_dot'
     stats_joint_valid_bins = bool(stats_joint_valid_bins)
-    pf_masks = _get_undilated_pf_component_masks(analysis)
-    if not isinstance(pf_masks, dict):
-        return []
+    pass_100_any = bool(pass_100_any)
+    is_place_cell = bool((analysis or {}).get('is_place_cell', False))
+    pf_masks = _get_undilated_pf_component_masks(analysis) if is_place_cell else None
 
     local_all = plot_data.get('local_tuning_all')
     local_ss = plot_data.get('local_tuning_ss')
@@ -849,6 +1032,20 @@ def _compute_csplus_pf_split_stats_rows(
     emp_lookup_cs = _compute_empirical_direction_lookup_all_bins(local_tuning=local_cs if isinstance(local_cs, dict) else {})
 
     def _lookup_spec_from_empirical_or_fallback(emp_lookup: dict, fallback_lookup: dict) -> dict:
+        fb = fallback_lookup if isinstance(fallback_lookup, dict) else {}
+        valid_mask_col8 = np.asarray(fb.get('arrow_valid_mask', np.array([])), dtype=bool)
+
+        def _apply_col8_valid_mask(dir_map_in: np.ndarray) -> np.ndarray:
+            dir_map_out = np.asarray(dir_map_in, dtype=float).copy()
+            if (
+                str(split_source) == 'empirical'
+                and valid_mask_col8.ndim == 2
+                and dir_map_out.ndim == 2
+                and valid_mask_col8.shape == dir_map_out.shape
+            ):
+                dir_map_out[~valid_mask_col8] = np.nan
+            return np.asarray(dir_map_out, dtype=float)
+
         x_emp = np.asarray(emp_lookup.get('x_edges', np.array([])), dtype=float) if isinstance(emp_lookup, dict) else np.array([], dtype=float)
         y_emp = np.asarray(emp_lookup.get('y_edges', np.array([])), dtype=float) if isinstance(emp_lookup, dict) else np.array([], dtype=float)
         d_emp = np.asarray(emp_lookup.get('dir_map', np.array([])), dtype=float) if isinstance(emp_lookup, dict) else np.array([], dtype=float)
@@ -860,13 +1057,12 @@ def _compute_csplus_pf_split_stats_rows(
             return {
                 'x_edges': np.asarray(x_emp, dtype=float),
                 'y_edges': np.asarray(y_emp, dtype=float),
-                'dir_map': np.asarray(d_emp, dtype=float),
+                'dir_map': _apply_col8_valid_mask(np.asarray(d_emp, dtype=float)),
             }
-        fb = fallback_lookup if isinstance(fallback_lookup, dict) else {}
         return {
             'x_edges': np.asarray(fb.get('x_edges', np.array([])), dtype=float),
             'y_edges': np.asarray(fb.get('y_edges', np.array([])), dtype=float),
-            'dir_map': np.asarray(fb.get('psi_emp_map', np.array([])), dtype=float),
+            'dir_map': _apply_col8_valid_mask(np.asarray(fb.get('psi_emp_map', np.array([])), dtype=float)),
         }
 
     stats_pref_reference = _sanitize_stats_pref_reference(stats_pref_reference)
@@ -912,28 +1108,31 @@ def _compute_csplus_pf_split_stats_rows(
     ty = np.asarray(split_maps.get('y_edges', np.array([])), dtype=float)
     if tx.size < 2 or ty.size < 2:
         return []
-    source_shape = tuple(int(v) for v in pf_masks['source_shape'])
-    sx, sy = _build_source_edges_for_mask(analysis, source_shape)
-    if sx.size < 2 or sy.size < 2:
-        return []
-    pf_overlap_thr = _safe_float(getattr(params, 'pf_overlay_area_threshold', 0.25), default=0.25)
-    if (not np.isfinite(pf_overlap_thr)) or pf_overlap_thr < 0:
-        pf_overlap_thr = 0.25
-    pf_overlap_thr = float(np.clip(pf_overlap_thr, 0.0, 1.0))
-
-    region_masks = {
-        'primary': _resample_mask_to_target_grid(
-            pf_masks['primary'], sx, sy, tx, ty, min_overlap_fraction=pf_overlap_thr
-        ),
-        'secondary': _resample_mask_to_target_grid(
-            pf_masks['secondary'], sx, sy, tx, ty, min_overlap_fraction=pf_overlap_thr
-        ),
-        'combined': _resample_mask_to_target_grid(
-            pf_masks['combined'], sx, sy, tx, ty, min_overlap_fraction=pf_overlap_thr
-        ),
-    }
-    region_masks['outside_combined'] = np.asarray(~np.asarray(region_masks['combined'], dtype=bool), dtype=bool)
-    region_masks['all_bins'] = np.ones_like(np.asarray(region_masks['combined'], dtype=bool), dtype=bool)
+    target_shape = (int(tx.size - 1), int(ty.size - 1))
+    region_masks = {'all_bins': np.ones(target_shape, dtype=bool)}
+    pf_mask_mode_label = 'non_place_all_bins'
+    if is_place_cell and isinstance(pf_masks, dict):
+        source_shape = tuple(int(v) for v in pf_masks['source_shape'])
+        sx, sy = _build_source_edges_for_mask(analysis, source_shape)
+        if sx.size >= 2 and sy.size >= 2:
+            pf_overlap_thr = _safe_float(getattr(params, 'pf_overlay_area_threshold', 0.25), default=0.25)
+            if (not np.isfinite(pf_overlap_thr)) or pf_overlap_thr < 0:
+                pf_overlap_thr = 0.25
+            pf_overlap_thr = float(np.clip(pf_overlap_thr, 0.0, 1.0))
+            region_masks = {
+                'primary': _resample_mask_to_target_grid(
+                    pf_masks['primary'], sx, sy, tx, ty, min_overlap_fraction=pf_overlap_thr
+                ),
+                'secondary': _resample_mask_to_target_grid(
+                    pf_masks['secondary'], sx, sy, tx, ty, min_overlap_fraction=pf_overlap_thr
+                ),
+                'combined': _resample_mask_to_target_grid(
+                    pf_masks['combined'], sx, sy, tx, ty, min_overlap_fraction=pf_overlap_thr
+                ),
+            }
+            region_masks['outside_combined'] = np.asarray(~np.asarray(region_masks['combined'], dtype=bool), dtype=bool)
+            region_masks['all_bins'] = np.ones_like(np.asarray(region_masks['combined'], dtype=bool), dtype=bool)
+            pf_mask_mode_label = 'components_undilated'
     metric_map_keys = {
         'all': 'all',
         'ss': 'ss',
@@ -942,7 +1141,13 @@ def _compute_csplus_pf_split_stats_rows(
         'slow': 'slow',
     }
     split_bin_size_cm = _safe_float(getattr(params, 'split_map_bin_size_cm', np.nan), default=np.nan)
-    target_shape = (int(tx.size - 1), int(ty.size - 1))
+    all_mrl_overall_map = _resample_map_to_target_grid(
+        source_map=np.asarray(arrow_all.get('mrl_emp_map', np.array([])), dtype=float),
+        source_x_edges=np.asarray(arrow_all.get('x_edges', np.array([])), dtype=float),
+        source_y_edges=np.asarray(arrow_all.get('y_edges', np.array([])), dtype=float),
+        target_x_edges=tx,
+        target_y_edges=ty,
+    )
     ss_mrl_overall_map = _resample_map_to_target_grid(
         source_map=np.asarray(arrow_ss.get('mrl_emp_map', np.array([])), dtype=float),
         source_x_edges=np.asarray(arrow_ss.get('x_edges', np.array([])), dtype=float),
@@ -957,30 +1162,49 @@ def _compute_csplus_pf_split_stats_rows(
         target_x_edges=tx,
         target_y_edges=ty,
     )
-    hd_emp_psi_src = np.asarray(arrow_all.get('psi_emp_map', np.array([])), dtype=float)
-    hd_emp_mrl_src = np.asarray(arrow_all.get('mrl_emp_map', np.array([])), dtype=float)
-    hd_emp_x_src = np.cos(hd_emp_psi_src) * np.clip(hd_emp_mrl_src, 0.0, 1.0)
-    hd_emp_y_src = np.sin(hd_emp_psi_src) * np.clip(hd_emp_mrl_src, 0.0, 1.0)
-    hd_emp_x_map = _resample_map_to_target_grid(
-        source_map=np.asarray(hd_emp_x_src, dtype=float),
-        source_x_edges=np.asarray(arrow_all.get('x_edges', np.array([])), dtype=float),
-        source_y_edges=np.asarray(arrow_all.get('y_edges', np.array([])), dtype=float),
-        target_x_edges=tx,
-        target_y_edges=ty,
-    )
-    hd_emp_y_map = _resample_map_to_target_grid(
-        source_map=np.asarray(hd_emp_y_src, dtype=float),
-        source_x_edges=np.asarray(arrow_all.get('x_edges', np.array([])), dtype=float),
-        source_y_edges=np.asarray(arrow_all.get('y_edges', np.array([])), dtype=float),
-        target_x_edges=tx,
-        target_y_edges=ty,
-    )
+    def _resample_emp_fit_vector_maps(arrow_fields):
+        def _resample_vector(psi_key, mrl_key):
+            psi_src = np.asarray((arrow_fields or {}).get(psi_key, np.array([])), dtype=float)
+            mrl_src = np.asarray((arrow_fields or {}).get(mrl_key, np.array([])), dtype=float)
+            vx_src = np.cos(psi_src) * np.clip(mrl_src, 0.0, 1.0)
+            vy_src = np.sin(psi_src) * np.clip(mrl_src, 0.0, 1.0)
+            vx_map = _resample_map_to_target_grid(
+                source_map=np.asarray(vx_src, dtype=float),
+                source_x_edges=np.asarray((arrow_fields or {}).get('x_edges', np.array([])), dtype=float),
+                source_y_edges=np.asarray((arrow_fields or {}).get('y_edges', np.array([])), dtype=float),
+                target_x_edges=tx,
+                target_y_edges=ty,
+            )
+            vy_map = _resample_map_to_target_grid(
+                source_map=np.asarray(vy_src, dtype=float),
+                source_x_edges=np.asarray((arrow_fields or {}).get('x_edges', np.array([])), dtype=float),
+                source_y_edges=np.asarray((arrow_fields or {}).get('y_edges', np.array([])), dtype=float),
+                target_x_edges=tx,
+                target_y_edges=ty,
+            )
+            if np.asarray(vx_map, dtype=float).shape != target_shape:
+                vx_map = np.full(target_shape, np.nan, dtype=float)
+            if np.asarray(vy_map, dtype=float).shape != target_shape:
+                vy_map = np.full(target_shape, np.nan, dtype=float)
+            return np.asarray(vx_map, dtype=float), np.asarray(vy_map, dtype=float)
+
+        emp_x_map, emp_y_map = _resample_vector('psi_emp_map', 'mrl_emp_map')
+        fit_x_map, fit_y_map = _resample_vector('psi_fit_map', 'mrl_fit_map')
+        return emp_x_map, emp_y_map, fit_x_map, fit_y_map
+
+    hd_emp_x_map, hd_emp_y_map, hd_fit_x_map_all, hd_fit_y_map_all = _resample_emp_fit_vector_maps(arrow_all)
+    hd_emp_x_map_ss, hd_emp_y_map_ss, hd_fit_x_map_ss, hd_fit_y_map_ss = _resample_emp_fit_vector_maps(arrow_ss)
+    hd_emp_x_map_cs, hd_emp_y_map_cs, hd_fit_x_map_cs, hd_fit_y_map_cs = _resample_emp_fit_vector_maps(arrow_cs)
     all_pref_occ_map = np.full(target_shape, np.nan, dtype=float)
     all_nonpref_occ_map = np.full(target_shape, np.nan, dtype=float)
     all_pref_speed_map = np.full(target_shape, np.nan, dtype=float)
     all_nonpref_speed_map = np.full(target_shape, np.nan, dtype=float)
+    theta_mrl_overall_map = np.full(target_shape, np.nan, dtype=float)
+    slow_mrl_overall_map = np.full(target_shape, np.nan, dtype=float)
     vel_x_map = np.full(target_shape, np.nan, dtype=float)
     vel_y_map = np.full(target_shape, np.nan, dtype=float)
+    beh_hd_x_map = np.full(target_shape, np.nan, dtype=float)
+    beh_hd_y_map = np.full(target_shape, np.nan, dtype=float)
     split_masks_payload = _compute_split_frame_masks_for_target_grid(
         data=stats_data,
         fit_info=fit_all,
@@ -1017,6 +1241,13 @@ def _compute_csplus_pf_split_stats_rows(
         ss_masks = masks.get('ss', {}) if isinstance(masks.get('ss', {}), dict) else {}
         cs_masks = masks.get('cs', {}) if isinstance(masks.get('cs', {}), dict) else {}
         frame_rate = _safe_float(stats_data.get('frame_rate', np.nan), default=np.nan)
+        split_occ_thr = _safe_float(getattr(params, 'occupancy_threshold_split_s', np.nan), default=np.nan)
+        if (not np.isfinite(split_occ_thr)) or split_occ_thr < 0:
+            split_occ_thr = _safe_float(getattr(params, 'occupancy_threshold_s', np.nan), default=0.0)
+        if (not np.isfinite(split_occ_thr)) or split_occ_thr < 0:
+            split_occ_thr = 0.0
+        min_occ_ang_bins = int(max(1, int(_safe_float(getattr(params, 'min_occupied_angle_bins', 1), default=1))))
+        n_angle_bins = int(max(2, int(_safe_float(getattr(params, 'n_angle_bins', 10), default=10))))
         all_pref_occ_map = _compute_split_occupancy_time_map(
             x_frames=x_frames,
             y_frames=y_frames,
@@ -1077,6 +1308,45 @@ def _compute_csplus_pf_split_stats_rows(
             x_edges=tx,
             y_edges=ty,
         )
+        beh_hd_x_map, beh_hd_y_map, _ = _compute_split_heading_vector_map(
+            x_frames=x_frames,
+            y_frames=y_frames,
+            dir_frames=dir_frames,
+            split_mask=np.asarray(moving_use, dtype=bool),
+            valid_frames=valid_frames,
+            x_edges=tx,
+            y_edges=ty,
+        )
+        theta_mrl_overall_map = _compute_value_heading_mrl_map(
+            x_frames=x_frames,
+            y_frames=y_frames,
+            dir_frames=dir_frames,
+            value_frames=np.asarray(stats_data.get('theta_amp_frames', np.array([])), dtype=float).reshape(-1),
+            valid_frames=valid_frames,
+            moving_frames=moving_mask,
+            x_edges=tx,
+            y_edges=ty,
+            frame_rate=frame_rate,
+            n_angle_bins=n_angle_bins,
+            occupancy_threshold_s=split_occ_thr,
+            min_occupied_angle_bins=min_occ_ang_bins,
+            clip_negative_values=False,
+        )
+        slow_mrl_overall_map = _compute_value_heading_mrl_map(
+            x_frames=x_frames,
+            y_frames=y_frames,
+            dir_frames=dir_frames,
+            value_frames=np.asarray(stats_data.get('slow_vm_frames', np.array([])), dtype=float).reshape(-1),
+            valid_frames=valid_frames,
+            moving_frames=moving_mask,
+            x_edges=tx,
+            y_edges=ty,
+            frame_rate=frame_rate,
+            n_angle_bins=n_angle_bins,
+            occupancy_threshold_s=split_occ_thr,
+            min_occupied_angle_bins=min_occ_ang_bins,
+            clip_negative_values=True,
+        )
 
     all_pref_valid = np.isfinite(np.asarray(split_maps.get('all', {}).get('preferred_map', np.array([])), dtype=float))
     all_nonpref_valid = np.isfinite(np.asarray(split_maps.get('all', {}).get('nonpreferred_map', np.array([])), dtype=float))
@@ -1092,19 +1362,45 @@ def _compute_csplus_pf_split_stats_rows(
     if all_nonpref_valid.shape == all_nonpref_speed_map.shape:
         all_nonpref_speed_map = np.asarray(all_nonpref_speed_map, dtype=float)
         all_nonpref_speed_map[~all_nonpref_valid] = np.nan
+    ss_pref_valid = np.isfinite(np.asarray(split_maps.get('ss', {}).get('preferred_map', np.array([])), dtype=float))
+    ss_nonpref_valid = np.isfinite(np.asarray(split_maps.get('ss', {}).get('nonpreferred_map', np.array([])), dtype=float))
+    cs_pref_valid = np.isfinite(np.asarray(split_maps.get('cs', {}).get('preferred_map', np.array([])), dtype=float))
+    cs_nonpref_valid = np.isfinite(np.asarray(split_maps.get('cs', {}).get('nonpreferred_map', np.array([])), dtype=float))
+
     corr_valid_mask = np.asarray(all_pref_valid, dtype=bool) | np.asarray(all_nonpref_valid, dtype=bool)
+    corr_valid_mask_ss = np.asarray(ss_pref_valid, dtype=bool) | np.asarray(ss_nonpref_valid, dtype=bool)
+    corr_valid_mask_cs = np.asarray(cs_pref_valid, dtype=bool) | np.asarray(cs_nonpref_valid, dtype=bool)
+
+    def _mask_to_valid(arr, valid_mask):
+        out = np.asarray(arr, dtype=float)
+        if out.shape == np.asarray(valid_mask, dtype=bool).shape:
+            out = out.copy()
+            out[~np.asarray(valid_mask, dtype=bool)] = np.nan
+        return np.asarray(out, dtype=float)
+
     if corr_valid_mask.shape == hd_emp_x_map.shape:
-        hd_emp_x_map = np.asarray(hd_emp_x_map, dtype=float)
-        hd_emp_x_map[~corr_valid_mask] = np.nan
+        hd_emp_x_map = _mask_to_valid(hd_emp_x_map, corr_valid_mask)
     if corr_valid_mask.shape == hd_emp_y_map.shape:
-        hd_emp_y_map = np.asarray(hd_emp_y_map, dtype=float)
-        hd_emp_y_map[~corr_valid_mask] = np.nan
+        hd_emp_y_map = _mask_to_valid(hd_emp_y_map, corr_valid_mask)
     if corr_valid_mask.shape == vel_x_map.shape:
-        vel_x_map = np.asarray(vel_x_map, dtype=float)
-        vel_x_map[~corr_valid_mask] = np.nan
+        vel_x_map = _mask_to_valid(vel_x_map, corr_valid_mask)
     if corr_valid_mask.shape == vel_y_map.shape:
-        vel_y_map = np.asarray(vel_y_map, dtype=float)
-        vel_y_map[~corr_valid_mask] = np.nan
+        vel_y_map = _mask_to_valid(vel_y_map, corr_valid_mask)
+    if corr_valid_mask.shape == beh_hd_x_map.shape:
+        beh_hd_x_map = _mask_to_valid(beh_hd_x_map, corr_valid_mask)
+    if corr_valid_mask.shape == beh_hd_y_map.shape:
+        beh_hd_y_map = _mask_to_valid(beh_hd_y_map, corr_valid_mask)
+
+    hd_fit_x_map_all = _mask_to_valid(hd_fit_x_map_all, corr_valid_mask)
+    hd_fit_y_map_all = _mask_to_valid(hd_fit_y_map_all, corr_valid_mask)
+    hd_emp_x_map_ss = _mask_to_valid(hd_emp_x_map_ss, corr_valid_mask_ss)
+    hd_emp_y_map_ss = _mask_to_valid(hd_emp_y_map_ss, corr_valid_mask_ss)
+    hd_fit_x_map_ss = _mask_to_valid(hd_fit_x_map_ss, corr_valid_mask_ss)
+    hd_fit_y_map_ss = _mask_to_valid(hd_fit_y_map_ss, corr_valid_mask_ss)
+    hd_emp_x_map_cs = _mask_to_valid(hd_emp_x_map_cs, corr_valid_mask_cs)
+    hd_emp_y_map_cs = _mask_to_valid(hd_emp_y_map_cs, corr_valid_mask_cs)
+    hd_fit_x_map_cs = _mask_to_valid(hd_fit_x_map_cs, corr_valid_mask_cs)
+    hd_fit_y_map_cs = _mask_to_valid(hd_fit_y_map_cs, corr_valid_mask_cs)
     out_rows = []
     for region_name, region_mask in region_masks.items():
         n_region_bins = int(np.sum(np.asarray(region_mask, dtype=bool)))
@@ -1134,17 +1430,19 @@ def _compute_csplus_pf_split_stats_rows(
                 'nonpreferred_mean': float(nonpref_mean) if np.isfinite(nonpref_mean) else np.nan,
                 'delta_pref_minus_nonpref': float(delta) if np.isfinite(delta) else np.nan,
                 'n_pref_bins': int(n_pref),
-                'n_nonpref_bins': int(n_nonpref),
-                'n_region_bins': int(n_region_bins),
-                'split_source': str(split_source),
-                'stats_pref_reference': str(stats_pref_reference),
-                'stats_joint_valid_bins': bool(stats_joint_valid_bins),
-                'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
-                'stats_smooth_sigma_cm': 0.0,
-                'stats_occ_smooth_sigma_cm': 0.0,
-                'pf_mask_mode': 'components_undilated',
-                'hd_vel_corr_method': str(hd_vel_corr_method),
-            })
+                    'n_nonpref_bins': int(n_nonpref),
+                    'n_region_bins': int(n_region_bins),
+                    'is_place_cell': bool(is_place_cell),
+                    'pass_100_any': bool(pass_100_any),
+                    'split_source': str(split_source),
+                    'stats_pref_reference': str(stats_pref_reference),
+                    'stats_joint_valid_bins': bool(stats_joint_valid_bins),
+                    'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
+                    'stats_smooth_sigma_cm': 0.0,
+                    'stats_occ_smooth_sigma_cm': 0.0,
+                    'pf_mask_mode': str(pf_mask_mode_label),
+                    'hd_vel_corr_method': str(hd_vel_corr_method),
+                })
         occ_pref_mean, occ_nonpref_mean, occ_n_pref, occ_n_nonpref = _paired_means_in_region(
             all_pref_occ_map,
             all_nonpref_occ_map,
@@ -1170,13 +1468,15 @@ def _compute_csplus_pf_split_stats_rows(
             'n_pref_bins': int(occ_n_pref),
             'n_nonpref_bins': int(occ_n_nonpref),
             'n_region_bins': int(n_region_bins),
+            'is_place_cell': bool(is_place_cell),
+            'pass_100_any': bool(pass_100_any),
             'split_source': str(split_source),
             'stats_pref_reference': str(stats_pref_reference),
             'stats_joint_valid_bins': bool(stats_joint_valid_bins),
             'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
             'stats_smooth_sigma_cm': 0.0,
             'stats_occ_smooth_sigma_cm': 0.0,
-            'pf_mask_mode': 'components_undilated',
+            'pf_mask_mode': str(pf_mask_mode_label),
             'hd_vel_corr_method': str(hd_vel_corr_method),
         })
         speed_pref_mean, speed_nonpref_mean, speed_n_pref, speed_n_nonpref = _paired_means_in_region(
@@ -1204,13 +1504,15 @@ def _compute_csplus_pf_split_stats_rows(
             'n_pref_bins': int(speed_n_pref),
             'n_nonpref_bins': int(speed_n_nonpref),
             'n_region_bins': int(n_region_bins),
+            'is_place_cell': bool(is_place_cell),
+            'pass_100_any': bool(pass_100_any),
             'split_source': str(split_source),
             'stats_pref_reference': str(stats_pref_reference),
             'stats_joint_valid_bins': bool(stats_joint_valid_bins),
             'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
             'stats_smooth_sigma_cm': 0.0,
             'stats_occ_smooth_sigma_cm': 0.0,
-            'pf_mask_mode': 'components_undilated',
+            'pf_mask_mode': str(pf_mask_mode_label),
             'hd_vel_corr_method': str(hd_vel_corr_method),
         })
         corr_val, corr_n = _hd_vel_correlation_in_region(
@@ -1236,18 +1538,96 @@ def _compute_csplus_pf_split_stats_rows(
             'n_pref_bins': int(corr_n),
             'n_nonpref_bins': int(corr_n),
             'n_region_bins': int(n_region_bins),
+            'is_place_cell': bool(is_place_cell),
+            'pass_100_any': bool(pass_100_any),
             'split_source': str(split_source),
             'stats_pref_reference': str(stats_pref_reference),
             'stats_joint_valid_bins': bool(stats_joint_valid_bins),
             'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
             'stats_smooth_sigma_cm': 0.0,
             'stats_occ_smooth_sigma_cm': 0.0,
-            'pf_mask_mode': 'components_undilated',
+            'pf_mask_mode': str(pf_mask_mode_label),
             'hd_vel_corr_method': str(hd_vel_corr_method),
         })
+        hd_pref_corr_val, hd_pref_corr_n = _hd_vel_correlation_in_region(
+            hd_x_map=hd_emp_x_map,
+            hd_y_map=hd_emp_y_map,
+            vel_x_map=beh_hd_x_map,
+            vel_y_map=beh_hd_y_map,
+            region_mask=region_mask,
+            method='mean_raw_dot',
+        )
+        out_rows.append({
+            'animal_id': str(animal_id),
+            'cell_idx': int(cell_idx),
+            'cell_num': int(cell_idx) + 1,
+            'category': str(category),
+            'any_pass_threshold': int(any_pass_threshold),
+            'region': str(region_name),
+            'metric': 'hd_pref_neural_vs_behavior',
+            # Store single-value correlation in both columns for long-format compatibility.
+            'preferred_mean': float(hd_pref_corr_val) if np.isfinite(hd_pref_corr_val) else np.nan,
+            'nonpreferred_mean': float(hd_pref_corr_val) if np.isfinite(hd_pref_corr_val) else np.nan,
+            'delta_pref_minus_nonpref': 0.0 if np.isfinite(hd_pref_corr_val) else np.nan,
+            'n_pref_bins': int(hd_pref_corr_n),
+            'n_nonpref_bins': int(hd_pref_corr_n),
+            'n_region_bins': int(n_region_bins),
+            'is_place_cell': bool(is_place_cell),
+            'pass_100_any': bool(pass_100_any),
+            'split_source': str(split_source),
+            'stats_pref_reference': str(stats_pref_reference),
+            'stats_joint_valid_bins': bool(stats_joint_valid_bins),
+            'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
+            'stats_smooth_sigma_cm': 0.0,
+            'stats_occ_smooth_sigma_cm': 0.0,
+            'pf_mask_mode': str(pf_mask_mode_label),
+            'hd_vel_corr_method': 'mean_raw_dot',
+        })
+        eb_empfit_corr_method = 'normalized_dot'
+        for metric_name, emp_x_local, emp_y_local, fit_x_local, fit_y_local in (
+            ('eb_empfit_corr_all', hd_emp_x_map, hd_emp_y_map, hd_fit_x_map_all, hd_fit_y_map_all),
+            ('eb_empfit_corr_ss', hd_emp_x_map_ss, hd_emp_y_map_ss, hd_fit_x_map_ss, hd_fit_y_map_ss),
+            ('eb_empfit_corr_cs', hd_emp_x_map_cs, hd_emp_y_map_cs, hd_fit_x_map_cs, hd_fit_y_map_cs),
+        ):
+            eb_corr_val, eb_corr_n = _hd_vel_correlation_in_region(
+                hd_x_map=emp_x_local,
+                hd_y_map=emp_y_local,
+                vel_x_map=fit_x_local,
+                vel_y_map=fit_y_local,
+                region_mask=region_mask,
+                method=str(eb_empfit_corr_method),
+            )
+            out_rows.append({
+                'animal_id': str(animal_id),
+                'cell_idx': int(cell_idx),
+                'cell_num': int(cell_idx) + 1,
+                'category': str(category),
+                'any_pass_threshold': int(any_pass_threshold),
+                'region': str(region_name),
+                'metric': str(metric_name),
+                'preferred_mean': float(eb_corr_val) if np.isfinite(eb_corr_val) else np.nan,
+                'nonpreferred_mean': float(eb_corr_val) if np.isfinite(eb_corr_val) else np.nan,
+                'delta_pref_minus_nonpref': 0.0 if np.isfinite(eb_corr_val) else np.nan,
+                'n_pref_bins': int(eb_corr_n),
+                'n_nonpref_bins': int(eb_corr_n),
+                'n_region_bins': int(n_region_bins),
+                'is_place_cell': bool(is_place_cell),
+                'pass_100_any': bool(pass_100_any),
+                'split_source': str(split_source),
+                'stats_pref_reference': str(stats_pref_reference),
+                'stats_joint_valid_bins': bool(stats_joint_valid_bins),
+                'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
+                'stats_smooth_sigma_cm': 0.0,
+                'stats_occ_smooth_sigma_cm': 0.0,
+                'pf_mask_mode': str(pf_mask_mode_label),
+                'hd_vel_corr_method': str(eb_empfit_corr_method),
+            })
         for metric_name, overall_map in (
+            ('all_mrl_overall', all_mrl_overall_map),
             ('ss_mrl_overall', ss_mrl_overall_map),
             ('cs_mrl_overall', cs_mrl_overall_map),
+            ('theta_mrl_overall', theta_mrl_overall_map),
+            ('slow_mrl_overall', slow_mrl_overall_map),
         ):
             overall_mean, n_overall = _mean_in_region(overall_map, region_mask)
             out_rows.append({
@@ -1265,15 +1645,19 @@ def _compute_csplus_pf_split_stats_rows(
                 'n_pref_bins': int(n_overall),
                 'n_nonpref_bins': int(n_overall),
                 'n_region_bins': int(n_region_bins),
+                'is_place_cell': bool(is_place_cell),
+                'pass_100_any': bool(pass_100_any),
                 'split_source': str(split_source),
                 'stats_pref_reference': str(stats_pref_reference),
                 'stats_joint_valid_bins': bool(stats_joint_valid_bins),
                 'split_bin_size_cm': float(split_bin_size_cm) if np.isfinite(split_bin_size_cm) else np.nan,
                 'stats_smooth_sigma_cm': 0.0,
                 'stats_occ_smooth_sigma_cm': 0.0,
-                'pf_mask_mode': 'components_undilated',
+                'pf_mask_mode': str(pf_mask_mode_label),
                 'hd_vel_corr_method': str(hd_vel_corr_method),
             })
+    for row in out_rows:
+        row.setdefault('selected_in_pass_any_folder', False)
     return out_rows
 
 
@@ -1323,6 +1707,12 @@ def main(argv=None):
         help='Spatial-bin validity criterion: minimum mean firing rate (Hz).',
     )
     parser.add_argument(
+        '--valid-bin-min-spikes',
+        type=int,
+        default=2,
+        help='Spatial-bin validity criterion: minimum spike count per spatial bin.',
+    )
+    parser.add_argument(
         '--tuning-min-valid-bins',
         type=int,
         default=5,
@@ -1352,7 +1742,8 @@ def main(argv=None):
         type=str,
         default='all',
         choices=['all', 'matching_metric'],
-        help='PF split stats preferred reference: all-spike (all) or per-metric (matching_metric).',
+        help='Shared preferred reference for column 5/6 SS/CS split maps and PF stats: '
+             'all-spike (all) or per-metric (matching_metric).',
     )
     parser.add_argument(
         '--stats-joint-valid-bins',
@@ -1367,6 +1758,19 @@ def main(argv=None):
         default='normalized_dot',
         choices=['normalized_dot', 'mean_raw_dot'],
         help='Binwise HD(empirical) vs velocity correlation metric.',
+    )
+    parser.add_argument(
+        '--col3-emp-arrow-length-scale',
+        type=float,
+        default=1.0,
+        help='Scale factor for empirical (blue) arrow length in column 3 spatial maps.',
+    )
+    parser.add_argument(
+        '--binpolar-render-style',
+        type=str,
+        default='fan',
+        choices=['fan', 'line', 'curve'],
+        help='Render style for columns 7/8 mini-polar panels: fan or line (curve alias for line).',
     )
     parser.add_argument(
         '--any-pass-threshold',
@@ -1385,8 +1789,18 @@ def main(argv=None):
     manifest_dir = Path(args.manifest_dir) if args.manifest_dir else base_dir
     any_pass_threshold = int(args.any_pass_threshold)
     tuning_min_valid_bins = int(max(1, int(args.tuning_min_valid_bins)))
+    stats_pref_reference = _sanitize_stats_pref_reference(args.stats_pref_reference)
     occupancy_threshold_s = float(max(0.0, float(args.occupancy_threshold_s)))
     occupancy_threshold_split_s = float(max(0.0, float(args.occupancy_threshold_split_s)))
+    valid_bin_min_spikes = int(max(0, int(args.valid_bin_min_spikes)))
+    col3_emp_arrow_length_scale = float(args.col3_emp_arrow_length_scale)
+    if (not np.isfinite(col3_emp_arrow_length_scale)) or col3_emp_arrow_length_scale <= 0:
+        col3_emp_arrow_length_scale = 1.0
+    binpolar_render_style = str(args.binpolar_render_style).strip().lower()
+    if binpolar_render_style == 'curve':
+        binpolar_render_style = 'line'
+    if binpolar_render_style not in {'fan', 'line'}:
+        binpolar_render_style = 'fan'
     any_pass_key = f'pass_{any_pass_threshold}'
     any_pass_suffix = f'any{any_pass_threshold}'
 
@@ -1423,12 +1837,14 @@ def main(argv=None):
         occupancy_threshold_split_s=float(occupancy_threshold_split_s),
         min_occupied_angle_bins=int(args.valid_bin_min_occupied_angle_bins),
         min_mean_rate_hz=float(args.valid_bin_min_mean_rate_hz),
+        min_spikes_per_bin=int(valid_bin_min_spikes),
         only_plot_spikes_in_valid_spatial_bins=False,
         show_empirical_fit_curve=True,
         show_spatial_map_with_fitted_arrows=True,
         curve_polar=False,
         split_maps_placecell_style=True,
         split_preferred_angle_source=str(args.split_preferred_angle_source),
+        split_preferred_reference_mode=str(stats_pref_reference),
         split_preferred_half_width_deg=float(args.split_preferred_half_width_deg),
         pf_overlay_area_threshold=float(args.pf_overlay_area_threshold),
         split_map_bin_size_cm=float(args.split_map_bin_size_cm),
@@ -1451,6 +1867,8 @@ def main(argv=None):
         theta_slow_min_duration_s=0.25,
         theta_slow_merge_gap_s=0.0,
         hd_vel_corr_method=str(args.hd_vel_corr_method),
+        col3_emp_arrow_length_scale=float(col3_emp_arrow_length_scale),
+        binpolar_render_style=str(binpolar_render_style),
         save_formats=tuple(args.save_formats),
         clear_output=False,
     )
@@ -1482,6 +1900,8 @@ def main(argv=None):
         'attempted': 0,
         'selected_any_threshold': 0,
         'plotted': 0,
+        'plotted_pass': 0,
+        'plotted_fail': 0,
         'skipped': 0,
         'filtered_false_positive': 0,
         'filtered_low_real_mrl_all': 0,
@@ -1520,9 +1940,6 @@ def main(argv=None):
             row_all = _filter_egocentric_summary_row_by_valid_bins(row_all, min_valid_bins=tuning_min_valid_bins)
             row_ss = _filter_egocentric_summary_row_by_valid_bins(row_ss, min_valid_bins=tuning_min_valid_bins)
             row_cs = _filter_egocentric_summary_row_by_valid_bins(row_cs, min_valid_bins=tuning_min_valid_bins)
-
-            cat_dir = per_cell_root / category
-            cat_dir.mkdir(parents=True, exist_ok=True)
 
             analysis = spatial_by_idx.get(cell_idx)
             if not isinstance(analysis, dict):
@@ -1629,16 +2046,54 @@ def main(argv=None):
                 pass_thr_ss = bool(pass_by_thr_ss.get(any_pass_threshold, False))
                 pass_thr_cs = bool(pass_by_thr_cs.get(any_pass_threshold, False))
                 pass_thr_any = bool(pass_thr_all or pass_thr_ss or pass_thr_cs)
-                if not pass_thr_any:
-                    continue
-                counts['selected_any_threshold'] += 1
+                pass95_any = bool(pass95_all or pass95_ss or pass95_cs)
+                pass99_any = bool(pass99_all or pass99_ss or pass99_cs)
+                pass100_any = bool(pass100_all or pass100_ss or pass100_cs)
                 real_mrl_all = np.nan
                 if isinstance(row_all, dict):
                     try:
                         real_mrl_all = float(row_all.get('real_mrl', np.nan))
                     except Exception:
                         real_mrl_all = np.nan
-                if np.isfinite(real_mrl_all) and (real_mrl_all < 0.2):
+                pf_row_start = int(len(pf_split_rows))
+                pf_row_end = int(pf_row_start)
+                try:
+                    _cell_pf_rows = _compute_pf_split_stats_rows(
+                        analysis=analysis,
+                        plot_data=plot_data,
+                        row_all=row_all,
+                        row_ss=row_ss,
+                        row_cs=row_cs,
+                        params=params,
+                        split_source=str(args.split_preferred_angle_source),
+                        stats_pref_reference=str(stats_pref_reference),
+                        stats_joint_valid_bins=_coerce_bool(str(args.stats_joint_valid_bins)),
+                        category=category,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        any_pass_threshold=int(any_pass_threshold),
+                        pass_100_any=bool(pass100_any),
+                        hd_vel_corr_method=str(args.hd_vel_corr_method),
+                    )
+                    for _r in _cell_pf_rows:
+                        _r['selected_in_pass_any_folder'] = False
+                    pf_split_rows.extend(_cell_pf_rows)
+                    pf_row_end = int(len(pf_split_rows))
+                except Exception as exc_stats:
+                    print(
+                        f'  [WARN] PF split stats failed for {animal_id} cell {cell_idx + 1}: '
+                        f'{type(exc_stats).__name__}: {exc_stats}'
+                    )
+                plot_group = f'pass_{any_pass_suffix}' if bool(pass_thr_any) else f'fail_{any_pass_suffix}'
+                if not bool(pass_thr_any):
+                    # Only keep non-passing CS+/CS- place cells in fail-group output.
+                    if str(category) not in {'CSplus', 'CSminus'}:
+                        continue
+                    if not bool((analysis or {}).get('is_place_cell', False)):
+                        continue
+                else:
+                    counts['selected_any_threshold'] += 1
+                if bool(pass_thr_any) and np.isfinite(real_mrl_all) and (real_mrl_all < 0.2):
                     skip_rows.append({
                         'category': category,
                         'animal_id': animal_id,
@@ -1652,13 +2107,12 @@ def main(argv=None):
                         f'low real_mrl_all ({real_mrl_all:.3f} < 0.200)'
                     )
                     continue
-                pass95_any = bool(pass95_all or pass95_ss or pass95_cs)
-                pass99_any = bool(pass99_all or pass99_ss or pass99_cs)
-                pass100_any = bool(pass100_all or pass100_ss or pass100_cs)
                 row_primary['pass_95'] = bool(pass95_any)
                 row_primary['pass_99'] = bool(pass99_any)
                 row_primary['pass_100'] = bool(pass100_any)
 
+                cat_dir = per_cell_root / plot_group / category
+                cat_dir.mkdir(parents=True, exist_ok=True)
                 out_base = cat_dir / f'{animal_id}_cell{cell_idx + 1:03d}_egocentric_summary_{any_pass_suffix}_3spike'
                 plot_meta = _plot_egocentric_per_cell_summary_figure(
                     category=category,
@@ -1678,7 +2132,7 @@ def main(argv=None):
                 green_all = int(plot_meta.get('green_ring_count_all', 0))
                 green_ss = int(plot_meta.get('green_ring_count_ss', 0))
                 green_cs = int(plot_meta.get('green_ring_count_cs', 0))
-                if max(green_all, green_ss, green_cs) < 3:
+                if bool(pass_thr_any) and max(green_all, green_ss, green_cs) < 3:
                     for saved in list(plot_meta.get('saved_paths', [])):
                         try:
                             Path(saved).unlink(missing_ok=True)
@@ -1699,39 +2153,22 @@ def main(argv=None):
                     continue
 
                 counts['plotted'] += 1
-                if str(category) == 'CSplus':
-                    try:
-                        pf_split_rows.extend(
-                            _compute_csplus_pf_split_stats_rows(
-                                analysis=analysis,
-                                plot_data=plot_data,
-                                row_all=row_all,
-                                row_ss=row_ss,
-                                row_cs=row_cs,
-                                params=params,
-                                split_source=str(args.split_preferred_angle_source),
-                                stats_pref_reference=str(args.stats_pref_reference),
-                                stats_joint_valid_bins=_coerce_bool(str(args.stats_joint_valid_bins)),
-                                category=category,
-                                animal_id=animal_id,
-                                cell_idx=cell_idx,
-                                any_pass_threshold=int(any_pass_threshold),
-                                hd_vel_corr_method=str(args.hd_vel_corr_method),
-                            )
-                        )
-                    except Exception as exc_stats:
-                        print(
-                            f'  [WARN] PF split stats failed for {animal_id} cell {cell_idx + 1}: '
-                            f'{type(exc_stats).__name__}: {exc_stats}'
-                        )
+                if bool(pass_thr_any):
+                    counts['plotted_pass'] += 1
+                    if pf_row_end > pf_row_start:
+                        for _ri in range(int(pf_row_start), int(pf_row_end)):
+                            pf_split_rows[_ri]['selected_in_pass_any_folder'] = True
+                else:
+                    counts['plotted_fail'] += 1
                 manifest_rows.append({
                     'category': category,
                     'animal_id': animal_id,
                     'cell_idx': cell_idx,
                     'cell_num': cell_idx + 1,
                     'any_pass_threshold': int(any_pass_threshold),
-                    'selected_by_any_threshold': True,
-                    f'selected_by_any_pass{any_pass_threshold}': True,
+                    'plot_group': str(plot_group),
+                    'selected_by_any_threshold': bool(pass_thr_any),
+                    f'selected_by_any_pass{any_pass_threshold}': bool(pass_thr_any),
                     f'pass{any_pass_threshold}_all': bool(pass_thr_all),
                     f'pass{any_pass_threshold}_ss': bool(pass_thr_ss),
                     f'pass{any_pass_threshold}_cs': bool(pass_thr_cs),
@@ -1764,10 +2201,11 @@ def main(argv=None):
                     'green_rings_all': int(green_all),
                     'green_rings_ss': int(green_ss),
                     'green_rings_cs': int(green_cs),
+                    'stats_pref_reference': str(stats_pref_reference),
                     'saved_paths': ';'.join(list(plot_meta.get('saved_paths', []))),
                 })
                 print(
-                    f'  [OK] {category} / cell {cell_idx + 1} '
+                    f'  [OK] [{plot_group}] {category} / cell {cell_idx + 1} '
                     f'({any_pass_key}: all={pass_thr_all}, ss={pass_thr_ss}, cs={pass_thr_cs})'
                 )
 
@@ -1787,6 +2225,7 @@ def main(argv=None):
         'cell_idx',
         'cell_num',
         'any_pass_threshold',
+        'plot_group',
         'selected_by_any_threshold',
         f'selected_by_any_pass{any_pass_threshold}',
         f'pass{any_pass_threshold}_all',
@@ -1821,6 +2260,7 @@ def main(argv=None):
         'green_rings_all',
         'green_rings_ss',
         'green_rings_cs',
+        'stats_pref_reference',
         'saved_paths',
     ]
     skip_columns = ['category', 'animal_id', 'cell_idx', 'reason']
@@ -1840,6 +2280,9 @@ def main(argv=None):
         'n_pref_bins',
         'n_nonpref_bins',
         'n_region_bins',
+        'is_place_cell',
+        'pass_100_any',
+        'selected_in_pass_any_folder',
         'split_source',
         'stats_pref_reference',
         'stats_joint_valid_bins',
@@ -1863,10 +2306,12 @@ def main(argv=None):
     print(f'Filtered low all real_mrl<0.2:    {counts["filtered_low_real_mrl_all"]}')
     print(f'Filtered false positives:         {counts["filtered_false_positive"]}')
     print(f'Plotted:                          {counts["plotted"]}')
+    print(f'  pass group plotted:             {counts["plotted_pass"]}')
+    print(f'  fail group plotted:             {counts["plotted_fail"]}')
     print(f'Skipped after selection:          {counts["skipped"]}')
     print(f'Manifest:                         {manifest_csv}')
     print(f'Skipped:                          {skip_csv}')
-    print(f'CS+ PF split stats:               {pf_split_csv} (rows={len(pf_split_df)})')
+    print(f'PF split stats (all categories):  {pf_split_csv} (rows={len(pf_split_df)})')
 
 
 if __name__ == '__main__':
