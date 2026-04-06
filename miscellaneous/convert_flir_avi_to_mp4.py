@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Convert a single FLIR AVI video into a compressed MP4."""
 
-from __future__ import annotations
-
 import argparse
 import shutil
 import subprocess
