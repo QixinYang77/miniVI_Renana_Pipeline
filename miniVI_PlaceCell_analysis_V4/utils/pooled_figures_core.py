@@ -347,6 +347,123 @@ def _half_violin_panel(ax, positions, data_list, colors_list, paired_specs, rng_
         ax.scatter(xs, data, s=4, color='black', alpha=0.5, linewidths=0)
 
 
+def _get_numeric_triplet_data(
+    df_subset: pd.DataFrame,
+    all_col: str,
+    ss_col: str,
+    cs_col: str,
+):
+    def _series(col_name: str) -> np.ndarray:
+        series = df_subset.get(col_name, pd.Series(np.nan, index=df_subset.index))
+        return pd.to_numeric(series, errors='coerce').to_numpy(dtype=float)
+
+    all_vals = _series(all_col)
+    ss_vals = _series(ss_col)
+    cs_vals = _series(cs_col)
+
+    all_valid = all_vals[np.isfinite(all_vals)]
+    ss_valid = ss_vals[np.isfinite(ss_vals)]
+    cs_valid = cs_vals[np.isfinite(cs_vals)]
+
+    paired_mask = np.isfinite(ss_vals) & np.isfinite(cs_vals)
+    ss_paired = ss_vals[paired_mask]
+    cs_paired = cs_vals[paired_mask]
+    return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
+
+
+def _all_finite_in_unit_interval(data_list) -> bool:
+    finite_vals = []
+    for arr in data_list:
+        arr = np.asarray(arr, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size > 0:
+            finite_vals.append(finite)
+    if not finite_vals:
+        return False
+    merged = np.concatenate(finite_vals)
+    return bool(np.all((merged >= 0.0) & (merged <= 1.0)))
+
+
+def _plot_pf_style_panel(
+    ax,
+    cs_metric,
+    non_metric,
+    ylabel: str,
+    plot_cs_minus_ss: bool = False,
+    fixed_ylim: tuple[float, float] | None = None,
+    yticks: list[float] | None = None,
+    zero_line: bool = False,
+    clamp_unit_interval: bool = False,
+):
+    positions_5 = [1, 2, 3, 4.5, 5.5]
+    cs_all, cs_ss, cs_cs, cs_ss_paired, cs_cs_paired = cs_metric
+    non_all, non_ss, _non_cs, _non_ss_paired, _non_cs_paired = non_metric
+
+    ax.axvspan(0.5, 3.5, alpha=0.3, color=CS_PLC_BG, zorder=0)
+    ax.axvspan(4.0, 6.0, alpha=0.3, color=NON_CS_PLC_BG, zorder=0)
+    ax.text(2, -0.22, 'CS+ PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
+    ax.text(5, -0.22, 'CS- PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
+
+    if plot_cs_minus_ss:
+        data_list = [cs_all, cs_ss, cs_cs, non_all, non_ss]
+        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR, SS_COLOR]
+        positions = positions_5
+    else:
+        data_list = [cs_all, cs_ss, cs_cs, non_all]
+        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR]
+        positions = [1, 2, 3, 4.5]
+
+    ylim = _global_ylim(data_list)
+    _half_violin_panel(ax, positions, data_list, colors_list, paired_specs=[(1, 2)])
+    if zero_line:
+        ax.axhline(0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+    ax.set_ylabel(ylabel, fontsize=6, fontname='Arial')
+    ax.set_xticks(positions)
+    ax.set_xticklabels(['All', 'SS', 'CS', 'All', 'SS'][:len(positions)], fontsize=4, fontname='Arial')
+    ax.set_xlim(0.3, 6.2 if plot_cs_minus_ss else 5.2)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.tick_params(axis='both', labelsize=5)
+    if yticks is not None:
+        ax.set_yticks(yticks)
+
+    if ylim:
+        y_range = ylim[1] - ylim[0]
+        h = y_range * 0.03
+        text_h = y_range * 0.08
+        gap = y_range * 0.05
+        y_top = y1 = ylim[1] + y_range * 0.05
+        if len(cs_ss_paired) >= 3:
+            p, _, _, _, _ = _paired_test(cs_ss_paired, cs_cs_paired)
+            _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
+            y_top = y1 + h + text_h
+        y2 = y1 + h + text_h + gap
+        if len(cs_all) >= 3 and len(non_all) >= 3:
+            p, _, _, _ = _unpaired_test_auto(cs_all, non_all)
+            _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
+            y_top = y2 + h + text_h
+        y3 = y2 + h + text_h + gap
+        if plot_cs_minus_ss and len(cs_ss) >= 3 and len(non_ss) >= 3:
+            p, _, _, _ = _unpaired_test_auto(cs_ss, non_ss)
+            _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
+            y_top = y3 + h + text_h
+
+        if clamp_unit_interval:
+            lower = 0.0
+            upper = max(1.0, y_top + y_range * 0.05)
+        elif fixed_ylim is not None:
+            lower = fixed_ylim[0]
+            upper = max(fixed_ylim[1], y_top + y_range * 0.05)
+        else:
+            lower = ylim[0]
+            upper = y_top + y_range * 0.05
+        ax.set_ylim(lower, upper)
+    elif fixed_ylim is not None:
+        ax.set_ylim(*fixed_ylim)
+    elif clamp_unit_interval:
+        ax.set_ylim(0.0, 1.0)
+
+
 def plot_combined_cs_plus_minus_4panels(
     df_cs_plc: pd.DataFrame,
     df_non_cs_plc: pd.DataFrame,
@@ -357,13 +474,12 @@ def plot_combined_cs_plus_minus_4panels(
     first_panel_ratio = 1.4
     fig, axes = plt.subplots(
         1,
-        5,
-        figsize=(6.9, panel_h),
-        gridspec_kw={'width_ratios': [first_panel_ratio, 1, 1, 1, first_panel_ratio]},
+        7,
+        figsize=(9.6, panel_h),
+        gridspec_kw={'width_ratios': [first_panel_ratio, 1, 1, 1, 1, 1, first_panel_ratio]},
     )
 
     positions_6 = [1, 2, 3, 4.5, 5.5, 6.5]
-    positions_5 = [1, 2, 3, 4.5, 5.5]
     arena_area_cm2 = 20.0 * 35.5
 
     # Panel 1: Peak rates.
@@ -449,123 +565,56 @@ def plot_combined_cs_plus_minus_4panels(
         cs_paired = cs_sizes[paired_mask]
         return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
 
-    # Panel 2: Summed PF size.
-    ax = axes[1]
     pf_cs_all, pf_cs_ss, pf_cs_cs, pf_cs_ss_paired, pf_cs_cs_paired = _get_pf_size_sum(df_cs_plc)
-    pf_non_all, pf_non_ss, _, _, _ = _get_pf_size_sum(df_non_cs_plc)
+    pf_non_all, pf_non_ss, pf_non_cs, pf_non_ss_paired, pf_non_cs_paired = _get_pf_size_sum(df_non_cs_plc)
+    _plot_pf_style_panel(
+        axes[1],
+        (pf_cs_all, pf_cs_ss, pf_cs_cs, pf_cs_ss_paired, pf_cs_cs_paired),
+        (pf_non_all, pf_non_ss, pf_non_cs, pf_non_ss_paired, pf_non_cs_paired),
+        ylabel='PF size (% arena)',
+        plot_cs_minus_ss=plot_cs_minus_ss,
+        fixed_ylim=(0, 100),
+        yticks=[0, 25, 50, 75, 100],
+    )
 
-    ax.axvspan(0.5, 3.5, alpha=0.3, color=CS_PLC_BG, zorder=0)
-    ax.axvspan(4.0, 6.0, alpha=0.3, color=NON_CS_PLC_BG, zorder=0)
-    ax.text(2, -0.22, 'CS+ PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
-    ax.text(5, -0.22, 'CS- PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
+    # Panel 3: Coherence.
+    coh_cs = _get_numeric_triplet_data(df_cs_plc, 'coherence_all', 'coherence_ss', 'coherence_cs')
+    coh_non = _get_numeric_triplet_data(df_non_cs_plc, 'coherence_all', 'coherence_ss', 'coherence_cs')
+    _plot_pf_style_panel(
+        axes[2],
+        coh_cs,
+        coh_non,
+        ylabel='Coherence (z)',
+        plot_cs_minus_ss=plot_cs_minus_ss,
+    )
 
-    if plot_cs_minus_ss:
-        data_list = [pf_cs_all, pf_cs_ss, pf_cs_cs, pf_non_all, pf_non_ss]
-        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR, SS_COLOR]
-        positions = positions_5
-    else:
-        data_list = [pf_cs_all, pf_cs_ss, pf_cs_cs, pf_non_all]
-        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR]
-        positions = [1, 2, 3, 4.5]
+    # Panel 4: Sparsity.
+    sparsity_cs = _get_numeric_triplet_data(df_cs_plc, 'sparsity_all', 'sparsity_ss', 'sparsity_cs')
+    sparsity_non = _get_numeric_triplet_data(df_non_cs_plc, 'sparsity_all', 'sparsity_ss', 'sparsity_cs')
+    sparsity_data_list = (
+        [sparsity_cs[0], sparsity_cs[1], sparsity_cs[2], sparsity_non[0], sparsity_non[1]]
+        if plot_cs_minus_ss
+        else [sparsity_cs[0], sparsity_cs[1], sparsity_cs[2], sparsity_non[0]]
+    )
+    _plot_pf_style_panel(
+        axes[3],
+        sparsity_cs,
+        sparsity_non,
+        ylabel='Sparsity',
+        plot_cs_minus_ss=plot_cs_minus_ss,
+        clamp_unit_interval=_all_finite_in_unit_interval(sparsity_data_list),
+    )
 
-    ylim = _global_ylim(data_list)
-    _half_violin_panel(ax, positions, data_list, colors_list, paired_specs=[(1, 2)])
-    ax.set_ylabel('PF size (% arena)', fontsize=6, fontname='Arial')
-    ax.set_xticks(positions)
-    ax.set_xticklabels(['All', 'SS', 'CS', 'All', 'SS'][:len(positions)], fontsize=4, fontname='Arial')
-    ax.set_xlim(0.3, 6.2 if plot_cs_minus_ss else 5.2)
-    ax.set_ylim(0, 100)
-    ax.set_yticks([0, 25, 50, 75, 100])
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.tick_params(axis='both', labelsize=5)
-
-    if ylim:
-        y_range = ylim[1] - ylim[0]
-        h = y_range * 0.03
-        text_h = y_range * 0.08
-        gap = y_range * 0.05
-        y_top = y1 = ylim[1] + y_range * 0.05
-        if len(pf_cs_ss_paired) >= 3:
-            p, _, _, _, _ = _paired_test(pf_cs_ss_paired, pf_cs_cs_paired)
-            _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
-            y_top = y1 + h + text_h
-        y2 = y1 + h + text_h + gap
-        if len(pf_cs_all) >= 3 and len(pf_non_all) >= 3:
-            p, _, _, _ = _unpaired_test_auto(pf_cs_all, pf_non_all)
-            _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
-            y_top = y2 + h + text_h
-        y3 = y2 + h + text_h + gap
-        if plot_cs_minus_ss and len(pf_cs_ss) >= 3 and len(pf_non_ss) >= 3:
-            p, _, _, _ = _unpaired_test_auto(pf_cs_ss, pf_non_ss)
-            _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
-            y_top = y3 + h + text_h
-        ax.set_ylim(0, y_top + y_range * 0.05)
-
-    def _get_si_data(df_subset: pd.DataFrame):
-        all_si = df_subset['si_bits_per_spike'].values
-        ss_si = df_subset['si_bits_per_spike_ss'].values
-        cs_si = df_subset['si_bits_per_spike_cs'].values
-
-        all_valid = all_si[np.isfinite(all_si)]
-        ss_valid = ss_si[np.isfinite(ss_si)]
-        cs_valid = cs_si[np.isfinite(cs_si)]
-
-        paired_mask = np.isfinite(ss_si) & np.isfinite(cs_si)
-        ss_paired = ss_si[paired_mask]
-        cs_paired = cs_si[paired_mask]
-        return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
-
-    # Panel 3: Spatial information.
-    ax = axes[2]
-    si_cs_all, si_cs_ss, si_cs_cs, si_cs_ss_paired, si_cs_cs_paired = _get_si_data(df_cs_plc)
-    si_non_all, si_non_ss, _, _, _ = _get_si_data(df_non_cs_plc)
-
-    ax.axvspan(0.5, 3.5, alpha=0.3, color=CS_PLC_BG, zorder=0)
-    ax.axvspan(4.0, 6.0, alpha=0.3, color=NON_CS_PLC_BG, zorder=0)
-    ax.text(2, -0.22, 'CS+ PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
-    ax.text(5, -0.22, 'CS- PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
-
-    if plot_cs_minus_ss:
-        data_list = [si_cs_all, si_cs_ss, si_cs_cs, si_non_all, si_non_ss]
-        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR, SS_COLOR]
-        positions = positions_5
-    else:
-        data_list = [si_cs_all, si_cs_ss, si_cs_cs, si_non_all]
-        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR]
-        positions = [1, 2, 3, 4.5]
-
-    ylim = _global_ylim(data_list)
-    _half_violin_panel(ax, positions, data_list, colors_list, paired_specs=[(1, 2)])
-    ax.set_ylabel('SI (bits/spike)', fontsize=6, fontname='Arial')
-    ax.set_xticks(positions)
-    ax.set_xticklabels(['All', 'SS', 'CS', 'All', 'SS'][:len(positions)], fontsize=4, fontname='Arial')
-    ax.set_xlim(0.3, 6.2 if plot_cs_minus_ss else 5.2)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.tick_params(axis='both', labelsize=5)
-
-    if ylim:
-        y_range = ylim[1] - ylim[0]
-        h = y_range * 0.03
-        text_h = y_range * 0.08
-        gap = y_range * 0.05
-        y_top = y1 = ylim[1] + y_range * 0.05
-        if len(si_cs_ss_paired) >= 3:
-            p, _, _, _, _ = _paired_test(si_cs_ss_paired, si_cs_cs_paired)
-            _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
-            y_top = y1 + h + text_h
-        y2 = y1 + h + text_h + gap
-        if len(si_cs_all) >= 3 and len(si_non_all) >= 3:
-            p, _, _, _ = _unpaired_test_auto(si_cs_all, si_non_all)
-            _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
-            y_top = y2 + h + text_h
-        y3 = y2 + h + text_h + gap
-        if plot_cs_minus_ss and len(si_cs_ss) >= 3 and len(si_non_ss) >= 3:
-            p, _, _, _ = _unpaired_test_auto(si_cs_ss, si_non_ss)
-            _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
-            y_top = y3 + h + text_h
-        ax.set_ylim(ylim[0], y_top + y_range * 0.05)
+    # Panel 5: Spatial information.
+    si_cs = _get_numeric_triplet_data(df_cs_plc, 'si_bits_per_spike', 'si_bits_per_spike_ss', 'si_bits_per_spike_cs')
+    si_non = _get_numeric_triplet_data(df_non_cs_plc, 'si_bits_per_spike', 'si_bits_per_spike_ss', 'si_bits_per_spike_cs')
+    _plot_pf_style_panel(
+        axes[4],
+        si_cs,
+        si_non,
+        ylabel='SI (bits/spike)',
+        plot_cs_minus_ss=plot_cs_minus_ss,
+    )
 
     def _get_selectivity(df_subset: pd.DataFrame):
         all_in = df_subset['all_inout_loco_in'].values
@@ -595,57 +644,17 @@ def plot_combined_cs_plus_minus_4panels(
         cs_paired = cs_sel[paired_mask]
         return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
 
-    # Panel 4: Selectivity.
-    ax = axes[3]
+    # Panel 6: Selectivity.
     sel_cs_all, sel_cs_ss, sel_cs_cs, sel_cs_ss_paired, sel_cs_cs_paired = _get_selectivity(df_cs_plc)
-    sel_non_all, sel_non_ss, _, _, _ = _get_selectivity(df_non_cs_plc)
-
-    ax.axvspan(0.5, 3.5, alpha=0.3, color=CS_PLC_BG, zorder=0)
-    ax.axvspan(4.0, 6.0, alpha=0.3, color=NON_CS_PLC_BG, zorder=0)
-    ax.text(2, -0.22, 'CS+ PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
-    ax.text(5, -0.22, 'CS- PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
-
-    if plot_cs_minus_ss:
-        data_list = [sel_cs_all, sel_cs_ss, sel_cs_cs, sel_non_all, sel_non_ss]
-        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR, SS_COLOR]
-        positions = positions_5
-    else:
-        data_list = [sel_cs_all, sel_cs_ss, sel_cs_cs, sel_non_all]
-        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR]
-        positions = [1, 2, 3, 4.5]
-
-    ylim = _global_ylim(data_list)
-    _half_violin_panel(ax, positions, data_list, colors_list, paired_specs=[(1, 2)])
-    ax.axhline(0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
-    ax.set_ylabel('Selectivity', fontsize=6, fontname='Arial')
-    ax.set_xticks(positions)
-    ax.set_xticklabels(['All', 'SS', 'CS', 'All', 'SS'][:len(positions)], fontsize=4, fontname='Arial')
-    ax.set_xlim(0.3, 6.2 if plot_cs_minus_ss else 5.2)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.tick_params(axis='both', labelsize=5)
-
-    if ylim:
-        y_range = ylim[1] - ylim[0]
-        h = y_range * 0.03
-        text_h = y_range * 0.08
-        gap = y_range * 0.05
-        y_top = y1 = ylim[1] + y_range * 0.05
-        if len(sel_cs_ss_paired) >= 3:
-            p, _, _, _, _ = _paired_test(sel_cs_ss_paired, sel_cs_cs_paired)
-            _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
-            y_top = y1 + h + text_h
-        y2 = y1 + h + text_h + gap
-        if len(sel_cs_all) >= 3 and len(sel_non_all) >= 3:
-            p, _, _, _ = _unpaired_test_auto(sel_cs_all, sel_non_all)
-            _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
-            y_top = y2 + h + text_h
-        y3 = y2 + h + text_h + gap
-        if plot_cs_minus_ss and len(sel_cs_ss) >= 3 and len(sel_non_ss) >= 3:
-            p, _, _, _ = _unpaired_test_auto(sel_cs_ss, sel_non_ss)
-            _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
-            y_top = y3 + h + text_h
-        ax.set_ylim(ylim[0], y_top + y_range * 0.05)
+    sel_non_all, sel_non_ss, sel_non_cs, sel_non_ss_paired, sel_non_cs_paired = _get_selectivity(df_non_cs_plc)
+    _plot_pf_style_panel(
+        axes[5],
+        (sel_cs_all, sel_cs_ss, sel_cs_cs, sel_cs_ss_paired, sel_cs_cs_paired),
+        (sel_non_all, sel_non_ss, sel_non_cs, sel_non_ss_paired, sel_non_cs_paired),
+        ylabel='Selectivity',
+        plot_cs_minus_ss=plot_cs_minus_ss,
+        zero_line=True,
+    )
 
     def _get_fr_in_ref_pf_data(df_subset: pd.DataFrame):
         if "fr_in_allpf_all" in df_subset.columns:
@@ -666,9 +675,9 @@ def plot_combined_cs_plus_minus_4panels(
         cs_paired = cs_fr[paired_mask]
         return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
 
-    # Panel 5: In-field firing rate using all-spike PF reference mask.
+    # Panel 7: In-field firing rate using all-spike PF reference mask.
     # Match Panel 1 layout/style: All/SS/CS for both CS+ and CS- PLC.
-    ax = axes[4]
+    ax = axes[6]
     fr_cs_all, fr_cs_ss, fr_cs_cs, fr_cs_ss_paired, fr_cs_cs_paired = _get_fr_in_ref_pf_data(df_cs_plc)
     fr_non_all, fr_non_ss, fr_non_cs, fr_non_ss_paired, fr_non_cs_paired = _get_fr_in_ref_pf_data(df_non_cs_plc)
 

@@ -412,6 +412,14 @@ class EgocentricSummaryPlotParams:
     hd_vel_corr_method: str = "normalized_dot"  # "normalized_dot" | "mean_raw_dot"
     col3_emp_arrow_length_scale: float = 1.0  # multiply empirical arrow length in column 3
     binpolar_render_style: str = "fan"  # "fan" | "line"
+    show_shuffle_null_column: bool = False
+    shuffle_null_n: int = 1000
+    shuffle_hist_bins: int = 28
+    shuffle_hist_color: str = "#9A9A9A"
+    shuffle_hist_alpha: float = 0.7
+    shuffle_emp_preferred_color: str = "#1F77B4"
+    shuffle_emp_nonpreferred_color: str = "#D62728"
+    shuffle_emp_linewidth: float = 1.2
     # Standard figure style controls (match pooled-summary defaults)
     font_family: str = "Arial"
     font_size: float = 6.0
@@ -2091,6 +2099,12 @@ def _collect_all_cells_stats(
             stats_row["ss_p_value"] = analysis.get("ss_p_value", np.nan)
             stats_row["cs_si"] = analysis.get("cs_si", np.nan)
             stats_row["cs_p_value"] = analysis.get("cs_p_value", np.nan)
+            stats_row["coherence_all"] = analysis.get("coherence_all", np.nan)
+            stats_row["coherence_ss"] = analysis.get("coherence_ss", np.nan)
+            stats_row["coherence_cs"] = analysis.get("coherence_cs", np.nan)
+            stats_row["sparsity_all"] = analysis.get("sparsity_all", np.nan)
+            stats_row["sparsity_ss"] = analysis.get("sparsity_ss", np.nan)
+            stats_row["sparsity_cs"] = analysis.get("sparsity_cs", np.nan)
             stats_row["theta_corr_all"] = analysis.get("theta_corr_all", np.nan)
             stats_row["theta_corr_ss"] = analysis.get("theta_corr_ss", np.nan)
             stats_row["theta_corr_cs"] = analysis.get("theta_corr_cs", np.nan)
@@ -2104,6 +2118,12 @@ def _collect_all_cells_stats(
             stats_row["ss_p_value"] = np.nan
             stats_row["cs_si"] = np.nan
             stats_row["cs_p_value"] = np.nan
+            stats_row["coherence_all"] = np.nan
+            stats_row["coherence_ss"] = np.nan
+            stats_row["coherence_cs"] = np.nan
+            stats_row["sparsity_all"] = np.nan
+            stats_row["sparsity_ss"] = np.nan
+            stats_row["sparsity_cs"] = np.nan
             stats_row["theta_corr_all"] = np.nan
             stats_row["theta_corr_ss"] = np.nan
             stats_row["theta_corr_cs"] = np.nan
@@ -2115,6 +2135,8 @@ def _collect_all_cells_stats(
             for prefix in ["", "_ss", "_cs"]:
                 for key in [
                     f"peak_rate{prefix}",
+                    f"coherence{prefix}",
+                    f"sparsity{prefix}",
                     f"si_bits_per_spike{prefix}",
                     f"n_place_fields{prefix}",
                     f"total_pf_size_cm2{prefix}",
@@ -2146,6 +2168,12 @@ def _collect_all_cells_stats(
         stats_row["peak_rate_all"] = peak_all_raw if np.isfinite(peak_all_raw) else 0.0
         stats_row["peak_rate_ss"] = analysis.get("ss_peak_rate", 0.0)
         stats_row["peak_rate_cs"] = analysis.get("cs_peak_rate", 0.0)
+        stats_row["coherence_all"] = analysis.get("coherence_all", np.nan)
+        stats_row["coherence_ss"] = analysis.get("coherence_ss", np.nan)
+        stats_row["coherence_cs"] = analysis.get("coherence_cs", np.nan)
+        stats_row["sparsity_all"] = analysis.get("sparsity_all", np.nan)
+        stats_row["sparsity_ss"] = analysis.get("sparsity_ss", np.nan)
+        stats_row["sparsity_cs"] = analysis.get("sparsity_cs", np.nan)
 
         for name, rmap_key in [("ss", "ss_rate_map"), ("cs", "cs_rate_map")]:
             rmap = analysis.get(rmap_key)
@@ -2304,6 +2332,12 @@ def _save_spatial_analysis_artifact(
             "si_bits_per_spike": analysis.get("si_bits_per_spike", np.nan),
             "si_bits_per_spike_ss": analysis.get("si_bits_per_spike_ss", np.nan),
             "si_bits_per_spike_cs": analysis.get("si_bits_per_spike_cs", np.nan),
+            "coherence_all": analysis.get("coherence_all", np.nan),
+            "coherence_ss": analysis.get("coherence_ss", np.nan),
+            "coherence_cs": analysis.get("coherence_cs", np.nan),
+            "sparsity_all": analysis.get("sparsity_all", np.nan),
+            "sparsity_ss": analysis.get("sparsity_ss", np.nan),
+            "sparsity_cs": analysis.get("sparsity_cs", np.nan),
             "x_traj": x_traj,
             "y_traj": y_traj,
             "spikes_x": analysis.get("spikes_x", np.array([])),
@@ -28624,6 +28658,11 @@ def _plot_egocentric_per_cell_summary_figure(
     )
     show_curve = bool(has_ref_any and bool(params.show_empirical_fit_curve))
     show_spatial_map = bool(has_ref_any and bool(params.show_spatial_map_with_fitted_arrows))
+    shuffle_payload_raw = data.get("shuffle_null_column_payload")
+    show_shuffle_column = bool(
+        bool(getattr(params, "show_shuffle_null_column", False))
+        and isinstance(shuffle_payload_raw, dict)
+    )
     n_main_panels = 1 + (1 if show_spatial_map else 0) + (1 if show_curve else 0)
     if n_main_panels <= 1:
         base_w = float(params.figsize_no_ref[0])
@@ -28631,7 +28670,8 @@ def _plot_egocentric_per_cell_summary_figure(
         base_w = float(params.figsize_with_ref[0]) + 2.0 * float(max(0, n_main_panels - 2))
     # Keep subplot sizing logic but add canvas room so increased spacing does not
     # squeeze panel contents.
-    figsize = (base_w + 4.2 + 1.5, float(params.figsize_with_ref[1]) * 3.1 + 1.0)
+    figsize_extra_w = 0.82 if show_shuffle_column else 0.0
+    figsize = (base_w + 4.2 + 1.5 + float(figsize_extra_w), float(params.figsize_with_ref[1]) * 3.1 + 1.0)
 
     fig = plt.figure(figsize=figsize, dpi=int(params.dpi), constrained_layout=False)
     # Columns 2-6 are intentionally narrower for a denser layout.
@@ -28645,9 +28685,12 @@ def _plot_egocentric_per_cell_summary_figure(
         width_ratios.append(widened_w_col)
     if show_curve:
         width_ratios.append(float(curve_w_col))
-    # preferred / non-preferred / mini-polar(emp-only, 2-column span) /
-    # mini-polar(emp-only no-fit/no-green, 2-column span)
-    width_ratios.extend([0.5, 0.5, 0.95, 0.95, 0.95, 0.95])
+    # preferred / non-preferred / optional shuffle-null histogram /
+    # mini-polar(emp-only, 2-column span) / mini-polar(emp-only no-fit/no-green, 2-column span)
+    width_ratios.extend([0.5, 0.5])
+    if show_shuffle_column:
+        width_ratios.append(0.42)
+    width_ratios.extend([0.95, 0.95, 0.95, 0.95])
     n_cols = len(width_ratios)
     gs = fig.add_gridspec(
         7,
@@ -28737,14 +28780,27 @@ def _plot_egocentric_per_cell_summary_figure(
         for _ax_col4 in [ax_curve_all, ax_curve_ss, ax_curve_cs, ax_curve_theta, ax_curve_slow, ax_curve]:
             _set_axis_size_inch(_ax_col4, float(col4_width_in), float(col4_height_in))
 
-    pref_col = n_cols - 6
-    nonpref_col = n_cols - 5
-    polar_emp_col0 = n_cols - 4
-    polar_emp_col1 = n_cols - 3
-    polar_emp2_col0 = n_cols - 2
-    polar_emp2_col1 = n_cols - 1
+    trailing_cols = 6 + (1 if show_shuffle_column else 0)
+    pref_col = n_cols - trailing_cols
+    nonpref_col = pref_col + 1
+    shuffle_col = nonpref_col + 1 if show_shuffle_column else None
+    polar_emp_col0 = (int(shuffle_col) + 1) if show_shuffle_column else (nonpref_col + 1)
+    polar_emp_col1 = polar_emp_col0 + 1
+    polar_emp2_col0 = polar_emp_col1 + 1
+    polar_emp2_col1 = polar_emp2_col0 + 1
     ax_pref_rows = [fig.add_subplot(gs[row, pref_col]) for row in range(1, 6)]
     ax_nonpref_rows = [fig.add_subplot(gs[row, nonpref_col]) for row in range(1, 6)]
+    ax_shuffle_rows: list[Any] = []
+    if show_shuffle_column and shuffle_col is not None:
+        ax_shuffle_rows = [fig.add_subplot(gs[row, int(shuffle_col)]) for row in range(1, 6)]
+        for _ax_shuf in ax_shuffle_rows:
+            try:
+                _p = _ax_shuf.get_position()
+                _new_h = float(_p.height) / 3.0
+                _new_y0 = float(_p.y0 + 0.5 * (_p.height - _new_h))
+                _ax_shuf.set_position([float(_p.x0), _new_y0, float(_p.width), _new_h])
+            except Exception:
+                pass
     ax_binpolar_emp_all = fig.add_subplot(gs[1:3, polar_emp_col0:polar_emp_col1 + 1])
     ax_binpolar_emp_ss = fig.add_subplot(gs[3:5, polar_emp_col0:polar_emp_col1 + 1])
     ax_binpolar_emp_cs = fig.add_subplot(gs[5:7, polar_emp_col0:polar_emp_col1 + 1])
@@ -28762,6 +28818,7 @@ def _plot_egocentric_per_cell_summary_figure(
         )  # curve panel(s)
         + (2 if show_curve else 0)  # extra empirical-only curve panels: theta / slow
         + 10  # preferred / non-preferred rows (5x2)
+        + (5 if show_shuffle_column else 0)  # optional shuffle-null histogram rows
         + 3  # empirical-only mini-polar rows (all/ss/cs)
         + 3  # empirical-only (no-fit/no-green) mini-polar rows (all/ss/cs)
     )
@@ -30421,6 +30478,74 @@ def _plot_egocentric_per_cell_summary_figure(
         split_occ_threshold_s = _coerce_float_or_nan(getattr(params, "occupancy_threshold_s", np.nan))
     if (not np.isfinite(split_occ_threshold_s)) or split_occ_threshold_s < 0:
         split_occ_threshold_s = 0.1
+    shuffle_rows_map: dict[str, dict[str, Any]] = {}
+    if isinstance(shuffle_payload_raw, dict):
+        rows_raw = shuffle_payload_raw.get("rows", [])
+        if isinstance(rows_raw, (list, tuple)):
+            for _r in rows_raw:
+                if not isinstance(_r, dict):
+                    continue
+                _metric = str(_r.get("metric", "")).strip().lower()
+                if _metric:
+                    shuffle_rows_map[_metric] = dict(_r)
+
+    def _plot_shuffle_hist_panel(
+        *,
+        ax: Any,
+        row_name: str,
+        metric_key: str,
+        show_title: bool,
+    ) -> None:
+        if ax is None:
+            return
+        payload = shuffle_rows_map.get(str(metric_key).strip().lower(), {})
+        shuf = np.asarray(payload.get("shuffle_preferred", np.array([])), dtype=float).reshape(-1)
+        shuf = shuf[np.isfinite(shuf)]
+        emp_pref = _coerce_float_or_nan(payload.get("empirical_preferred", np.nan))
+        emp_nonpref = _coerce_float_or_nan(payload.get("empirical_nonpreferred", np.nan))
+        if shuf.size > 0:
+            n_bins_hist = int(max(5, int(getattr(params, "shuffle_hist_bins", 28))))
+            ax.hist(
+                shuf,
+                bins=n_bins_hist,
+                color=str(getattr(params, "shuffle_hist_color", "#9A9A9A")),
+                alpha=float(getattr(params, "shuffle_hist_alpha", 0.7)),
+                edgecolor="none",
+                zorder=1,
+            )
+            lw_emp = float(max(0.2, float(getattr(params, "shuffle_emp_linewidth", 1.2))))
+            if np.isfinite(emp_pref):
+                ax.axvline(
+                    float(emp_pref),
+                    color=str(getattr(params, "shuffle_emp_preferred_color", "#1F77B4")),
+                    linewidth=lw_emp,
+                    zorder=3,
+                )
+            if np.isfinite(emp_nonpref):
+                ax.axvline(
+                    float(emp_nonpref),
+                    color=str(getattr(params, "shuffle_emp_nonpreferred_color", "#D62728")),
+                    linewidth=lw_emp,
+                    zorder=3,
+                )
+            if np.isfinite(emp_pref) or np.isfinite(emp_nonpref):
+                vals = [float(v) for v in [emp_pref, emp_nonpref] if np.isfinite(v)]
+                lo = float(np.nanmin(shuf))
+                hi = float(np.nanmax(shuf))
+                lo2 = float(min([lo] + vals))
+                hi2 = float(max([hi] + vals))
+                if np.isfinite(lo2) and np.isfinite(hi2) and hi2 > lo2:
+                    pad = 0.06 * (hi2 - lo2)
+                    ax.set_xlim(lo2 - pad, hi2 + pad)
+        else:
+            if (not np.isfinite(emp_pref)) and (not np.isfinite(emp_nonpref)):
+                ax.set_axis_off()
+                return
+        # Keep x-axis ticks/labels visible on every row.
+        ax.set_xlabel("Value", fontsize=7)
+        ax.set_ylabel("Count", fontsize=7)
+        ax.tick_params(labelsize=6, length=2.0)
+
     pref_occ_ref = np.array([], dtype=float)
     nonpref_occ_ref = np.array([], dtype=float)
     if len(split_rows) > 0 and isinstance(split_rows[0][2], dict):
@@ -30516,6 +30641,22 @@ def _plot_egocentric_per_cell_summary_figure(
                 cbar.set_label("Hz", fontsize=7)
             else:
                 cbar.set_label("spkh.", fontsize=7)
+        if show_shuffle_column and row_idx < len(ax_shuffle_rows):
+            metric_for_row = "all"
+            if row_name == "SS":
+                metric_for_row = "ss"
+            elif row_name == "CS":
+                metric_for_row = "cs"
+            elif row_name == "Theta":
+                metric_for_row = "theta"
+            elif row_name == "Slow Vm":
+                metric_for_row = "slow"
+            _plot_shuffle_hist_panel(
+                ax=ax_shuffle_rows[row_idx],
+                row_name=str(row_name),
+                metric_key=str(metric_for_row),
+                show_title=(row_idx == 0),
+            )
 
     # Columns 2-6: hide x/y axes; show 10 cm scale bar only on first-row panels.
     _axes_scale_bar: list[Any] = [ax_psi_all, ax_psi_ss, ax_psi_cs]
@@ -30677,6 +30818,7 @@ def _plot_egocentric_per_cell_summary_figure(
         "hd_vel_corr_n_all": int(hd_vel_corr_n_all),
         "hd_vel_corr_n_ss": int(hd_vel_corr_n_ss),
         "hd_vel_corr_n_cs": int(hd_vel_corr_n_cs),
+        "show_shuffle_null_column": bool(show_shuffle_column),
         "saved_paths": saved_paths,
     }
 

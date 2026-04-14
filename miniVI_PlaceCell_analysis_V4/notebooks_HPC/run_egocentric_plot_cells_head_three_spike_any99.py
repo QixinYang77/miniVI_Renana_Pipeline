@@ -22,6 +22,7 @@ Output:
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -1661,6 +1662,431 @@ def _compute_pf_split_stats_rows(
     return out_rows
 
 
+def _build_preferred_lookup_specs_for_stats(
+    *,
+    local_all,
+    local_ss,
+    local_cs,
+    arrow_all,
+    arrow_ss,
+    arrow_cs,
+    stats_pref_reference: str,
+    split_source: str,
+):
+    stats_pref_reference = _sanitize_stats_pref_reference(stats_pref_reference)
+    split_source = _sanitize_split_source(split_source)
+    emp_lookup_all = _compute_empirical_direction_lookup_all_bins(local_tuning=local_all if isinstance(local_all, dict) else {})
+    emp_lookup_ss = _compute_empirical_direction_lookup_all_bins(local_tuning=local_ss if isinstance(local_ss, dict) else {})
+    emp_lookup_cs = _compute_empirical_direction_lookup_all_bins(local_tuning=local_cs if isinstance(local_cs, dict) else {})
+
+    if stats_pref_reference == 'matching_metric':
+        ss_emp_lookup = emp_lookup_ss
+        cs_emp_lookup = emp_lookup_cs
+        ss_lookup = arrow_ss
+        cs_lookup = arrow_cs
+    else:
+        ss_emp_lookup = emp_lookup_all
+        cs_emp_lookup = emp_lookup_all
+        ss_lookup = arrow_all
+        cs_lookup = arrow_all
+
+    def _lookup_spec_from_empirical_or_fallback(emp_lookup: dict, fallback_lookup: dict) -> dict:
+        fb = fallback_lookup if isinstance(fallback_lookup, dict) else {}
+        valid_mask_col8 = np.asarray(fb.get('arrow_valid_mask', np.array([])), dtype=bool)
+
+        def _apply_col8_valid_mask(dir_map_in: np.ndarray) -> np.ndarray:
+            dir_map_out = np.asarray(dir_map_in, dtype=float).copy()
+            if (
+                str(split_source) == 'empirical'
+                and valid_mask_col8.ndim == 2
+                and dir_map_out.ndim == 2
+                and valid_mask_col8.shape == dir_map_out.shape
+            ):
+                dir_map_out[~valid_mask_col8] = np.nan
+            return np.asarray(dir_map_out, dtype=float)
+
+        x_emp = np.asarray(emp_lookup.get('x_edges', np.array([])), dtype=float) if isinstance(emp_lookup, dict) else np.array([], dtype=float)
+        y_emp = np.asarray(emp_lookup.get('y_edges', np.array([])), dtype=float) if isinstance(emp_lookup, dict) else np.array([], dtype=float)
+        d_emp = np.asarray(emp_lookup.get('dir_map', np.array([])), dtype=float) if isinstance(emp_lookup, dict) else np.array([], dtype=float)
+        if (
+            x_emp.size >= 2
+            and y_emp.size >= 2
+            and d_emp.shape == (int(x_emp.size - 1), int(y_emp.size - 1))
+        ):
+            return {
+                'x_edges': np.asarray(x_emp, dtype=float),
+                'y_edges': np.asarray(y_emp, dtype=float),
+                'dir_map': _apply_col8_valid_mask(np.asarray(d_emp, dtype=float)),
+            }
+        return {
+            'x_edges': np.asarray(fb.get('x_edges', np.array([])), dtype=float),
+            'y_edges': np.asarray(fb.get('y_edges', np.array([])), dtype=float),
+            'dir_map': _apply_col8_valid_mask(np.asarray(fb.get('psi_emp_map', np.array([])), dtype=float)),
+        }
+
+    return {
+        'all': _lookup_spec_from_empirical_or_fallback(emp_lookup_all, arrow_all),
+        'ss': _lookup_spec_from_empirical_or_fallback(ss_emp_lookup, ss_lookup),
+        'cs': _lookup_spec_from_empirical_or_fallback(cs_emp_lookup, cs_lookup),
+    }
+
+
+def _compute_shuffle_null_payload_for_plot(
+    *,
+    plot_data,
+    row_all,
+    row_ss,
+    row_cs,
+    params,
+    split_source: str,
+    stats_pref_reference: str,
+    n_shuffles: int,
+    rng_seed: int,
+):
+    out = {
+        'ok': False,
+        'reason': 'unknown',
+        'n_shuffles': int(max(1, int(n_shuffles))),
+        'rows': [],
+    }
+    if not isinstance(plot_data, dict):
+        out['reason'] = 'invalid_plot_data'
+        return out
+
+    local_all = plot_data.get('local_tuning_all')
+    local_ss = plot_data.get('local_tuning_ss')
+    local_cs = plot_data.get('local_tuning_cs')
+    fit_all = _resolve_plot_fit_params(local_tuning=local_all, summary_row=row_all if isinstance(row_all, dict) else {})
+    fit_ss = _resolve_plot_fit_params(local_tuning=local_ss, summary_row=row_ss if isinstance(row_ss, dict) else row_all)
+    fit_cs = _resolve_plot_fit_params(local_tuning=local_cs, summary_row=row_cs if isinstance(row_cs, dict) else row_all)
+    arrow_all = _compute_spatial_arrow_fields(local_tuning=local_all, fit_info=fit_all, params=params)
+    arrow_ss = _compute_spatial_arrow_fields(local_tuning=local_ss, fit_info=fit_ss, params=params)
+    arrow_cs = _compute_spatial_arrow_fields(local_tuning=local_cs, fit_info=fit_cs, params=params)
+
+    split_source = _sanitize_split_source(split_source)
+    preferred_lookup_specs = _build_preferred_lookup_specs_for_stats(
+        local_all=local_all,
+        local_ss=local_ss,
+        local_cs=local_cs,
+        arrow_all=arrow_all,
+        arrow_ss=arrow_ss,
+        arrow_cs=arrow_cs,
+        stats_pref_reference=stats_pref_reference,
+        split_source=split_source,
+    )
+
+    stats_data = dict(plot_data)
+    pcfg = dict(plot_data.get('placecell_map_params', {})) if isinstance(plot_data.get('placecell_map_params', {}), dict) else {}
+    # Match PF-split stats basis (unsmoothed maps for scalar summaries).
+    pcfg['smooth_sigma'] = 0.0
+    pcfg['occ_smooth_sigma'] = 0.0
+    stats_data['placecell_map_params'] = pcfg
+    stats_params = copy.deepcopy(params)
+    stats_params.pc_smooth_sigma = 0.0
+    stats_params.pc_occ_smooth_sigma = 0.0
+
+    split_maps = _compute_placecell_style_preferred_nonpreferred_maps(
+        data=stats_data,
+        fit_info=fit_all,
+        params=stats_params,
+        preferred_angle_source=split_source,
+        preferred_lookup_specs=preferred_lookup_specs,
+        preferred_half_width_deg=float(getattr(params, 'split_preferred_half_width_deg', 50.0)),
+        apply_min_occupancy_mask=True,
+    )
+    if not bool(split_maps.get('ok', False)):
+        out['reason'] = f"split_maps_failed({split_maps.get('reason', 'unknown')})"
+        return out
+
+    tx = np.asarray(split_maps.get('x_edges', np.array([])), dtype=float)
+    ty = np.asarray(split_maps.get('y_edges', np.array([])), dtype=float)
+    nx = int(max(tx.size - 1, 0))
+    ny = int(max(ty.size - 1, 0))
+    if nx <= 0 or ny <= 0:
+        out['reason'] = 'invalid_target_edges'
+        return out
+
+    split_masks_payload = _compute_split_frame_masks_for_target_grid(
+        data=stats_data,
+        fit_info=fit_all,
+        params=stats_params,
+        preferred_lookup_specs=preferred_lookup_specs,
+        split_source=split_source,
+        preferred_half_width_deg=float(getattr(params, 'split_preferred_half_width_deg', 50.0)),
+        target_x_edges=tx,
+        target_y_edges=ty,
+    )
+    if not bool(split_masks_payload.get('ok', False)):
+        out['reason'] = f"split_masks_failed({split_masks_payload.get('reason', 'unknown')})"
+        return out
+
+    x_arr = np.asarray(stats_data.get('x_frames', np.array([])), dtype=float).reshape(-1)
+    y_arr = np.asarray(stats_data.get('y_frames', np.array([])), dtype=float).reshape(-1)
+    dir_arr = _wrap_angle_to_pi_local(np.asarray(stats_data.get('dir_frames', np.array([])), dtype=float).reshape(-1))
+    theta_vals = np.asarray(stats_data.get('theta_amp_frames', np.array([])), dtype=float).reshape(-1)
+    slow_vals = np.asarray(stats_data.get('slow_vm_frames', np.array([])), dtype=float).reshape(-1)
+    raw_all = np.asarray(stats_data.get('raw_all_spike_frames', np.array([])), dtype=int).reshape(-1)
+    raw_ss = np.asarray(stats_data.get('raw_ss_spike_frames', np.array([])), dtype=int).reshape(-1)
+    raw_cs = np.asarray(stats_data.get('raw_cs_spike_frames', np.array([])), dtype=int).reshape(-1)
+    valid_frames = np.asarray(split_masks_payload.get('valid_frames', np.array([])), dtype=bool).reshape(-1)
+    moving_mask = np.asarray(split_masks_payload.get('moving_mask_frames', np.array([])), dtype=bool).reshape(-1)
+    n_frames = int(x_arr.size)
+    if (
+        n_frames <= 0
+        or any(arr.size != n_frames for arr in (y_arr, dir_arr, theta_vals, slow_vals, valid_frames, moving_mask))
+    ):
+        out['reason'] = 'length_mismatch'
+        return out
+
+    frame_rate = _safe_float(stats_data.get('frame_rate', np.nan), default=np.nan)
+    if (not np.isfinite(frame_rate)) or frame_rate <= 0:
+        out['reason'] = 'invalid_frame_rate'
+        return out
+    split_occ_thr = _safe_float(getattr(params, 'occupancy_threshold_split_s', np.nan), default=np.nan)
+    if (not np.isfinite(split_occ_thr)) or split_occ_thr < 0:
+        split_occ_thr = _safe_float(getattr(params, 'occupancy_threshold_s', np.nan), default=0.1)
+    if (not np.isfinite(split_occ_thr)) or split_occ_thr < 0:
+        split_occ_thr = 0.1
+
+    xi = _digitize_with_upper_edge_inclusive(x_arr, tx)
+    yi = _digitize_with_upper_edge_inclusive(y_arr, ty)
+    in_bounds = (
+        np.isfinite(x_arr) & np.isfinite(y_arr)
+        & (xi >= 0) & (yi >= 0)
+        & (xi < nx) & (yi < ny)
+    )
+    frame_bin_flat = np.full(n_frames, -1, dtype=int)
+    if np.any(in_bounds):
+        frame_bin_flat[in_bounds] = (xi[in_bounds].astype(int) * ny + yi[in_bounds].astype(int))
+    n_bins = int(nx * ny)
+
+    def _prepare_spike_frames(raw_frames: np.ndarray) -> np.ndarray:
+        spk = np.asarray(raw_frames, dtype=int).reshape(-1)
+        if spk.size <= 0:
+            return np.array([], dtype=int)
+        spk = spk[(spk >= 0) & (spk < n_frames)]
+        if spk.size <= 0:
+            return np.array([], dtype=int)
+        spk = np.unique(spk)
+        spk = spk[np.asarray(valid_frames[spk], dtype=bool)]
+        spk = spk[np.asarray(frame_bin_flat[spk] >= 0, dtype=bool)]
+        return np.asarray(spk, dtype=int)
+
+    spk_all = _prepare_spike_frames(raw_all)
+    spk_ss = _prepare_spike_frames(raw_ss)
+    spk_cs = _prepare_spike_frames(raw_cs)
+    pref_half_width_rad = float(np.deg2rad(float(getattr(params, 'split_preferred_half_width_deg', 50.0))))
+
+    fit_dir_tx, fit_has_ref = _compute_fit_reference_direction_map(fit_all, tx, ty)
+
+    def _resolve_lookup_spec(key: str):
+        fallback = (np.asarray(tx, dtype=float), np.asarray(ty, dtype=float), np.asarray(fit_dir_tx, dtype=float))
+        if split_source != 'empirical' or not isinstance(preferred_lookup_specs, dict):
+            return fallback
+        spec = preferred_lookup_specs.get(str(key), {})
+        if not isinstance(spec, dict):
+            return fallback
+        x_lookup = np.asarray(spec.get('x_edges', np.array([])), dtype=float)
+        y_lookup = np.asarray(spec.get('y_edges', np.array([])), dtype=float)
+        dir_lookup = np.asarray(spec.get('dir_map', np.array([])), dtype=float)
+        if x_lookup.size < 2 or y_lookup.size < 2:
+            return fallback
+        if dir_lookup.shape != (int(x_lookup.size - 1), int(y_lookup.size - 1)):
+            return fallback
+        return np.asarray(x_lookup, dtype=float), np.asarray(y_lookup, dtype=float), np.asarray(dir_lookup, dtype=float)
+
+    def _build_key_shuffle_info(key: str):
+        x_lookup, y_lookup, dir_lookup = _resolve_lookup_spec(key)
+        if (
+            split_source == 'fit'
+            and (not bool(fit_has_ref))
+            and np.all(~np.isfinite(np.asarray(dir_lookup, dtype=float)))
+        ):
+            return {
+                'idx': np.array([], dtype=int),
+                'dir': np.array([], dtype=float),
+                'lookup_flat': np.array([], dtype=int),
+                'ref_base': np.array([], dtype=float),
+                'n_lookup_bins': 0,
+            }
+        xi_lk = _digitize_with_upper_edge_inclusive(x_arr, x_lookup)
+        yi_lk = _digitize_with_upper_edge_inclusive(y_arr, y_lookup)
+        in_bounds_lk = (
+            (xi_lk >= 0) & (yi_lk >= 0)
+            & (xi_lk < int(x_lookup.size - 1))
+            & (yi_lk < int(y_lookup.size - 1))
+        )
+        eligible = (
+            np.asarray(valid_frames, dtype=bool)
+            & np.asarray(moving_mask, dtype=bool)
+            & np.isfinite(dir_arr)
+            & np.isfinite(x_arr)
+            & np.isfinite(y_arr)
+            & in_bounds_lk
+        )
+        idx = np.where(eligible)[0].astype(int)
+        if idx.size <= 0:
+            return {
+                'idx': np.array([], dtype=int),
+                'dir': np.array([], dtype=float),
+                'lookup_flat': np.array([], dtype=int),
+                'ref_base': np.array([], dtype=float),
+                'n_lookup_bins': int(max(0, (x_lookup.size - 1) * (y_lookup.size - 1))),
+            }
+        ii = xi_lk[idx].astype(int)
+        jj = yi_lk[idx].astype(int)
+        ref = np.asarray(dir_lookup, dtype=float)[ii, jj]
+        has_ref = np.isfinite(ref)
+        idx = idx[has_ref]
+        if idx.size <= 0:
+            return {
+                'idx': np.array([], dtype=int),
+                'dir': np.array([], dtype=float),
+                'lookup_flat': np.array([], dtype=int),
+                'ref_base': np.array([], dtype=float),
+                'n_lookup_bins': int(max(0, (x_lookup.size - 1) * (y_lookup.size - 1))),
+            }
+        ii = xi_lk[idx].astype(int)
+        jj = yi_lk[idx].astype(int)
+        lookup_flat = (ii * int(y_lookup.size - 1) + jj).astype(int)
+        ref = np.asarray(dir_lookup, dtype=float)[ii, jj]
+        return {
+            'idx': np.asarray(idx, dtype=int),
+            'dir': np.asarray(dir_arr[idx], dtype=float),
+            'lookup_flat': np.asarray(lookup_flat, dtype=int),
+            'ref_base': np.asarray(ref, dtype=float),
+            'n_lookup_bins': int(max(0, (x_lookup.size - 1) * (y_lookup.size - 1))),
+        }
+
+    key_info = {
+        'all': _build_key_shuffle_info('all'),
+        'ss': _build_key_shuffle_info('ss'),
+        'cs': _build_key_shuffle_info('cs'),
+    }
+
+    def _mask_from_key_info(info: dict, *, random_delta: bool, rng: np.random.Generator | None = None) -> np.ndarray:
+        m = np.zeros(n_frames, dtype=bool)
+        idx = np.asarray(info.get('idx', np.array([])), dtype=int)
+        if idx.size <= 0:
+            return m
+        dirs = np.asarray(info.get('dir', np.array([])), dtype=float)
+        ref_base = np.asarray(info.get('ref_base', np.array([])), dtype=float)
+        lookup_flat = np.asarray(info.get('lookup_flat', np.array([])), dtype=int)
+        if random_delta:
+            n_lk = int(max(0, int(info.get('n_lookup_bins', 0))))
+            if n_lk <= 0 or rng is None:
+                return m
+            delta = rng.uniform(-np.pi, np.pi, size=n_lk)
+            ref = _wrap_angle_to_pi_local(ref_base + delta[lookup_flat])
+        else:
+            ref = np.asarray(ref_base, dtype=float)
+        delta_ang = _wrap_angle_to_pi_local(dirs - ref)
+        is_pref = np.abs(delta_ang) <= (pref_half_width_rad + 1e-12)
+        if np.any(is_pref):
+            m[idx[is_pref]] = True
+        return m
+
+    def _metric_pref_mean(metric_name: str, pref_mask: np.ndarray) -> tuple[float, int]:
+        mask = np.asarray(pref_mask, dtype=bool).reshape(-1)
+        if mask.size != n_frames:
+            return np.nan, 0
+        usable_frames = mask & np.asarray(valid_frames, dtype=bool) & (frame_bin_flat >= 0)
+        if not np.any(usable_frames):
+            return np.nan, 0
+        pref_occ = np.bincount(
+            frame_bin_flat[usable_frames].astype(int),
+            minlength=n_bins,
+        ).astype(float) / float(frame_rate)
+        occ_ok = np.isfinite(pref_occ) & (pref_occ >= float(split_occ_thr))
+        if str(metric_name) in {'all', 'ss', 'cs'}:
+            spk = spk_all if str(metric_name) == 'all' else (spk_ss if str(metric_name) == 'ss' else spk_cs)
+            if spk.size > 0:
+                spk_use = spk[np.asarray(mask[spk], dtype=bool)]
+            else:
+                spk_use = np.array([], dtype=int)
+            spk_counts = np.zeros(n_bins, dtype=float)
+            if spk_use.size > 0:
+                spk_bins = frame_bin_flat[spk_use]
+                spk_bins = spk_bins[spk_bins >= 0]
+                if spk_bins.size > 0:
+                    spk_counts = np.bincount(spk_bins.astype(int), minlength=n_bins).astype(float)
+            rate = np.full(n_bins, np.nan, dtype=float)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                rate[occ_ok] = spk_counts[occ_ok] / pref_occ[occ_ok]
+            keep = np.isfinite(rate)
+            if np.sum(keep) <= 0:
+                return np.nan, 0
+            return float(np.nanmean(rate[keep])), int(np.sum(keep))
+        vals = theta_vals if str(metric_name) == 'theta' else slow_vals
+        finite_vals = usable_frames & np.isfinite(vals)
+        if not np.any(finite_vals):
+            return np.nan, 0
+        cnt = np.bincount(frame_bin_flat[finite_vals].astype(int), minlength=n_bins).astype(float)
+        sums = np.bincount(frame_bin_flat[finite_vals].astype(int), weights=np.asarray(vals[finite_vals], dtype=float), minlength=n_bins).astype(float)
+        mean_map = np.full(n_bins, np.nan, dtype=float)
+        has_cnt = cnt > 0
+        with np.errstate(invalid='ignore', divide='ignore'):
+            mean_map[has_cnt] = sums[has_cnt] / cnt[has_cnt]
+        mean_map[~occ_ok] = np.nan
+        keep = np.isfinite(mean_map)
+        if np.sum(keep) <= 0:
+            return np.nan, 0
+        return float(np.nanmean(mean_map[keep])), int(np.sum(keep))
+
+    emp_masks = split_masks_payload.get('masks', {}) if isinstance(split_masks_payload.get('masks', {}), dict) else {}
+    emp_pref_all = np.asarray((emp_masks.get('all', {}) or {}).get('preferred', np.zeros(n_frames, dtype=bool)), dtype=bool)
+    emp_nonpref_all = np.asarray((emp_masks.get('all', {}) or {}).get('nonpreferred', np.zeros(n_frames, dtype=bool)), dtype=bool)
+    emp_pref_ss = np.asarray((emp_masks.get('ss', {}) or {}).get('preferred', np.zeros(n_frames, dtype=bool)), dtype=bool)
+    emp_nonpref_ss = np.asarray((emp_masks.get('ss', {}) or {}).get('nonpreferred', np.zeros(n_frames, dtype=bool)), dtype=bool)
+    emp_pref_cs = np.asarray((emp_masks.get('cs', {}) or {}).get('preferred', np.zeros(n_frames, dtype=bool)), dtype=bool)
+    emp_nonpref_cs = np.asarray((emp_masks.get('cs', {}) or {}).get('nonpreferred', np.zeros(n_frames, dtype=bool)), dtype=bool)
+
+    row_defs = [
+        ('all', 'All', 'all', emp_pref_all, emp_nonpref_all),
+        ('ss', 'SS', 'ss', emp_pref_ss, emp_nonpref_ss),
+        ('cs', 'CS', 'cs', emp_pref_cs, emp_nonpref_cs),
+        ('theta', 'Theta', 'all', emp_pref_all, emp_nonpref_all),
+        ('slow', 'Slow Vm', 'all', emp_pref_all, emp_nonpref_all),
+    ]
+
+    n_shuf = int(max(1, int(n_shuffles)))
+    rng = np.random.default_rng(int(max(0, int(rng_seed))))
+    shuffle_pref = {k: np.full(n_shuf, np.nan, dtype=float) for k, *_ in row_defs}
+
+    key_pref_masks_per_shuffle = {'all': None, 'ss': None, 'cs': None}
+    for s_idx in range(n_shuf):
+        for key in ('all', 'ss', 'cs'):
+            key_pref_masks_per_shuffle[key] = _mask_from_key_info(key_info[key], random_delta=True, rng=rng)
+        for metric_key, _label, key_for_shuffle, _emp_pref_mask, _emp_nonpref_mask in row_defs:
+            mean_pref, _ = _metric_pref_mean(metric_key, key_pref_masks_per_shuffle[str(key_for_shuffle)])
+            shuffle_pref[metric_key][s_idx] = float(mean_pref) if np.isfinite(mean_pref) else np.nan
+
+    rows_payload = []
+    for metric_key, label, _key_for_shuffle, emp_pref_mask, emp_nonpref_mask in row_defs:
+        emp_pref_mean, emp_pref_n = _metric_pref_mean(metric_key, emp_pref_mask)
+        emp_nonpref_mean, emp_nonpref_n = _metric_pref_mean(metric_key, emp_nonpref_mask)
+        rows_payload.append(
+            {
+                'metric': str(metric_key),
+                'label': str(label),
+                'shuffle_preferred': np.asarray(shuffle_pref[metric_key], dtype=float),
+                'empirical_preferred': float(emp_pref_mean) if np.isfinite(emp_pref_mean) else np.nan,
+                'empirical_nonpreferred': float(emp_nonpref_mean) if np.isfinite(emp_nonpref_mean) else np.nan,
+                'empirical_preferred_n_bins': int(emp_pref_n),
+                'empirical_nonpreferred_n_bins': int(emp_nonpref_n),
+            }
+        )
+
+    out['ok'] = True
+    out['reason'] = 'ok'
+    out['n_shuffles'] = int(n_shuf)
+    out['split_source'] = str(split_source)
+    out['stats_pref_reference'] = str(stats_pref_reference)
+    out['preferred_half_width_deg'] = float(getattr(params, 'split_preferred_half_width_deg', 50.0))
+    out['rows'] = rows_payload
+    return out
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description='Generate per-cell summaries for union(pass_<threshold> across 3 head spike types)'
@@ -1770,7 +2196,7 @@ def main(argv=None):
         type=str,
         default='fan',
         choices=['fan', 'line', 'curve'],
-        help='Render style for columns 7/8 mini-polar panels: fan or line (curve alias for line).',
+        help='Render style for right-side mini-polar panels: fan or line (curve alias for line).',
     )
     parser.add_argument(
         '--any-pass-threshold',
@@ -1869,6 +2295,8 @@ def main(argv=None):
         hd_vel_corr_method=str(args.hd_vel_corr_method),
         col3_emp_arrow_length_scale=float(col3_emp_arrow_length_scale),
         binpolar_render_style=str(binpolar_render_style),
+        show_shuffle_null_column=True,
+        shuffle_null_n=1000,
         save_formats=tuple(args.save_formats),
         clear_output=False,
     )
@@ -2110,6 +2538,34 @@ def main(argv=None):
                 row_primary['pass_95'] = bool(pass95_any)
                 row_primary['pass_99'] = bool(pass99_any)
                 row_primary['pass_100'] = bool(pass100_any)
+                if bool(pass_thr_any) and bool(getattr(params, 'show_shuffle_null_column', False)):
+                    try:
+                        seed_src = f"{animal_id}|{int(cell_idx)}|{int(any_pass_threshold)}|shuffle_null"
+                        seed_bytes = hashlib.sha256(seed_src.encode("utf-8")).digest()
+                        shuffle_seed = int.from_bytes(seed_bytes[:8], byteorder="little", signed=False) % (2**31 - 1)
+                        if shuffle_seed <= 0:
+                            shuffle_seed = 1
+                        shuffle_payload = _compute_shuffle_null_payload_for_plot(
+                            plot_data=plot_data,
+                            row_all=row_all,
+                            row_ss=row_ss,
+                            row_cs=row_cs,
+                            params=params,
+                            split_source=str(args.split_preferred_angle_source),
+                            stats_pref_reference=str(stats_pref_reference),
+                            n_shuffles=int(max(1, int(getattr(params, 'shuffle_null_n', 1000)))),
+                            rng_seed=int(shuffle_seed),
+                        )
+                        plot_data['shuffle_null_column_payload'] = dict(shuffle_payload)
+                    except Exception as exc_shuffle:
+                        plot_data['shuffle_null_column_payload'] = {
+                            'ok': False,
+                            'reason': f'shuffle_payload_failed({type(exc_shuffle).__name__}: {exc_shuffle})',
+                            'rows': [],
+                            'n_shuffles': int(max(1, int(getattr(params, 'shuffle_null_n', 1000)))),
+                        }
+                else:
+                    plot_data.pop('shuffle_null_column_payload', None)
 
                 cat_dir = per_cell_root / plot_group / category
                 cat_dir.mkdir(parents=True, exist_ok=True)

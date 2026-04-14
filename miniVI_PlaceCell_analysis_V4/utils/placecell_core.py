@@ -2398,6 +2398,12 @@ def analyze_place_cell_single_moving(
     si_bits_per_spike = calculate_spatial_information_bits_per_spike(smooth_map, occ_map)
     si_bits_per_spike_ss = calculate_spatial_information_bits_per_spike(ss_rate_map, occ_map) if ss_rate_map is not None else np.nan
     si_bits_per_spike_cs = calculate_spatial_information_bits_per_spike(cs_rate_map, occ_map) if cs_rate_map is not None else np.nan
+    coherence_all = calculate_rate_map_coherence(smooth_map)
+    coherence_ss = calculate_rate_map_coherence(ss_rate_map) if ss_rate_map is not None else np.nan
+    coherence_cs = calculate_rate_map_coherence(cs_rate_map) if cs_rate_map is not None else np.nan
+    sparsity_all = calculate_rate_map_sparsity(smooth_map, occ_map)
+    sparsity_ss = calculate_rate_map_sparsity(ss_rate_map, occ_map) if ss_rate_map is not None else np.nan
+    sparsity_cs = calculate_rate_map_sparsity(cs_rate_map, occ_map) if cs_rate_map is not None else np.nan
 
     # Calculate theta/slow maps and correlations if traces are provided
     theta_map = None
@@ -2853,6 +2859,12 @@ def analyze_place_cell_single_moving(
         "si_bits_per_spike": si_bits_per_spike,
         "si_bits_per_spike_ss": si_bits_per_spike_ss,
         "si_bits_per_spike_cs": si_bits_per_spike_cs,
+        "coherence_all": coherence_all,
+        "coherence_ss": coherence_ss,
+        "coherence_cs": coherence_cs,
+        "sparsity_all": sparsity_all,
+        "sparsity_ss": sparsity_ss,
+        "sparsity_cs": sparsity_cs,
         "theta_corr_all": theta_corr_all,
         "theta_corr_ss": theta_corr_ss,
         "theta_corr_cs": theta_corr_cs,
@@ -15421,8 +15433,12 @@ def _compute_moving_epochs(
     speed_threshold=2,
     min_duration_s=0.5,
     merge_gap_s=1.0,
+    speed_max = 60
 ):
     speed = np.asarray(speed, dtype=float)
+    speed[speed>speed_max] = np.nan
+    # interpolate missing speed
+    speed = interpolate_nan_segment(speed)
     if filter_type == "median":
         if kernel_size % 2 == 0:
             kernel_size += 1
@@ -15525,6 +15541,79 @@ def calculate_spatial_information_bits_per_spike(firing_rate_map, occupancy_map)
     valid_info = info_per_bin[np.isfinite(info_per_bin)]
     
     return np.sum(valid_info) if valid_info.size > 0 else np.nan
+
+
+def calculate_rate_map_coherence(rate_map):
+    """Compute Fisher-z-transformed spatial coherence from a 2D rate map."""
+    rate_map = np.asarray(rate_map, dtype=float)
+    if rate_map.ndim != 2 or rate_map.size == 0:
+        return np.nan
+
+    center_vals = []
+    neighbor_means = []
+    n_rows, n_cols = rate_map.shape
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            center = rate_map[row, col]
+            if not np.isfinite(center):
+                continue
+
+            row_start = max(0, row - 1)
+            row_end = min(n_rows, row + 2)
+            col_start = max(0, col - 1)
+            col_end = min(n_cols, col + 2)
+            window = np.asarray(rate_map[row_start:row_end, col_start:col_end], dtype=float)
+            neighbor_mask = np.ones(window.shape, dtype=bool)
+            neighbor_mask[row - row_start, col - col_start] = False
+            neighbor_vals = window[neighbor_mask & np.isfinite(window)]
+            if neighbor_vals.size == 0:
+                continue
+
+            center_vals.append(float(center))
+            neighbor_means.append(float(np.mean(neighbor_vals)))
+
+    if len(center_vals) < 3:
+        return np.nan
+
+    center_arr = np.asarray(center_vals, dtype=float)
+    neighbor_arr = np.asarray(neighbor_means, dtype=float)
+    if np.std(center_arr) == 0 or np.std(neighbor_arr) == 0:
+        return np.nan
+
+    corr = np.corrcoef(center_arr, neighbor_arr)[0, 1]
+    if not np.isfinite(corr):
+        return np.nan
+
+    eps = 1e-6
+    corr = float(np.clip(corr, -1.0 + eps, 1.0 - eps))
+    return float(np.arctanh(corr))
+
+
+def calculate_rate_map_sparsity(rate_map, occupancy_map):
+    """Compute occupancy-corrected sparsity from a 2D rate map."""
+    rate_map = np.asarray(rate_map, dtype=float)
+    occupancy_map = np.asarray(occupancy_map, dtype=float)
+    if rate_map.shape != occupancy_map.shape or rate_map.ndim != 2 or rate_map.size == 0:
+        return np.nan
+
+    valid_mask = np.isfinite(rate_map) & np.isfinite(occupancy_map) & (occupancy_map > 0)
+    if not np.any(valid_mask):
+        return np.nan
+
+    rates = rate_map[valid_mask]
+    occupancy = occupancy_map[valid_mask]
+    occupancy_sum = float(np.sum(occupancy))
+    if occupancy_sum <= 0:
+        return np.nan
+
+    occ_prob = occupancy / occupancy_sum
+    weighted_mean = float(np.sum(occ_prob * rates))
+    denom = float(np.sum(occ_prob * (rates ** 2)))
+    if denom <= 0 or not np.isfinite(denom):
+        return np.nan
+
+    return float((weighted_mean ** 2) / denom)
 
 
 def get_place_field_sizes_cm(place_field_mask, bin_size_cm):

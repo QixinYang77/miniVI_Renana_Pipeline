@@ -242,6 +242,63 @@ def _metric_vals_first_available(df: pd.DataFrame, metrics: list[str], side: str
     return np.array([], dtype=float)
 
 
+def _compute_direction_selectivity(pref_vals: np.ndarray, nonpref_vals: np.ndarray) -> np.ndarray:
+    pref_vals = np.asarray(pref_vals, dtype=float)
+    nonpref_vals = np.asarray(nonpref_vals, dtype=float)
+    den = pref_vals + nonpref_vals
+    out = np.full(pref_vals.shape, np.nan, dtype=float)
+    ok = np.isfinite(pref_vals) & np.isfinite(nonpref_vals) & np.isfinite(den) & (np.abs(den) > 1e-9)
+    if np.any(ok):
+        out[ok] = (pref_vals[ok] - nonpref_vals[ok]) / den[ok]
+    return out
+
+
+def _metric_ds_frame(
+    df: pd.DataFrame,
+    metric_name: str,
+    id_cols: list[str],
+    *,
+    slow_use_abs: bool = True,
+) -> pd.DataFrame:
+    sub, pref, nonpref = _metric_pairs(df, metric_name, id_cols)
+    # Keep existing direction-selectivity behavior for slow Vm where requested.
+    if bool(slow_use_abs) and str(metric_name).strip().lower() == "slow":
+        pref = np.abs(np.asarray(pref, dtype=float))
+        nonpref = np.abs(np.asarray(nonpref, dtype=float))
+    ds = _compute_direction_selectivity(pref, nonpref)
+    out = sub[id_cols].copy()
+    out["ds"] = ds
+    out = out.loc[np.isfinite(out["ds"].to_numpy(dtype=float))].copy()
+    return out
+
+
+def _metric_ds_vals(
+    df: pd.DataFrame,
+    metric_name: str,
+    id_cols: list[str],
+    *,
+    slow_use_abs: bool = True,
+) -> np.ndarray:
+    ds_df = _metric_ds_frame(df, metric_name, id_cols, slow_use_abs=slow_use_abs)
+    vals = pd.to_numeric(ds_df["ds"], errors="coerce").to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+    return np.asarray(vals, dtype=float)
+
+
+def _metric_ds_vals_first_available(
+    df: pd.DataFrame,
+    metrics: list[str],
+    id_cols: list[str],
+    *,
+    slow_use_abs: bool = True,
+) -> np.ndarray:
+    for metric in list(metrics):
+        vals = _metric_ds_vals(df, str(metric), id_cols, slow_use_abs=slow_use_abs)
+        if int(vals.size) > 0:
+            return vals
+    return np.array([], dtype=float)
+
+
 def _build_merged_4groups(region_df: pd.DataFrame, metric_ss: str, metric_cs: str, id_cols: list[str]) -> pd.DataFrame:
     ss_sub = region_df.loc[
         region_df["metric"].astype(str) == str(metric_ss),
@@ -365,7 +422,7 @@ def _plot_region_row(
     ax.set_ylabel("Rate, SS/CS (Hz)", fontsize=float(style["axes_labelsize"]))
     _finalize_axis(ax, style)
 
-    for panel_idx, metric, ylabel in [(2, "theta", r"$\theta$ amp. (spkh.)"), (3, "slow", "Slow Vm (spkh.)"), (7, "occupancy_time", "Occupancy (s)"), (8, "speed", "Speed (cm/s)")]:
+    for panel_idx, metric, ylabel in [(2, "theta", r"$\theta$ amp. (spkh.)"), (3, "slow", "Slow Vm (spkh.)"), (8, "occupancy_time", "Occupancy (s)"), (9, "speed", "Speed (cm/s)")]:
         ax = axes_row[panel_idx]
         _, pref, nonpref = _metric_pairs(region_df, metric, id_cols)
         valid = np.isfinite(pref) & np.isfinite(nonpref)
@@ -385,6 +442,7 @@ def _plot_region_row(
 
     ax = axes_row[4]
     if str(mrl_panel_mode).strip().lower() == "ss_only":
+        all_vals = _metric_vals_first_available(region_df, ["all_mrl_overall", "ss_mrl_overall"], "pref", id_cols)
         ss_mrl_df = (
             region_df.loc[region_df["metric"].astype(str) == "ss_mrl_overall", id_cols + ["preferred_mean"]]
             .copy()
@@ -393,15 +451,24 @@ def _plot_region_row(
         )
         ss_vals = ss_mrl_df["ss_mrl"].to_numpy(dtype=float) if "ss_mrl" in ss_mrl_df.columns else np.array([], dtype=float)
         ss_vals = ss_vals[np.isfinite(ss_vals)]
+        if int(all_vals.size) <= 0 and int(ss_vals.size) > 0:
+            all_vals = np.asarray(ss_vals, dtype=float)
         n_ss = int(ss_vals.size)
-        _draw_boxplot(ax, [ss_vals], [0], ["#026C80"])
+        _draw_boxplot(ax, [all_vals, ss_vals], [0, 1], ["#7A7A7A", "#026C80"])
+        n_all = int(all_vals.size)
+        if n_all > 0:
+            jitter = np.linspace(-0.08, 0.08, n_all) if n_all > 1 else np.array([0.0], dtype=float)
+            ax.scatter(0.0 + jitter, all_vals, s=10, c="#7A7A7A", edgecolors="none", alpha=0.95, zorder=3)
         if n_ss > 0:
             jitter = np.linspace(-0.08, 0.08, n_ss) if n_ss > 1 else np.array([0.0], dtype=float)
-            ax.scatter(jitter, ss_vals, s=10, c="#026C80", edgecolors="none", alpha=0.95, zorder=3)
-        panel_vals[(row_region, "ss_cs_mrl")] = np.asarray(ss_vals, dtype=float)
-        _maybe_title(ax, f"SS MRL (n={n_ss})")
-        ax.set_xticks([0]); ax.set_xticklabels(["SS"], fontsize=float(style["tick_labelsize"]))
+            ax.scatter(1.0 + jitter, ss_vals, s=10, c="#026C80", edgecolors="none", alpha=0.95, zorder=3)
+        panel_vals[(row_region, "ss_cs_mrl")] = (
+            np.concatenate([all_vals, ss_vals]) if (n_all + n_ss) > 0 else np.array([], dtype=float)
+        )
+        _maybe_title(ax, f"All vs SS MRL (n={n_ss})")
+        ax.set_xticks([0, 1]); ax.set_xticklabels(["All", "SS"], fontsize=float(style["tick_labelsize"]))
     else:
+        all_vals = _metric_vals_first_available(region_df, ["all_mrl_overall", "ss_mrl_overall"], "pref", id_cols)
         ss_mrl_df = region_df.loc[region_df["metric"].astype(str) == "ss_mrl_overall", id_cols + ["preferred_mean"]].copy().drop_duplicates(subset=id_cols).rename(columns={"preferred_mean": "ss_mrl"})
         cs_mrl_df = region_df.loc[region_df["metric"].astype(str) == "cs_mrl_overall", id_cols + ["preferred_mean"]].copy().drop_duplicates(subset=id_cols).rename(columns={"preferred_mean": "cs_mrl"})
         merged_mrl = ss_mrl_df.merge(cs_mrl_df, on=id_cols, how="inner")
@@ -410,19 +477,84 @@ def _plot_region_row(
         valid = np.isfinite(ss_vals) & np.isfinite(cs_vals)
         ss_vals = ss_vals[valid]; cs_vals = cs_vals[valid]
         n_merge_mrl = int(ss_vals.size)
-        _draw_boxplot(ax, [ss_vals, cs_vals], [0, 1], ["#026C80", "#EE9B00"])
-        _overlay_pair_lines_points(ax, ss_vals, cs_vals, 0.0, 1.0, "#026C80", "#EE9B00")
-        panel_vals[(row_region, "ss_cs_mrl")] = np.concatenate([ss_vals, cs_vals]) if n_merge_mrl > 0 else np.array([], dtype=float)
+        _draw_boxplot(ax, [all_vals, ss_vals, cs_vals], [0, 1, 2], ["#7A7A7A", "#026C80", "#EE9B00"])
+        if int(all_vals.size) > 0:
+            jitter = np.linspace(-0.08, 0.08, int(all_vals.size)) if int(all_vals.size) > 1 else np.array([0.0], dtype=float)
+            ax.scatter(0.0 + jitter, all_vals, s=10, c="#7A7A7A", edgecolors="none", alpha=0.95, zorder=3)
+        _overlay_pair_lines_points(ax, ss_vals, cs_vals, 1.0, 2.0, "#026C80", "#EE9B00")
+        panel_vals[(row_region, "ss_cs_mrl")] = (
+            np.concatenate([all_vals, ss_vals, cs_vals]) if (int(all_vals.size) + int(n_merge_mrl) * 2) > 0 else np.array([], dtype=float)
+        )
         p, stat, test_name, n_pair, shapiro_p = _paired_test_auto(ss_vals, cs_vals)
-        tests.append({"region": row_region, "panel": "ss_cs_mrl", "comparison": "ss_mrl_overall_vs_cs_mrl_overall", "n": int(n_pair), "p_raw": p, "statistic": stat, "test": test_name, "shapiro_p": shapiro_p, "x1": 0.0, "x2": 1.0, "level": 0})
-        _maybe_title(ax, f"SS vs CS MRL (n={n_merge_mrl})")
-        ax.set_xticks([0, 1]); ax.set_xticklabels(["SS", "CS"], fontsize=float(style["tick_labelsize"]))
+        tests.append({"region": row_region, "panel": "ss_cs_mrl", "comparison": "ss_mrl_overall_vs_cs_mrl_overall", "n": int(n_pair), "p_raw": p, "statistic": stat, "test": test_name, "shapiro_p": shapiro_p, "x1": 1.0, "x2": 2.0, "level": 0})
+        _maybe_title(ax, f"All/SS/CS MRL (n={n_merge_mrl})")
+        ax.set_xticks([0, 1, 2]); ax.set_xticklabels(["All", "SS", "CS"], fontsize=float(style["tick_labelsize"]))
     ax.set_ylabel("MRL", fontsize=float(style["axes_labelsize"]))
     _finalize_axis(ax, style)
 
+    ax = axes_row[5]
+    if str(mrl_panel_mode).strip().lower() == "ss_only":
+        all_ds = _metric_ds_vals_first_available(region_df, ["all", "ss"], id_cols, slow_use_abs=True)
+        ss_ds = _metric_ds_vals(region_df, "ss", id_cols, slow_use_abs=True)
+        if int(all_ds.size) <= 0 and int(ss_ds.size) > 0:
+            all_ds = np.asarray(ss_ds, dtype=float)
+        n_ss_ds = int(ss_ds.size)
+        _draw_boxplot(ax, [all_ds, ss_ds], [0, 1], ["#7A7A7A", "#026C80"])
+        n_all_ds = int(all_ds.size)
+        if n_all_ds > 0:
+            jitter = np.linspace(-0.08, 0.08, n_all_ds) if n_all_ds > 1 else np.array([0.0], dtype=float)
+            ax.scatter(0.0 + jitter, all_ds, s=10, c="#7A7A7A", edgecolors="none", alpha=0.95, zorder=3)
+        if n_ss_ds > 0:
+            jitter = np.linspace(-0.08, 0.08, n_ss_ds) if n_ss_ds > 1 else np.array([0.0], dtype=float)
+            ax.scatter(1.0 + jitter, ss_ds, s=10, c="#026C80", edgecolors="none", alpha=0.95, zorder=3)
+        panel_vals[(row_region, "ss_cs_ds")] = (
+            np.concatenate([all_ds, ss_ds]) if (n_all_ds + n_ss_ds) > 0 else np.array([], dtype=float)
+        )
+        _maybe_title(ax, f"All vs SS DS (n={n_ss_ds})")
+        ax.set_xticks([0, 1]); ax.set_xticklabels(["All", "SS"], fontsize=float(style["tick_labelsize"]))
+    else:
+        all_ds = _metric_ds_vals_first_available(region_df, ["all", "ss"], id_cols, slow_use_abs=True)
+        ss_ds_df = _metric_ds_frame(region_df, "ss", id_cols, slow_use_abs=True).rename(columns={"ds": "ss_ds"})
+        cs_ds_df = _metric_ds_frame(region_df, "cs", id_cols, slow_use_abs=True).rename(columns={"ds": "cs_ds"})
+        merged_ds = ss_ds_df.merge(cs_ds_df, on=id_cols, how="inner")
+        ss_ds = pd.to_numeric(merged_ds["ss_ds"], errors="coerce").to_numpy(dtype=float)
+        cs_ds = pd.to_numeric(merged_ds["cs_ds"], errors="coerce").to_numpy(dtype=float)
+        valid_ds = np.isfinite(ss_ds) & np.isfinite(cs_ds)
+        ss_ds = ss_ds[valid_ds]
+        cs_ds = cs_ds[valid_ds]
+        n_merge_ds = int(ss_ds.size)
+        _draw_boxplot(ax, [all_ds, ss_ds, cs_ds], [0, 1, 2], ["#7A7A7A", "#026C80", "#EE9B00"])
+        if int(all_ds.size) > 0:
+            jitter = np.linspace(-0.08, 0.08, int(all_ds.size)) if int(all_ds.size) > 1 else np.array([0.0], dtype=float)
+            ax.scatter(0.0 + jitter, all_ds, s=10, c="#7A7A7A", edgecolors="none", alpha=0.95, zorder=3)
+        _overlay_pair_lines_points(ax, ss_ds, cs_ds, 1.0, 2.0, "#026C80", "#EE9B00")
+        panel_vals[(row_region, "ss_cs_ds")] = (
+            np.concatenate([all_ds, ss_ds, cs_ds]) if (int(all_ds.size) + int(n_merge_ds) * 2) > 0 else np.array([], dtype=float)
+        )
+        p, stat, test_name, n_pair, shapiro_p = _paired_test_auto(ss_ds, cs_ds)
+        tests.append(
+            {
+                "region": row_region,
+                "panel": "ss_cs_ds",
+                "comparison": "ss_ds_vs_cs_ds",
+                "n": int(n_pair),
+                "p_raw": p,
+                "statistic": stat,
+                "test": test_name,
+                "shapiro_p": shapiro_p,
+                "x1": 1.0,
+                "x2": 2.0,
+                "level": 0,
+            }
+        )
+        _maybe_title(ax, f"SS vs CS DS (n={n_merge_ds})")
+        ax.set_xticks([0, 1, 2]); ax.set_xticklabels(["All", "SS", "CS"], fontsize=float(style["tick_labelsize"]))
+    ax.set_ylabel("DS", fontsize=float(style["axes_labelsize"]))
+    _finalize_axis(ax, style)
+
     for panel_idx, metric_name, panel_key, panel_title in [
-        (5, "theta_mrl_overall", "theta_mrl", "Theta MRL"),
-        (6, "slow_mrl_overall", "slow_mrl", "Slow Vm MRL"),
+        (6, "theta_mrl_overall", "theta_mrl", "Theta MRL"),
+        (7, "slow_mrl_overall", "slow_mrl", "Slow Vm MRL"),
     ]:
         ax = axes_row[panel_idx]
         vals = _metric_vals(region_df, metric_name, "pref", id_cols)
@@ -452,8 +584,8 @@ def _plot_region_row(
         ax.set_ylabel("MRL", fontsize=float(style["axes_labelsize"]))
         _finalize_axis(ax, style)
 
-    # Panel 8: HDP-HD corr (no stats requested)
-    ax = axes_row[9]
+    # Panel 10: HDP-HD corr (no stats requested)
+    ax = axes_row[10]
     corr_sub = region_df.loc[region_df["metric"].astype(str) == "hd_pref_neural_vs_behavior", id_cols + ["preferred_mean"]].copy()
     corr_sub = corr_sub.drop_duplicates(subset=id_cols).sort_values(id_cols).reset_index(drop=True)
     corr_vals = pd.to_numeric(corr_sub["preferred_mean"], errors="coerce").to_numpy(dtype=float)
@@ -475,9 +607,9 @@ def _plot_region_row(
     _finalize_axis(ax, style)
 
     for panel_idx, metric_name, panel_key, panel_title, xlab in [
-        (10, "eb_empfit_corr_all", "eb_empfit_corr_all", "EB emp-fit corr (All)", "All bins"),
-        (11, "eb_empfit_corr_ss", "eb_empfit_corr_ss", "EB emp-fit corr (SS)", "SS bins"),
-        (12, "eb_empfit_corr_cs", "eb_empfit_corr_cs", "EB emp-fit corr (CS)", "CS bins"),
+        (11, "eb_empfit_corr_all", "eb_empfit_corr_all", "EB emp-fit corr (All)", "All bins"),
+        (12, "eb_empfit_corr_ss", "eb_empfit_corr_ss", "EB emp-fit corr (SS)", "SS bins"),
+        (13, "eb_empfit_corr_cs", "eb_empfit_corr_cs", "EB emp-fit corr (CS)", "CS bins"),
     ]:
         ax = axes_row[panel_idx]
         vals = _metric_vals(region_df, metric_name, "pref", id_cols)
@@ -999,28 +1131,6 @@ def plot_pf_split_direction_selectivity_csplus_vs_csminus_first4(
     style_opts: dict[str, Any] | None = None,
     show: bool = True,
 ) -> dict[str, Any]:
-    def _compute_ds(pref_vals: np.ndarray, nonpref_vals: np.ndarray) -> np.ndarray:
-        pref_vals = np.asarray(pref_vals, dtype=float)
-        nonpref_vals = np.asarray(nonpref_vals, dtype=float)
-        den = pref_vals + nonpref_vals
-        out = np.full(pref_vals.shape, np.nan, dtype=float)
-        ok = np.isfinite(pref_vals) & np.isfinite(nonpref_vals) & np.isfinite(den) & (np.abs(den) > 1e-9)
-        if np.any(ok):
-            out[ok] = (pref_vals[ok] - nonpref_vals[ok]) / den[ok]
-        return out
-
-    def _metric_ds_frame(df: pd.DataFrame, metric_name: str, id_cols: list[str]) -> pd.DataFrame:
-        sub, pref, nonpref = _metric_pairs(df, metric_name, id_cols)
-        # For slow Vm DS, use magnitude as requested.
-        if str(metric_name).strip().lower() == "slow":
-            pref = np.abs(np.asarray(pref, dtype=float))
-            nonpref = np.abs(np.asarray(nonpref, dtype=float))
-        ds = _compute_ds(pref, nonpref)
-        out = sub[id_cols].copy()
-        out["ds"] = ds
-        out = out.loc[np.isfinite(out["ds"].to_numpy(dtype=float))].copy()
-        return out
-
     csplus_group_norm = str(csplus_group).strip().lower()
     if csplus_group_norm in {"both", "all_and_eb_tuned", "eb_tuned_and_all"}:
         out: dict[str, Any] = {"results": {}}
@@ -1653,10 +1763,10 @@ def plot_pf_split_group_figures(
             continue
 
         n_rows = len(present_rows)
-        width_ratios = [1, 2, 1, 1, 1, 1, 1, 1, 1, 0.5, 0.5, 0.5, 0.5]
+        width_ratios = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 0.5, 0.5, 0.5]
         fig_w = float(sum(width_ratios))
         fig_h = float(1.2 * n_rows)
-        fig, axes = plt.subplots(n_rows, 13, figsize=(fig_w, fig_h), dpi=180, constrained_layout=True, gridspec_kw={"width_ratios": width_ratios})
+        fig, axes = plt.subplots(n_rows, 14, figsize=(fig_w, fig_h), dpi=180, constrained_layout=True, gridspec_kw={"width_ratios": width_ratios})
         axes = np.asarray(axes, dtype=object)
         if axes.ndim == 1:
             axes = axes.reshape(1, -1)
@@ -1694,6 +1804,7 @@ def plot_pf_split_group_figures(
                 "theta",
                 "slow",
                 "ss_cs_mrl",
+                "ss_cs_ds",
                 "theta_mrl",
                 "slow_mrl",
                 "occupancy",
