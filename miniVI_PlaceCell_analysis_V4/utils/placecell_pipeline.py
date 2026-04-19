@@ -6543,6 +6543,7 @@ def generate_distance_defined_trial_by_trial_plc_plots(
                         plateaus_dicts=plateaus_dicts,
                         slow_trace_gap=trace_slow_gap,
                         theta_slow_pad_factor=theta_slow_pad_factor,
+                        trace_ymax_from_simple_spikes=(str(category_name) == "CSminus"),
                         sharey=bool(sharey),
                         place_field_contours=trajectory_contours,
                         center_position_label=f"Closest to PF{pf_rank}",
@@ -7777,6 +7778,7 @@ def generate_distance_defined_trials_and_dataset(
                         plateaus_dicts=plateaus_for_plot,
                         slow_trace_gap=float(trace_slow_gap),
                         theta_slow_pad_factor=float(theta_slow_pad_factor),
+                        trace_ymax_from_simple_spikes=(str(cat) == "CSminus"),
                         sharey=bool(sharey),
                         place_field_contours=trajectory_contours,
                         center_position_label=f"Closest to PF{pf_rank}",
@@ -8161,19 +8163,72 @@ def _estimate_single_heatmap_figure_height(
     trial_height: float,
     avg_height: float,
     merge_ss_cs: bool,
+    fixed_heatmap_height: float | None = None,
     direction_keys: tuple[str, str, str] = ("all", "cw", "ccw"),
 ) -> float:
-    max_trials_all = _compute_single_heatmap_max_trials(
-        entry_data,
-        time_rel,
-        direction_keys=direction_keys,
-    )
     n_rows = 4 if bool(merge_ss_cs) else 5
-    heatmap_h = max_trials_all * float(trial_height)
+    if fixed_heatmap_height is not None and np.isfinite(float(fixed_heatmap_height)) and float(fixed_heatmap_height) > 0:
+        heatmap_h = float(fixed_heatmap_height)
+    else:
+        max_trials_all = _compute_single_heatmap_max_trials(
+            entry_data,
+            time_rel,
+            direction_keys=direction_keys,
+        )
+        heatmap_h = max_trials_all * float(trial_height)
     row_spacing = 0.05
     title_space = 0.3
     xlabel_space = 0.3
     return n_rows * (heatmap_h + float(avg_height)) + (n_rows - 1) * row_spacing + title_space + xlabel_space
+
+
+def _compute_pf_centered_panel_layout_inches(
+    *,
+    n_rows: int,
+    heatmap_height: float,
+    avg_height: float,
+    subplot_width: float,
+    show_row_ylabel: bool,
+    show_column_titles: bool,
+    show_colorbar: bool,
+    heatmap_wspace: float,
+) -> dict[str, float]:
+    left_margin = 0.38 if bool(show_row_ylabel) else 0.12
+    right_margin = 0.05
+    top_margin = 0.22 if bool(show_column_titles) else 0.08
+    bottom_margin = 0.24
+    heat_avg_gap = 0.06
+    row_gap = 0.10
+    col_gap = max(0.05, float(heatmap_wspace) * float(subplot_width))
+    cbar_gap = 0.08 if bool(show_colorbar) else 0.0
+    cbar_width = 0.032 if bool(show_colorbar) else 0.0
+    panel_width = (
+        left_margin
+        + 3.0 * float(subplot_width)
+        + 2.0 * col_gap
+        + cbar_gap
+        + cbar_width
+        + right_margin
+    )
+    panel_height = (
+        top_margin
+        + float(n_rows) * (float(heatmap_height) + heat_avg_gap + float(avg_height))
+        + float(max(0, int(n_rows) - 1)) * row_gap
+        + bottom_margin
+    )
+    return {
+        "panel_width": float(panel_width),
+        "panel_height": float(panel_height),
+        "left_margin": float(left_margin),
+        "right_margin": float(right_margin),
+        "top_margin": float(top_margin),
+        "bottom_margin": float(bottom_margin),
+        "heat_avg_gap": float(heat_avg_gap),
+        "row_gap": float(row_gap),
+        "col_gap": float(col_gap),
+        "cbar_gap": float(cbar_gap),
+        "cbar_width": float(cbar_width),
+    }
 
 
 def _compute_single_cell_fr_vmaxs(
@@ -8295,6 +8350,8 @@ def _plot_single_cell_heatmap_on_figure(
     colorbar_vmax_override: dict[str, float] | None = None,
     avg_ylim_override: dict[int, tuple[float, float]] | None = None,
     fixed_heatmap_height: float | None = None,
+    fixed_subplot_width: float | None = None,
+    panel_bbox: tuple[float, float, float, float] | None = None,
     show_row_ylabel: bool = True,
     show_colorbar: bool = True,
     show_avg_yticks_left_only: bool = True,
@@ -8444,6 +8501,14 @@ def _plot_single_cell_heatmap_on_figure(
     else:
         heatmap_h = max(col_trials) * float(trial_height)
     hr = [heatmap_h, float(avg_height)]
+    exact_layout = (
+        panel_bbox is not None
+        and fixed_subplot_width is not None
+        and np.isfinite(float(fixed_subplot_width))
+        and float(fixed_subplot_width) > 0
+        and np.isfinite(float(heatmap_h))
+        and float(heatmap_h) > 0
+    )
 
     outer_gs = GridSpec(
         n_rows,
@@ -8456,6 +8521,7 @@ def _plot_single_cell_heatmap_on_figure(
     axes = np.empty((n_rows, 3), dtype=object)
     avg_axes = np.empty((n_rows, 3), dtype=object)
     cbar_gs_top = [None] * n_rows
+    fixed_cbar_positions: dict[int, tuple[float, float, float, float]] = {}
 
     for row in range(n_rows):
         for col in range(3):
@@ -8468,6 +8534,58 @@ def _plot_single_cell_heatmap_on_figure(
         inner_cb = GridSpecFromSubplotSpec(2, 1, subplot_spec=outer_gs[row, 3], height_ratios=hr, hspace=0.05)
         cbar_gs_top[row] = inner_cb[0]
         fig.add_subplot(inner_cb[1]).axis("off")
+
+    if exact_layout:
+        fig_w, fig_h = fig.get_size_inches()
+        panel_x, panel_y, panel_w, panel_h = [float(v) for v in panel_bbox]
+        layout_in = _compute_pf_centered_panel_layout_inches(
+            n_rows=n_rows,
+            heatmap_height=float(heatmap_h),
+            avg_height=float(avg_height),
+            subplot_width=float(fixed_subplot_width),
+            show_row_ylabel=bool(show_row_ylabel),
+            show_column_titles=bool(show_column_titles),
+            show_colorbar=bool(show_colorbar),
+            heatmap_wspace=float(heatmap_wspace),
+        )
+        panel_x_in = panel_x * float(fig_w)
+        panel_y_in = panel_y * float(fig_h)
+        left_in = panel_x_in + float(layout_in["left_margin"])
+        top_in = panel_y_in + panel_h * float(fig_h) - float(layout_in["top_margin"])
+        subplot_width_in = float(fixed_subplot_width)
+        heatmap_height_in = float(heatmap_h)
+        avg_height_in = float(avg_height)
+        heat_avg_gap_in = float(layout_in["heat_avg_gap"])
+        row_gap_in = float(layout_in["row_gap"])
+        col_gap_in = float(layout_in["col_gap"])
+        cbar_x_in = left_in + 3.0 * subplot_width_in + 2.0 * col_gap_in + float(layout_in["cbar_gap"])
+        cbar_w_in = float(layout_in["cbar_width"])
+
+        for row in range(n_rows):
+            row_top_in = top_in - row * (heatmap_height_in + heat_avg_gap_in + avg_height_in + row_gap_in)
+            heat_y0_in = row_top_in - heatmap_height_in
+            avg_y0_in = heat_y0_in - heat_avg_gap_in - avg_height_in
+            for col in range(3):
+                x0_in = left_in + col * (subplot_width_in + col_gap_in)
+                axes[row, col].set_position([
+                    x0_in / float(fig_w),
+                    heat_y0_in / float(fig_h),
+                    subplot_width_in / float(fig_w),
+                    heatmap_height_in / float(fig_h),
+                ])
+                avg_axes[row, col].set_position([
+                    x0_in / float(fig_w),
+                    avg_y0_in / float(fig_h),
+                    subplot_width_in / float(fig_w),
+                    avg_height_in / float(fig_h),
+                ])
+            if bool(show_colorbar):
+                fixed_cbar_positions[row] = (
+                    cbar_x_in / float(fig_w),
+                    heat_y0_in / float(fig_h),
+                    cbar_w_in / float(fig_w),
+                    heatmap_height_in / float(fig_h),
+                )
 
     row_images = [None] * n_rows
     ss_rgb = np.array([2, 108, 128]) / 255.0
@@ -8695,14 +8813,23 @@ def _plot_single_cell_heatmap_on_figure(
             cb_cs = fig.colorbar(sm_cs, cax=ax_cs_cb)
             cb_cs.ax.tick_params(labelsize=int(ss_cs_cbar_tick_labelsize))
             cb_cs.set_label("CS", fontsize=4, rotation=0, labelpad=8)
+            if exact_layout and row in fixed_cbar_positions:
+                x0, y0, w0, h0 = fixed_cbar_positions[row]
+                cb_gap_in = 0.06
+                cb_gap = cb_gap_in / float(fig_h)
+                cb_half_h = max(0.0, (h0 - cb_gap) / 2.0)
+                ax_ss_cb.set_position([x0, y0 + cb_half_h + cb_gap, w0, cb_half_h])
+                ax_cs_cb.set_position([x0, y0, w0, cb_half_h])
         elif row_images[row] is not None:
             ax_cb = fig.add_subplot(cbar_gs_top[row])
             cbar = fig.colorbar(row_images[row], cax=ax_cb)
             cbar.ax.tick_params(labelsize=4)
+            if exact_layout and row in fixed_cbar_positions:
+                ax_cb.set_position(list(fixed_cbar_positions[row]))
         else:
             fig.add_subplot(cbar_gs_top[row]).axis("off")
 
-    if apply_tight_layout:
+    if apply_tight_layout and (not exact_layout):
         try:
             tight_fn = getattr(fig, "tight_layout", None)
             if callable(tight_fn):
@@ -8745,6 +8872,10 @@ def plot_pf_centered_single_cell_heatmap(
     show_heatmap_yticks_all_columns: bool = False,
     ss_cs_cbar_tick_labelsize: int = 3,
     heatmap_wspace: float = 0.15,
+    avg_theta_ylim: tuple[float, float] | None = None,
+    avg_slow_ylim: tuple[float, float] | None = None,
+    fixed_heatmap_height: float | None = None,
+    fixed_subplot_width: float | None = None,
     direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
     direction_titles: tuple[str, str, str] | list[str] | None = None,
 ) -> plt.Figure:
@@ -8752,14 +8883,40 @@ def plot_pf_centered_single_cell_heatmap(
         direction_keys=direction_keys,
         direction_titles=direction_titles,
     )
-    fig_height = _estimate_single_heatmap_figure_height(
-        entry_data,
-        np.asarray(time_rel, dtype=float),
-        trial_height=trial_height,
-        avg_height=avg_height,
-        merge_ss_cs=merge_ss_cs,
-        direction_keys=dir_keys,
+    show_column_titles_use = bool(show_titles) if show_column_titles is None else bool(show_column_titles)
+    exact_layout = (
+        fixed_subplot_width is not None
+        and np.isfinite(float(fixed_subplot_width))
+        and float(fixed_subplot_width) > 0
+        and fixed_heatmap_height is not None
+        and np.isfinite(float(fixed_heatmap_height))
+        and float(fixed_heatmap_height) > 0
     )
+    if exact_layout:
+        n_rows = 4 if bool(merge_ss_cs) else 5
+        panel_layout = _compute_pf_centered_panel_layout_inches(
+            n_rows=n_rows,
+            heatmap_height=float(fixed_heatmap_height),
+            avg_height=float(avg_height),
+            subplot_width=float(fixed_subplot_width),
+            show_row_ylabel=True,
+            show_column_titles=show_column_titles_use,
+            show_colorbar=True,
+            heatmap_wspace=float(heatmap_wspace),
+        )
+        fig_height = float(panel_layout["panel_height"])
+        fig = plt.figure(figsize=(float(panel_layout["panel_width"]), fig_height))
+    else:
+        fig_height = _estimate_single_heatmap_figure_height(
+            entry_data,
+            np.asarray(time_rel, dtype=float),
+            trial_height=trial_height,
+            avg_height=avg_height,
+            merge_ss_cs=merge_ss_cs,
+            fixed_heatmap_height=fixed_heatmap_height,
+            direction_keys=dir_keys,
+        )
+        fig = plt.figure(figsize=(fig_width, fig_height))
     colorbar_vmax_use = dict(colorbar_vmax_override) if isinstance(colorbar_vmax_override, dict) else None
     if colorbar_vmax_use is None and bool(auto_colorbar_vmax_from_pf1_all):
         colorbar_vmax_use = _compute_cell_colorbar_vmax_from_all_direction(
@@ -8768,7 +8925,13 @@ def plot_pf_centered_single_cell_heatmap(
             smooth_window=int(smooth_window),
             std_multiplier=float(colorbar_std_multiplier),
         )
-    fig = plt.figure(figsize=(fig_width, fig_height))
+    avg_ylim_override: dict[int, tuple[float, float]] = {}
+    theta_row = 2 if bool(merge_ss_cs) else 3
+    slow_row = 3 if bool(merge_ss_cs) else 4
+    if avg_theta_ylim is not None:
+        avg_ylim_override[int(theta_row)] = (float(avg_theta_ylim[0]), float(avg_theta_ylim[1]))
+    if avg_slow_ylim is not None:
+        avg_ylim_override[int(slow_row)] = (float(avg_slow_ylim[0]), float(avg_slow_ylim[1]))
     _plot_single_cell_heatmap_on_figure(
         fig,
         entry_data,
@@ -8789,14 +8952,18 @@ def plot_pf_centered_single_cell_heatmap(
         center_line_x=center_line_x,
         show_session_gap_line=show_session_gap_line,
         colorbar_vmax_override=colorbar_vmax_use,
-        show_column_titles=(bool(show_titles) if show_column_titles is None else bool(show_column_titles)),
+        avg_ylim_override=(avg_ylim_override if len(avg_ylim_override) > 0 else None),
+        fixed_heatmap_height=fixed_heatmap_height,
+        fixed_subplot_width=fixed_subplot_width,
+        panel_bbox=((0.0, 0.0, 1.0, 1.0) if exact_layout else None),
+        show_column_titles=show_column_titles_use,
         column_title_include_trials=bool(column_title_include_trials),
         x_label_col_idx=x_label_col_idx,
         show_heatmap_yticks=bool(show_heatmap_yticks),
         show_heatmap_yticks_all_columns=bool(show_heatmap_yticks_all_columns),
         ss_cs_cbar_tick_labelsize=int(ss_cs_cbar_tick_labelsize),
         heatmap_wspace=float(heatmap_wspace),
-        apply_tight_layout=True,
+        apply_tight_layout=(not exact_layout),
         direction_keys=dir_keys,
         direction_titles=dir_titles,
     )
@@ -8844,6 +9011,10 @@ def plot_pf_centered_dual_component_heatmap(
     show_heatmap_yticks_all_columns: bool = False,
     ss_cs_cbar_tick_labelsize: int = 3,
     heatmap_wspace: float = 0.15,
+    avg_theta_ylim: tuple[float, float] | None = None,
+    avg_slow_ylim: tuple[float, float] | None = None,
+    fixed_heatmap_height: float | None = None,
+    fixed_subplot_width: float | None = None,
     direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
     direction_titles: tuple[str, str, str] | list[str] | None = None,
 ) -> plt.Figure:
@@ -8884,6 +9055,10 @@ def plot_pf_centered_dual_component_heatmap(
             show_heatmap_yticks_all_columns=show_heatmap_yticks_all_columns,
             ss_cs_cbar_tick_labelsize=ss_cs_cbar_tick_labelsize,
             heatmap_wspace=heatmap_wspace,
+            avg_theta_ylim=avg_theta_ylim,
+            avg_slow_ylim=avg_slow_ylim,
+            fixed_heatmap_height=fixed_heatmap_height,
+            fixed_subplot_width=fixed_subplot_width,
             direction_keys=dir_keys,
             direction_titles=dir_titles,
         )
@@ -8905,39 +9080,94 @@ def plot_pf_centered_dual_component_heatmap(
             smooth_window=int(smooth_window),
             std_multiplier=float(colorbar_std_multiplier),
         )
-    max_trials_primary = _compute_single_heatmap_max_trials(
-        entry_primary,
-        time_rel,
-        direction_keys=dir_keys,
+    fixed_avg_ylim_override: dict[int, tuple[float, float]] = {}
+    theta_row = 2 if bool(merge_ss_cs) else 3
+    slow_row = 3 if bool(merge_ss_cs) else 4
+    if avg_theta_ylim is not None:
+        fixed_avg_ylim_override[int(theta_row)] = (float(avg_theta_ylim[0]), float(avg_theta_ylim[1]))
+    if avg_slow_ylim is not None:
+        fixed_avg_ylim_override[int(slow_row)] = (float(avg_slow_ylim[0]), float(avg_slow_ylim[1]))
+    fixed_heatmap_height_use = fixed_heatmap_height
+    if fixed_heatmap_height_use is None:
+        max_trials_primary = _compute_single_heatmap_max_trials(
+            entry_primary,
+            time_rel,
+            direction_keys=dir_keys,
+        )
+        max_trials_secondary = _compute_single_heatmap_max_trials(
+            entry_secondary,
+            time_rel,
+            direction_keys=dir_keys,
+        )
+        fixed_heatmap_height_use = max(max_trials_primary, max_trials_secondary) * float(trial_height)
+    show_column_titles_use = bool(show_titles) if show_column_titles is None else bool(show_column_titles)
+    exact_layout = (
+        fixed_subplot_width is not None
+        and np.isfinite(float(fixed_subplot_width))
+        and float(fixed_subplot_width) > 0
+        and fixed_heatmap_height_use is not None
+        and np.isfinite(float(fixed_heatmap_height_use))
+        and float(fixed_heatmap_height_use) > 0
     )
-    max_trials_secondary = _compute_single_heatmap_max_trials(
-        entry_secondary,
-        time_rel,
-        direction_keys=dir_keys,
-    )
-    fixed_heatmap_height = max(max_trials_primary, max_trials_secondary) * float(trial_height)
-    h1 = _estimate_single_heatmap_figure_height(
-        entry_primary,
-        time_rel,
-        trial_height=trial_height,
-        avg_height=avg_height,
-        merge_ss_cs=merge_ss_cs,
-        direction_keys=dir_keys,
-    )
-    h2 = _estimate_single_heatmap_figure_height(
-        entry_secondary,
-        time_rel,
-        trial_height=trial_height,
-        avg_height=avg_height,
-        merge_ss_cs=merge_ss_cs,
-        direction_keys=dir_keys,
-    )
-    fig = plt.figure(figsize=(fig_width * 2 + 0.45, max(h1, h2)))
-    subfigs = fig.subfigures(1, 2, wspace=0.04)
-    subfigs = list(np.ravel(subfigs))
+
+    if exact_layout:
+        n_rows = 4 if bool(merge_ss_cs) else 5
+        left_layout = _compute_pf_centered_panel_layout_inches(
+            n_rows=n_rows,
+            heatmap_height=float(fixed_heatmap_height_use),
+            avg_height=float(avg_height),
+            subplot_width=float(fixed_subplot_width),
+            show_row_ylabel=True,
+            show_column_titles=show_column_titles_use,
+            show_colorbar=False,
+            heatmap_wspace=float(heatmap_wspace),
+        )
+        right_layout = _compute_pf_centered_panel_layout_inches(
+            n_rows=n_rows,
+            heatmap_height=float(fixed_heatmap_height_use),
+            avg_height=float(avg_height),
+            subplot_width=float(fixed_subplot_width),
+            show_row_ylabel=False,
+            show_column_titles=show_column_titles_use,
+            show_colorbar=True,
+            heatmap_wspace=float(heatmap_wspace),
+        )
+        panel_gap = 0.18
+        fig_w = float(left_layout["panel_width"]) + float(panel_gap) + float(right_layout["panel_width"])
+        fig_h = max(float(left_layout["panel_height"]), float(right_layout["panel_height"]))
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        left_bbox = (0.0, 0.0, float(left_layout["panel_width"]) / fig_w, 1.0)
+        right_bbox = (
+            (float(left_layout["panel_width"]) + float(panel_gap)) / fig_w,
+            0.0,
+            float(right_layout["panel_width"]) / fig_w,
+            1.0,
+        )
+    else:
+        h1 = _estimate_single_heatmap_figure_height(
+            entry_primary,
+            time_rel,
+            trial_height=trial_height,
+            avg_height=avg_height,
+            merge_ss_cs=merge_ss_cs,
+            fixed_heatmap_height=fixed_heatmap_height_use,
+            direction_keys=dir_keys,
+        )
+        h2 = _estimate_single_heatmap_figure_height(
+            entry_secondary,
+            time_rel,
+            trial_height=trial_height,
+            avg_height=avg_height,
+            merge_ss_cs=merge_ss_cs,
+            fixed_heatmap_height=fixed_heatmap_height_use,
+            direction_keys=dir_keys,
+        )
+        fig = plt.figure(figsize=(fig_width * 2 + 0.45, max(h1, h2)))
+        subfigs = fig.subfigures(1, 2, wspace=0.04)
+        subfigs = list(np.ravel(subfigs))
 
     pf1_avg_ylim = _plot_single_cell_heatmap_on_figure(
-        subfigs[0],
+        (fig if exact_layout else subfigs[0]),
         entry_primary,
         time_rel,
         smooth_window=smooth_window,
@@ -8957,23 +9187,26 @@ def plot_pf_centered_dual_component_heatmap(
         show_session_gap_line=show_session_gap_line,
         fr_vmax_override=fr_vmax_use,
         colorbar_vmax_override=colorbar_vmax_use,
-        fixed_heatmap_height=fixed_heatmap_height,
+        avg_ylim_override=(fixed_avg_ylim_override if len(fixed_avg_ylim_override) > 0 else None),
+        fixed_heatmap_height=fixed_heatmap_height_use,
+        fixed_subplot_width=fixed_subplot_width,
+        panel_bbox=(left_bbox if exact_layout else None),
         show_row_ylabel=True,
         show_colorbar=False,
         show_avg_yticks_left_only=True,
-        show_column_titles=(bool(show_titles) if show_column_titles is None else bool(show_column_titles)),
+        show_column_titles=show_column_titles_use,
         column_title_include_trials=bool(column_title_include_trials),
         x_label_col_idx=x_label_col_idx,
         show_heatmap_yticks=bool(show_heatmap_yticks),
         show_heatmap_yticks_all_columns=bool(show_heatmap_yticks_all_columns),
         ss_cs_cbar_tick_labelsize=int(ss_cs_cbar_tick_labelsize),
         heatmap_wspace=float(heatmap_wspace),
-        apply_tight_layout=True,
+        apply_tight_layout=(not exact_layout),
         direction_keys=dir_keys,
         direction_titles=dir_titles,
     )
     _plot_single_cell_heatmap_on_figure(
-        subfigs[1],
+        (fig if exact_layout else subfigs[1]),
         entry_secondary,
         time_rel,
         smooth_window=smooth_window,
@@ -8994,18 +9227,20 @@ def plot_pf_centered_dual_component_heatmap(
         fr_vmax_override=fr_vmax_use,
         colorbar_vmax_override=colorbar_vmax_use,
         avg_ylim_override=pf1_avg_ylim,
-        fixed_heatmap_height=fixed_heatmap_height,
+        fixed_heatmap_height=fixed_heatmap_height_use,
+        fixed_subplot_width=fixed_subplot_width,
+        panel_bbox=(right_bbox if exact_layout else None),
         show_row_ylabel=False,
         show_colorbar=True,
         show_avg_yticks_left_only=True,
-        show_column_titles=(bool(show_titles) if show_column_titles is None else bool(show_column_titles)),
+        show_column_titles=show_column_titles_use,
         column_title_include_trials=bool(column_title_include_trials),
         x_label_col_idx=x_label_col_idx,
         show_heatmap_yticks=bool(show_heatmap_yticks),
         show_heatmap_yticks_all_columns=bool(show_heatmap_yticks_all_columns),
         ss_cs_cbar_tick_labelsize=int(ss_cs_cbar_tick_labelsize),
         heatmap_wspace=float(heatmap_wspace),
-        apply_tight_layout=True,
+        apply_tight_layout=(not exact_layout),
         direction_keys=dir_keys,
         direction_titles=dir_titles,
     )
@@ -12088,14 +12323,18 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
     fr_vmax_scale: float = 0.6,
     theta_vlim: tuple[float, float] = (0, 0.5),
     slow_vlim: tuple[float, float] = (-0.4, 0.4),
-    fig_width: float = 3.8,
+    fig_width: float = 3.0,
     trial_height: float = 0.02,
     xlim: tuple[float, float] | None = None,
     merge_ss_cs: bool = True,
     merge_plateau: bool = True,
     smooth_plateau: bool = False,
     plateau_vlim: float = 0.01,
+    avg_height: float = 0.25,
+    subplot_width: float = 0.55,
     avg_smooth_window: float | None = None,
+    avg_theta_ylim: tuple[float, float] | None = (0.0, 0.2),
+    avg_slow_ylim: tuple[float, float] | None = (-0.1, 0.1),
     align_all_peak_to_zero: bool = True,
     peak_align_window: tuple[float, float] = (-5.0, 5.0),
     max_peak_adjust_cm: float | None = None,
@@ -12284,6 +12523,7 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
                 merge_plateau=merge_plateau,
                 smooth_plateau=smooth_plateau,
                 plateau_vlim=plateau_vlim,
+                avg_height=avg_height,
                 avg_smooth_window=avg_smooth_window_bins,
                 x_label="Distance from PF peak (cm)",
                 center_line_x=0.0,
@@ -12298,6 +12538,10 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
                 show_heatmap_yticks_all_columns=False,
                 ss_cs_cbar_tick_labelsize=4,
                 heatmap_wspace=0.20,
+                avg_theta_ylim=avg_theta_ylim,
+                avg_slow_ylim=avg_slow_ylim,
+                fixed_heatmap_height=0.5,
+                fixed_subplot_width=float(subplot_width),
             )
             n_saved += 1
             if entry1 is not None and entry2 is not None:
@@ -13632,6 +13876,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
     average_export_stage: str = "post",
     avg_mode: str = "combined",
     enforce_min_traversals_on_saved_exports: bool = False,
+    show_sem_shading: bool = True,
     direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
     direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
     explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
@@ -13875,6 +14120,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
         align_all_peak_to_zero=False,
         peak_align_window=pf1_window,
         avg_smooth_window=avg_smooth_window_bins,
+        show_sem_shading=show_sem_shading,
         show_plot=False,
         close_on_return=False,
         all_direction_key=str(dir_keys[0]),
@@ -21055,6 +21301,7 @@ def generate_drz_trials_and_dataset(
                         plateaus_dicts=plot_payload["plateaus_for_plot"],
                         slow_trace_gap=float(trace_slow_gap),
                         theta_slow_pad_factor=float(theta_slow_pad_factor),
+                        trace_ymax_from_simple_spikes=(str(cat) == "CSminus"),
                         sharey=bool(sharey),
                         place_field_contours=trajectory_contours,
                         pf_occupancy_mask=np.asarray(place_field_contour_mask, dtype=bool),
@@ -22267,6 +22514,7 @@ def generate_drz_trials_and_dataset_egocentric_preferred_nonpreferred(
                             plateaus_dicts=plot_payload["plateaus_for_plot"],
                             slow_trace_gap=float(trace_slow_gap),
                             theta_slow_pad_factor=float(theta_slow_pad_factor),
+                            trace_ymax_from_simple_spikes=(str(cat) == "CSminus"),
                             sharey=bool(sharey),
                             place_field_contours=[{"mask": np.asarray(place_field_contour_mask, dtype=bool), "color": contour_color, "linewidth": 0.8, "linestyle": "solid", "alpha": 1.0}],
                             pf_occupancy_mask=np.asarray(place_field_contour_mask, dtype=bool),

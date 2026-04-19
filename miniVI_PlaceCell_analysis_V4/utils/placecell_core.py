@@ -8683,6 +8683,7 @@ def plot_place_field_traversal_trials(
                     linestyle="None",
                     marker="|",
                     markersize=spike_tick_size,
+                    markeredgewidth=0.5,
                     color=simple_spike_color,
                     zorder=3,
                 )
@@ -8696,6 +8697,7 @@ def plot_place_field_traversal_trials(
                     linestyle="None",
                     marker="|",
                     markersize=spike_tick_size,
+                    markeredgewidth=0.5,
                     color=complex_spike_color,
                     zorder=3,
                 )
@@ -8864,6 +8866,7 @@ def plot_place_field_traversal_trials(
                         color=simple_spike_color,
                         linestyle="None",
                         markersize=spike_tick_size,
+                        markeredgewidth=0.5,
                         label="Simple spikes",
                     )
                 )
@@ -8877,6 +8880,7 @@ def plot_place_field_traversal_trials(
                         color=complex_spike_color,
                         linestyle="None",
                         markersize=spike_tick_size,
+                        markeredgewidth=0.5,
                         label="Complex spikes",
                     )
                 )
@@ -8897,6 +8901,7 @@ def plot_place_field_traversal_trials(
                             color=simple_spike_color,
                             linestyle="None",
                             markersize=spike_tick_size,
+                            markeredgewidth=0.5,
                         ),
                     )
                 )
@@ -8911,6 +8916,7 @@ def plot_place_field_traversal_trials(
                             color=complex_spike_color,
                             linestyle="None",
                             markersize=spike_tick_size,
+                            markeredgewidth=0.5,
                         ),
                     )
                 )
@@ -9406,8 +9412,8 @@ def plot_place_field_traversal_trials_with_cb_example(
     frame_rate,
     complex_bursts_dicts,
     cell_idx,
-    burst_pre_ms=20,
-    burst_post_ms=20,
+    burst_pre_ms=100,
+    burst_post_ms=100,
     padding_sec=2.0,
     zscore_traces=False,
     bad_timepoints=None,
@@ -9843,10 +9849,14 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
     slow_trace_gap = float(slow_trace_gap)
     theta_slow_pad_factor = float(theta_slow_pad_factor)
     sharey = bool(sharey)
+    trace_ymax_from_simple_spikes = bool(kwargs.pop("trace_ymax_from_simple_spikes", False))
+    trace_ymax_simple_spike_scale = float(kwargs.pop("trace_ymax_simple_spike_scale", 1.05))
     if slow_trace_gap < 0:
         raise ValueError("slow_trace_gap must be >= 0.")
     if theta_slow_pad_factor < 0:
         raise ValueError("theta_slow_pad_factor must be >= 0.")
+    if not np.isfinite(trace_ymax_simple_spike_scale) or trace_ymax_simple_spike_scale <= 0:
+        raise ValueError("trace_ymax_simple_spike_scale must be > 0.")
     place_field_contours = kwargs.pop("place_field_contours", None)
     center_position_label = kwargs.pop("center_position_label", None)
     pf_peak_label = kwargs.pop("pf_peak_label", "PF peak")
@@ -10107,47 +10117,39 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
         slow_maxs.append(np.nanmax(slow_z[start_idx:end_idx]))
 
     trace_min_global = min(trace_mins)
+    trace_max_global = max(trace_maxs)
     theta_max_global = max(theta_maxs)
     theta_min_global = min(theta_mins)
     slow_max_global = max(slow_maxs)
     slow_min_global = min(slow_mins)
 
-    trace_range = max(trace_maxs) - min(trace_mins)
+    trace_range = trace_max_global - trace_min_global
     theta_range = theta_max_global - theta_min_global
     slow_range = slow_max_global - slow_min_global
 
-    # Spacing between stacked signals within the same axis.
-    # Show slow Vm right below the trace, and theta below slow.
-    pad_slow_theta = theta_slow_pad_factor * max(
-        slow_range if np.isfinite(slow_range) and slow_range > 0 else 1.0,
-        theta_range if np.isfinite(theta_range) and theta_range > 0 else 1.0,
-    )
-    offset1_shared = slow_trace_gap
-    offset2_shared = max(0.0, float(theta_max_global - slow_min_global + pad_slow_theta))
-
     trace_plot_trial_mask = np.ones(n_trials, dtype=bool)
+    fixed_trace_xlim_s = None
+    fixed_trace_xlim_frames = None
     if max_plot_trial_duration_s is not None:
         max_plot_trial_duration_s = float(max_plot_trial_duration_s)
         if np.isfinite(max_plot_trial_duration_s) and max_plot_trial_duration_s > 0:
-            trial_durations_s = np.asarray(
-                [(e - s) / float(frame_rate) for s, e in valid_epochs],
-                dtype=float,
-            )
-            trace_plot_trial_mask = np.asarray(trial_durations_s <= max_plot_trial_duration_s, dtype=bool)
-    durations_for_xlim = [
-        (e - s)
-        for keep_i, (s, e) in zip(trace_plot_trial_mask.tolist(), valid_epochs)
-        if keep_i
-    ]
-    if len(durations_for_xlim) == 0:
-        max_epoch_duration = min(
-            max((e - s) for s, e in valid_epochs),
-            int(round(float(max_plot_trial_duration_s) * float(frame_rate)))
-        ) if (max_plot_trial_duration_s is not None and np.isfinite(float(max_plot_trial_duration_s)) and float(max_plot_trial_duration_s) > 0) else max((e - s) for s, e in valid_epochs)
-    else:
-        max_epoch_duration = max(durations_for_xlim)
+            fixed_trace_xlim_s = float(max_plot_trial_duration_s)
+            fixed_trace_xlim_frames = max(1, int(round(fixed_trace_xlim_s * float(frame_rate))))
+    max_epoch_duration = max((e - s) for s, e in valid_epochs)
     global_x_min = -padding_sec
-    global_x_max = max_epoch_duration / frame_rate + padding_sec
+    global_x_max = (
+        fixed_trace_xlim_s if fixed_trace_xlim_s is not None else (max_epoch_duration / frame_rate + padding_sec)
+    )
+
+    def _get_trace_plot_indices(epoch_start, epoch_end):
+        start_idx = int(max(0, epoch_start - padding_frames))
+        end_idx = int(min(len(trace_z), epoch_end + padding_frames))
+        visible_end_idx = end_idx
+        if fixed_trace_xlim_frames is not None:
+            visible_end_idx = min(visible_end_idx, int(epoch_start + fixed_trace_xlim_frames))
+        if visible_end_idx <= start_idx:
+            visible_end_idx = min(end_idx, start_idx + 1)
+        return start_idx, end_idx, visible_end_idx
 
     def _get_spike_indices(spike_source):
         if spike_source is None:
@@ -10164,6 +10166,127 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
     simple_spikes = _get_spike_indices(refined_SS)
     complex_spikes = _get_spike_indices(all_CS_spikes)
     all_spike_indices = _get_spike_indices(all_spikes)
+
+    simple_spike_trace_ymax_global = None
+    simple_spike_theta_ymax_global = None
+    if trace_ymax_from_simple_spikes and simple_spikes is not None and len(simple_spikes) > 0:
+        ss_vals_all = []
+        theta_ss_vals_all = []
+        for keep_i, (epoch_start, epoch_end) in zip(trace_plot_trial_mask.tolist(), valid_epochs):
+            if not keep_i:
+                continue
+            start_idx, _, visible_end_idx = _get_trace_plot_indices(epoch_start, epoch_end)
+            ss_idx = np.asarray(simple_spikes, dtype=int)
+            ss_idx = ss_idx[(ss_idx >= start_idx) & (ss_idx < visible_end_idx)]
+            if bad_mask is not None and ss_idx.size > 0:
+                ss_idx = ss_idx[~bad_mask[ss_idx]]
+            if ss_idx.size == 0:
+                continue
+            ss_vals = np.asarray(trace_z[ss_idx], dtype=float)
+            ss_vals = ss_vals[np.isfinite(ss_vals)]
+            if ss_vals.size > 0:
+                ss_vals_all.append(ss_vals)
+            theta_ss_vals = np.asarray(theta_z[ss_idx], dtype=float)
+            theta_ss_vals = theta_ss_vals[np.isfinite(theta_ss_vals)]
+            if theta_ss_vals.size > 0:
+                theta_ss_vals_all.append(theta_ss_vals)
+        if len(ss_vals_all) > 0:
+            ss_max_global = float(np.nanmax(np.concatenate(ss_vals_all)))
+            candidate_ymax = float(ss_max_global * trace_ymax_simple_spike_scale)
+            if np.isfinite(candidate_ymax):
+                simple_spike_trace_ymax_global = candidate_ymax
+        if len(theta_ss_vals_all) > 0:
+            theta_ss_max_global = float(np.nanmax(np.concatenate(theta_ss_vals_all)))
+            candidate_theta_ymax = float(theta_ss_max_global * trace_ymax_simple_spike_scale)
+            if np.isfinite(candidate_theta_ymax):
+                simple_spike_theta_ymax_global = candidate_theta_ymax
+
+    trace_display_max_global = trace_max_global
+    if (
+        trace_ymax_from_simple_spikes
+        and simple_spike_trace_ymax_global is not None
+        and np.isfinite(simple_spike_trace_ymax_global)
+        and simple_spike_trace_ymax_global > trace_min_global
+    ):
+        trace_display_max_global = min(trace_display_max_global, float(simple_spike_trace_ymax_global))
+
+    theta_display_max_global = theta_max_global
+    if (
+        trace_ymax_from_simple_spikes
+        and simple_spike_theta_ymax_global is not None
+        and np.isfinite(simple_spike_theta_ymax_global)
+        and simple_spike_theta_ymax_global > theta_min_global
+    ):
+        theta_display_max_global = min(theta_display_max_global, float(simple_spike_theta_ymax_global))
+
+    theta_display_range = theta_display_max_global - theta_min_global
+
+    # Spacing between stacked signals within the same axis.
+    # Show slow Vm right below the trace, and theta below slow.
+    pad_slow_theta = theta_slow_pad_factor * max(
+        slow_range if np.isfinite(slow_range) and slow_range > 0 else 1.0,
+        theta_display_range if np.isfinite(theta_display_range) and theta_display_range > 0 else 1.0,
+    )
+    offset1_shared = slow_trace_gap
+    offset2_shared = max(0.0, float(theta_display_max_global - slow_min_global + pad_slow_theta))
+
+    def _compute_channel_display_stats(signal_window, display_max_ceiling=None):
+        signal_window_arr = np.asarray(signal_window, dtype=float)
+        finite_signal = signal_window_arr[np.isfinite(signal_window_arr)]
+        if finite_signal.size > 0:
+            signal_min_local = float(np.nanmin(finite_signal))
+            signal_max_local = float(np.nanmax(finite_signal))
+        else:
+            signal_min_local = 0.0
+            signal_max_local = 0.0
+
+        signal_display_max = signal_max_local
+        if (
+            display_max_ceiling is not None
+            and np.isfinite(display_max_ceiling)
+            and display_max_ceiling > signal_min_local
+        ):
+            signal_display_max = min(signal_display_max, float(display_max_ceiling))
+
+        if not np.isfinite(signal_display_max):
+            signal_display_max = signal_max_local
+        if signal_display_max < signal_min_local:
+            signal_display_max = signal_max_local
+
+        if np.isfinite(signal_display_max) and signal_display_max < signal_max_local:
+            signal_window_ylim = np.minimum(signal_window_arr, signal_display_max)
+        else:
+            signal_window_ylim = signal_window_arr
+
+        return {
+            "signal_min": signal_min_local,
+            "signal_display_max": signal_display_max,
+            "signal_window_ylim": signal_window_ylim,
+        }
+
+    def _compute_trace_display_stats(trace_window):
+        trace_display_stats = _compute_channel_display_stats(
+            trace_window,
+            (
+                simple_spike_trace_ymax_global
+                if trace_ymax_from_simple_spikes
+                else None
+            ),
+        )
+        trace_min_local = float(trace_display_stats["signal_min"])
+        trace_display_max = float(trace_display_stats["signal_display_max"])
+        trace_window_ylim = np.asarray(trace_display_stats["signal_window_ylim"], dtype=float)
+
+        trace_range_local = trace_display_max - trace_min_local
+        if not np.isfinite(trace_range_local) or trace_range_local <= 0:
+            trace_range_local = 0.1
+        spike_tick_y_local = trace_display_max + 0.05 * trace_range_local
+        return {
+            "trace_min": trace_min_local,
+            "trace_display_max": trace_display_max,
+            "trace_window_ylim": trace_window_ylim,
+            "spike_tick_y": float(spike_tick_y_local),
+        }
 
     def _compute_ifr(spike_indices):
         if spike_indices is None or len(spike_indices) == 0:
@@ -10343,12 +10466,22 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
         for keep_i, (epoch_start, epoch_end) in zip(trace_plot_trial_mask.tolist(), valid_epochs):
             if not keep_i:
                 continue
-            start_idx = epoch_start - padding_frames
-            end_idx = epoch_end + padding_frames
-            trace_window = trace_z[start_idx:end_idx]
-            theta_window = theta_z[start_idx:end_idx]
+            start_idx, _, visible_end_idx = _get_trace_plot_indices(epoch_start, epoch_end)
+            trace_window = trace_z[start_idx:visible_end_idx]
+            trace_display_stats = _compute_trace_display_stats(trace_window)
+            trace_window_ylim = np.asarray(trace_display_stats["trace_window_ylim"], dtype=float)
+            theta_window = theta_z[start_idx:visible_end_idx]
+            theta_display_stats = _compute_channel_display_stats(
+                theta_window,
+                (
+                    simple_spike_theta_ymax_global
+                    if trace_ymax_from_simple_spikes
+                    else None
+                ),
+            )
+            theta_window_ylim = np.asarray(theta_display_stats["signal_window_ylim"], dtype=float)
             slow_source = slow_z if zscore_traces else slow_plot
-            slow_window = slow_source[start_idx:end_idx]
+            slow_window = slow_source[start_idx:visible_end_idx]
             if normalize_slow_baseline:
                 baseline = np.nan
                 if epoch_start > start_idx:
@@ -10356,16 +10489,13 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                 if np.isfinite(baseline):
                     slow_window = slow_window - baseline
 
-            trace_range_local = np.nanmax(trace_window) - np.nanmin(trace_window)
-            if not np.isfinite(trace_range_local) or trace_range_local == 0:
-                trace_range_local = 0.1
-            spike_tick_y = np.nanmax(trace_window) + 0.05 * trace_range_local
+            spike_tick_y = float(trace_display_stats["spike_tick_y"])
 
             trial_vals = np.concatenate(
                 [
-                    np.ravel(trace_window),
+                    np.ravel(trace_window_ylim),
                     np.ravel(slow_window - offset1_shared),
-                    np.ravel(theta_window - offset1_shared - offset2_shared),
+                    np.ravel(theta_window_ylim - offset1_shared - offset2_shared),
                     np.asarray([spike_tick_y, 0.0, -offset1_shared, -offset1_shared - offset2_shared], dtype=float),
                 ]
             )
@@ -10385,21 +10515,35 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
         ax_trace = axes[trial_idx, 0]
         ax_traj = axes[trial_idx, 1]
 
-        start_idx = epoch_start - padding_frames
-        end_idx = epoch_end + padding_frames
+        start_idx, end_idx, visible_end_idx = _get_trace_plot_indices(epoch_start, epoch_end)
         time_rel = (np.arange(start_idx, end_idx) - epoch_start) / frame_rate
         plot_trace_trial = bool(trace_plot_trial_mask[trial_idx]) if trial_idx < len(trace_plot_trial_mask) else True
 
         trace_window = trace_z[start_idx:end_idx]
         theta_window = theta_z[start_idx:end_idx]
+        trace_window_visible = trace_z[start_idx:visible_end_idx]
+        theta_window_visible = theta_z[start_idx:visible_end_idx]
+        trace_display_stats = _compute_trace_display_stats(trace_window_visible)
+        trace_window_ylim = np.asarray(trace_display_stats["trace_window_ylim"], dtype=float)
+        theta_display_stats = _compute_channel_display_stats(
+            theta_window_visible,
+            (
+                simple_spike_theta_ymax_global
+                if trace_ymax_from_simple_spikes
+                else None
+            ),
+        )
+        theta_window_ylim = np.asarray(theta_display_stats["signal_window_ylim"], dtype=float)
         slow_source = slow_z if zscore_traces else slow_plot
         slow_window = slow_source[start_idx:end_idx]
+        slow_window_visible = slow_window[: max(0, visible_end_idx - start_idx)]
         if normalize_slow_baseline:
             baseline = np.nan
             if epoch_start > start_idx:
                 baseline = np.nanmean(slow_source[start_idx:epoch_start])
             if np.isfinite(baseline):
                 slow_window = slow_window - baseline
+                slow_window_visible = slow_window_visible - baseline
 
         epoch_duration = (epoch_end - epoch_start) / frame_rate
         if plot_trace_trial and shade_traversal_epoch:
@@ -10407,8 +10551,8 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
 
         if plot_trace_trial and ifr_valid is not None and show_firing_rate:
             ifr_window = ifr_valid[start_idx:end_idx]
-            trace_min = np.nanmin(trace_window)
-            trace_max = np.nanmax(trace_window)
+            trace_min = float(trace_display_stats["trace_min"])
+            trace_max = float(trace_display_stats["trace_display_max"])
             trace_range = trace_max - trace_min
             if not np.isfinite(trace_range) or trace_range == 0:
                 trace_range = 1.0
@@ -10428,10 +10572,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                 zorder=1,
             )
 
-        trace_range_local = np.nanmax(trace_window) - np.nanmin(trace_window)
-        if not np.isfinite(trace_range_local) or trace_range_local == 0:
-            trace_range_local = 0.1
-        spike_tick_y = np.nanmax(trace_window) + 0.05 * trace_range_local
+        spike_tick_y = float(trace_display_stats["spike_tick_y"])
 
         if plot_trace_trial and simple_spikes is not None:
             ss_mask = (simple_spikes >= start_idx) & (simple_spikes < end_idx)
@@ -10443,6 +10584,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                     linestyle="None",
                     marker="|",
                     markersize=spike_tick_size,
+                    markeredgewidth=0.5,
                     color=simple_spike_color,
                     zorder=3,
                 )
@@ -10456,6 +10598,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                     linestyle="None",
                     marker="|",
                     markersize=spike_tick_size,
+                    markeredgewidth=0.5,
                     color=complex_spike_color,
                     zorder=3,
                 )
@@ -10559,8 +10702,8 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
             offset1 = offset1_shared
             offset2 = offset2_shared
         else:
-            slow_min_local = np.nanmin(slow_window) if np.any(np.isfinite(slow_window)) else 0.0
-            theta_max_local = np.nanmax(theta_window) if np.any(np.isfinite(theta_window)) else 0.0
+            slow_min_local = np.nanmin(slow_window_visible) if np.any(np.isfinite(slow_window_visible)) else 0.0
+            theta_max_local = float(theta_display_stats["signal_display_max"])
             offset1 = slow_trace_gap
             offset2 = max(0.0, float(theta_max_local - slow_min_local + pad_slow_theta))
         theta_label = "Theta (4-8 Hz)"
@@ -10657,6 +10800,22 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
         ax_trace.set_xlim([global_x_min, global_x_max])
         if sharey and shared_trace_ylim is not None:
             ax_trace.set_ylim(shared_trace_ylim[0], shared_trace_ylim[1])
+        elif trace_ymax_from_simple_spikes:
+            trial_vals = np.concatenate(
+                [
+                    np.ravel(trace_window_ylim),
+                    np.ravel(slow_window_visible - offset1),
+                    np.ravel(theta_window_ylim - offset1 - offset2),
+                    np.asarray([spike_tick_y, 0.0, -offset1, -offset1 - offset2], dtype=float),
+                ]
+            )
+            trial_vals = trial_vals[np.isfinite(trial_vals)]
+            if trial_vals.size > 0:
+                y0 = float(np.nanmin(trial_vals))
+                y1 = float(np.nanmax(trial_vals))
+                span = y1 - y0
+                pad = 0.03 * span if np.isfinite(span) and span > 0 else 0.1
+                ax_trace.set_ylim(y0 - pad, y1 + pad)
 
         if trial_idx == 0:
             handles, labels = ax_trace.get_legend_handles_labels()
@@ -10669,6 +10828,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                         color=simple_spike_color,
                         linestyle="None",
                         markersize=spike_tick_size,
+                        markeredgewidth=0.5,
                         label="Simple spikes",
                     )
                 )
@@ -10682,6 +10842,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                         color=complex_spike_color,
                         linestyle="None",
                         markersize=spike_tick_size,
+                        markeredgewidth=0.5,
                         label="Complex spikes",
                     )
                 )
@@ -10702,6 +10863,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                             color=simple_spike_color,
                             linestyle="None",
                             markersize=spike_tick_size,
+                            markeredgewidth=0.5,
                         ),
                     )
                 )
@@ -10716,6 +10878,7 @@ def plot_place_field_traversal_trials_centered_by_max_rate(
                             color=complex_spike_color,
                             linestyle="None",
                             markersize=spike_tick_size,
+                            markeredgewidth=0.5,
                         ),
                     )
                 )
@@ -11427,8 +11590,8 @@ def plot_place_field_traversal_trials_with_cb_example_centered_by_max_rate(
     frame_rate,
     complex_bursts_dicts,
     cell_idx,
-    burst_pre_ms=20,
-    burst_post_ms=20,
+    burst_pre_ms=100,
+    burst_post_ms=100,
     padding_sec=2.0,
     zscore_traces=False,
     bad_timepoints=None,
@@ -11902,6 +12065,21 @@ def plot_place_field_traversal_trials_with_cb_example_centered_by_max_rate(
 
     all_spikes_local = kwargs.get("all_spikes", None)
     all_spike_indices = _get_spike_indices_local(all_spikes_local)
+
+    bad_mask = None
+    if bad_timepoints is not None:
+        bad_mask = np.asarray(bad_timepoints)
+        if bad_mask.dtype != bool:
+            if bad_mask.ndim == 1 and bad_mask.size == len(trace):
+                bad_mask = bad_mask.astype(bool)
+            else:
+                bad_idx = np.asarray(bad_mask, dtype=int).reshape(-1)
+                bad_idx = bad_idx[(bad_idx >= 0) & (bad_idx < len(trace))]
+                bad_mask_bool = np.zeros(len(trace), dtype=bool)
+                bad_mask_bool[bad_idx] = True
+                bad_mask = bad_mask_bool
+        if bad_mask.shape[0] != len(trace):
+            raise ValueError("bad_timepoints must match trace length or be index list.")
     
     # Compute instantaneous firing rate if we have spike data
     ifr_local = None
@@ -12063,6 +12241,7 @@ def plot_place_field_traversal_trials_with_cb_example_centered_by_max_rate(
         chosen_start = None
         chosen_end = None
         chosen_is_plateau = False
+        chosen_is_spike_fallback = False
         max_rate_idx = max_rate_center_indices[trial_idx]
         target_idx = None
         # Primary reference timepoint:
@@ -12126,6 +12305,28 @@ def plot_place_field_traversal_trials_with_cb_example_centered_by_max_rate(
                 chosen_start = int(starts[chosen_idx])
                 chosen_end = int(ends[chosen_idx]) if chosen_idx < len(ends) else chosen_start
 
+        # Final fallback: if there is no plateau/CB example, zoom around the
+        # PF-restricted all-spike firing-rate maximum for this traversal.
+        if chosen_start is None or chosen_end is None:
+            fallback_center_idx = None
+            has_spikes_in_epoch = False
+            if all_spike_indices is not None and len(all_spike_indices) > 0:
+                spikes_in_epoch = (all_spike_indices >= epoch_start) & (all_spike_indices < epoch_end)
+                has_spikes_in_epoch = bool(np.any(spikes_in_epoch))
+            if has_spikes_in_epoch and ifr_local is not None and np.any(in_pf_epoch):
+                ifr_epoch = np.asarray(ifr_local[epoch_start:epoch_end], dtype=float)
+                fallback_valid = np.asarray(in_pf_epoch, dtype=bool) & np.isfinite(ifr_epoch)
+                if bad_mask is not None:
+                    fallback_valid &= (~bad_mask[epoch_start:epoch_end])
+                if np.any(fallback_valid):
+                    valid_rel = np.where(fallback_valid)[0]
+                    fallback_rel = int(valid_rel[np.nanargmax(ifr_epoch[fallback_valid])])
+                    fallback_center_idx = int(epoch_start + fallback_rel)
+            if fallback_center_idx is not None:
+                chosen_start = fallback_center_idx
+                chosen_end = fallback_center_idx
+                chosen_is_spike_fallback = True
+
         if chosen_start is None or chosen_end is None:
             ax_example.text(
                 0.5,
@@ -12160,17 +12361,36 @@ def plot_place_field_traversal_trials_with_cb_example_centered_by_max_rate(
         trace_max = np.nanmax(trace_window) if trace_window.size > 0 else np.nan
         if not np.isfinite(trace_min) or not np.isfinite(trace_max) or trace_max == trace_min:
             trace_min, trace_max = ax_trace.get_ylim()
-        rect = Rectangle(
-            (t_start, trace_min),
-            t_end - t_start,
-            trace_max - trace_min,
-            fill=False,
-            edgecolor=("red" if chosen_is_plateau else "gray"),
-            linestyle="--",
-            linewidth=0.25,
-            zorder=4,
-        )
-        ax_trace.add_patch(rect)
+        if chosen_is_spike_fallback:
+            box_start_idx = max(burst_start - pre_frames, start_idx)
+            box_end_idx = min(burst_end + post_frames + 1, end_idx)
+            box_t_start = (box_start_idx - epoch_start) / frame_rate
+            box_t_end = (box_end_idx - epoch_start) / frame_rate
+            if box_t_end <= box_t_start:
+                box_t_end = box_t_start + (1.0 / frame_rate)
+            rect = Rectangle(
+                (box_t_start, trace_min),
+                box_t_end - box_t_start,
+                trace_max - trace_min,
+                fill=False,
+                edgecolor="gray",
+                linestyle="--",
+                linewidth=0.25,
+                zorder=4,
+            )
+            ax_trace.add_patch(rect)
+        else:
+            rect = Rectangle(
+                (t_start, trace_min),
+                t_end - t_start,
+                trace_max - trace_min,
+                fill=False,
+                edgecolor=("red" if chosen_is_plateau else "gray"),
+                linestyle="--",
+                linewidth=0.25,
+                zorder=4,
+            )
+            ax_trace.add_patch(rect)
 
         win_start = max(burst_start - pre_frames, 0)
         win_end = min(burst_end + post_frames + 1, len(trace_arr))
@@ -12281,8 +12501,8 @@ def plot_place_field_traversal_trials_with_cb_example_by_direction(
     frame_rate,
     complex_bursts_dicts,
     cell_idx,
-    burst_pre_ms=20,
-    burst_post_ms=20,
+    burst_pre_ms=100,
+    burst_post_ms=100,
     padding_sec=2.0,
     zscore_traces=False,
     show=True,

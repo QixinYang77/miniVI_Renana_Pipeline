@@ -292,10 +292,11 @@ def plot_celltype_distribution_pie(
     plcs_csminus,
     non_plcs,
     save_path=None,
-    fig_size=(1, 1.8),
+    fig_width: float = 1.0,
+    fig_height: float = 1.8,
 ):
     """Plot CS+ PLC / CS- PLC / Non-PLC distribution pie chart."""
-    fig, ax = plt.subplots(figsize=fig_size)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     sizes = [len(plcs_csplus), len(plcs_csminus), len(non_plcs)]
     labels = ['CS+ PLCs', 'CS- PLCs', 'Non-PLCs']
     # Match category background hues used in pooled plots, with stronger opacity in pie.

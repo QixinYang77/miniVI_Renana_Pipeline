@@ -469,13 +469,14 @@ def plot_combined_cs_plus_minus_4panels(
     df_non_cs_plc: pd.DataFrame,
     save_path: str,
     plot_cs_minus_ss: bool = False,
+    fig_width: float = 9.6,
+    fig_height: float = 1.4,
 ):
-    panel_h = 1.4
     first_panel_ratio = 1.4
     fig, axes = plt.subplots(
         1,
         7,
-        figsize=(9.6, panel_h),
+        figsize=(fig_width, fig_height),
         gridspec_kw={'width_ratios': [first_panel_ratio, 1, 1, 1, 1, 1, first_panel_ratio]},
     )
 
@@ -1025,36 +1026,26 @@ def _unpaired_test_bursts(d1, d2):
     return p, 'Mann-Whitney U'
 
 
-def plot_complex_burst_metrics_allbursts_csplus(
+def _collect_complex_burst_metric_pools(
     plcs_csplus,
-    save_path: str,
-    state_key: str = 'run',
+    metric_specs,
     min_bursts_per_condition: int = 3,
 ):
     conditions = ['run_in', 'run_out', 'rest_in', 'rest_out']
-    burst_metric_specs = [
-        ('n_spikes', 'Spks./burst'),
-        ('peak_amp', 'Peak amp'),
-        ('duration_ms', 'Duration (ms)'),
-        ('auc', 'AUC'),
-    ]
-
-    burst_data_all = {metric: {cond: [] for cond in conditions} for metric, _ in burst_metric_specs}
+    burst_data_all = {metric: {cond: [] for cond in conditions} for metric, _ in metric_specs}
 
     for cell in plcs_csplus:
         bm = cell.get('burst_metrics')
         complex_by_cond = bm.get('complex') if isinstance(bm, dict) else None
         for cond in conditions:
-            bursts = []
-            if isinstance(complex_by_cond, dict):
-                bursts = complex_by_cond.get(cond, [])
-            if not isinstance(bursts, (list, tuple)):
-                bursts = []
-            for b in bursts:
-                if not isinstance(b, dict):
+            bursts = complex_by_cond.get(cond, []) if isinstance(complex_by_cond, dict) else []
+            if not isinstance(bursts, (list, tuple)) or len(bursts) < int(min_bursts_per_condition):
+                continue
+            for burst in bursts:
+                if not isinstance(burst, dict):
                     continue
-                for metric_key, _ in burst_metric_specs:
-                    val = b.get(metric_key, np.nan)
+                for metric_key, _ in metric_specs:
+                    val = burst.get(metric_key, np.nan)
                     try:
                         val = float(val)
                     except (TypeError, ValueError):
@@ -1062,118 +1053,895 @@ def plot_complex_burst_metrics_allbursts_csplus(
                     if np.isfinite(val):
                         burst_data_all[metric_key][cond].append(val)
 
-    burst_ylim = {}
-    for metric, _ in burst_metric_specs:
-        all_vals = [np.asarray(burst_data_all[metric][cond], dtype=float) for cond in conditions]
-        burst_ylim[metric] = _global_ylim(all_vals, pct_low=1, pct_high=99)
+    return burst_data_all, conditions
 
-    panel_w = 0.9
-    panel_h = 1.2
-    fig, axes = plt.subplots(1, len(burst_metric_specs), figsize=(panel_w * len(burst_metric_specs), panel_h), sharex=True, sharey=False)
 
+def _compute_hist_axis_config(metric_key, arrays):
+    finite_arrays = []
+    for arr in arrays:
+        arr = np.asarray(arr, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size > 0:
+            finite_arrays.append(finite)
+    if not finite_arrays:
+        return None
+
+    combined = np.concatenate(finite_arrays)
+    data_min = float(np.min(combined))
+    data_max = float(np.max(combined))
+    if not np.isfinite(data_min) or not np.isfinite(data_max):
+        return None
+
+    combined_rounded = np.round(combined)
+    is_integer_metric = np.all(np.isclose(combined, combined_rounded, atol=1e-8))
+    int_min = None
+    int_max = None
+
+    if metric_key == 'n_spikes':
+        bin_edges = np.arange(1.5, 10.5 + 1.0, 1.0, dtype=float)
+        xlim = (2.0, 10.0)
+        xticks = np.array([2, 4, 6, 8, 10], dtype=int)
+    elif metric_key == 'duration_ms':
+        if data_max == data_min:
+            span = 10.0
+            bin_edges = np.array([data_min - span, data_max + span], dtype=float)
+            xlim = (float(data_min - span), float(data_max + span))
+        else:
+            bin_start = 10.0 * np.floor(data_min / 10.0)
+            bin_end = 10.0 * np.ceil(data_max / 10.0)
+            if bin_end <= bin_start:
+                bin_end = bin_start + 10.0
+            bin_edges = np.arange(bin_start, bin_end + 10.0, 10.0, dtype=float)
+            x_pad = 0.03 * (data_max - data_min) if data_max > data_min else 1.0
+            xlim = (float(data_min - x_pad), float(data_max + x_pad))
+        xticks = None
+    elif is_integer_metric:
+        int_min = int(np.min(combined_rounded))
+        int_max = int(np.max(combined_rounded))
+        bin_edges = np.arange(int_min - 0.5, int_max + 1.5, 1.0, dtype=float)
+        if bin_edges.size < 2:
+            bin_edges = np.array([int_min - 0.5, int_min + 0.5], dtype=float)
+        xlim = (float(bin_edges[0]), float(bin_edges[-1]))
+        xticks = np.arange(int_min, int_max + 1, 1, dtype=int) if int_max >= int_min else None
+    elif data_max == data_min:
+        span = max(abs(data_max) * 0.1, 1.0)
+        bin_edges = np.array([data_min - span, data_max + span], dtype=float)
+        xlim = (float(data_min - span), float(data_max + span))
+        xticks = None
+    else:
+        n_bins = int(np.clip(np.sqrt(combined.size), 10, 30))
+        bin_edges = np.linspace(data_min, data_max, n_bins + 1)
+        x_pad = 0.03 * (data_max - data_min) if data_max > data_min else 1.0
+        xlim = (float(data_min - x_pad), float(data_max + x_pad))
+        xticks = None
+
+    if metric_key == 'duration_ms':
+        tick_start = max(50, int(np.ceil(xlim[0] / 50.0) * 50))
+        tick_end = int(np.floor(xlim[1] / 50.0) * 50)
+        if tick_end >= tick_start:
+            xticks = np.arange(tick_start, tick_end + 1, 50, dtype=int)
+
+    return {
+        'bin_edges': np.asarray(bin_edges, dtype=float),
+        'xlim': xlim,
+        'xticks': xticks,
+    }
+
+
+def _plot_overlapping_hist_panel(
+    ax,
+    vals_in,
+    vals_out,
+    axis_config,
+    xlabel,
+    ylabel='',
+    sig_label='',
+    show_legend=False,
+    legend_loc='upper left',
+    first_label='Out PF',
+    second_label='In PF',
+    first_color='gray',
+    second_color='magenta',
+    background_color=CS_PLC_BG,
+    plot_mode='hist',
+    fill_alpha=0.3,
+):
+    vals_in = np.asarray(vals_in, dtype=float)
+    vals_out = np.asarray(vals_out, dtype=float)
+    vals_in = vals_in[np.isfinite(vals_in)]
+    vals_out = vals_out[np.isfinite(vals_out)]
+
+    if len(vals_in) < 2 or len(vals_out) < 2 or axis_config is None:
+        ax.axis('off')
+        return
+
+    bin_edges = axis_config['bin_edges']
+    plot_mode = str(plot_mode).strip().lower()
+    if plot_mode not in {'hist', 'cumulative'}:
+        raise ValueError("plot_mode must be 'hist' or 'cumulative'.")
+
+    if background_color is not None:
+        ax.set_facecolor(background_color)
+    if plot_mode == 'hist':
+        weights_out = np.full(vals_out.shape, 100.0 / len(vals_out), dtype=float)
+        weights_in = np.full(vals_in.shape, 100.0 / len(vals_in), dtype=float)
+        ax.hist(
+            vals_out,
+            bins=bin_edges,
+            weights=weights_out,
+            color=first_color,
+            alpha=fill_alpha,
+            edgecolor='none',
+            zorder=1,
+            label=first_label,
+        )
+        ax.hist(
+            vals_in,
+            bins=bin_edges,
+            weights=weights_in,
+            color=second_color,
+            alpha=fill_alpha,
+            edgecolor='none',
+            zorder=2,
+            label=second_label,
+        )
+        ax.hist(
+            vals_out,
+            bins=bin_edges,
+            weights=weights_out,
+            histtype='step',
+            color=first_color,
+            linewidth=0.8,
+            zorder=3,
+        )
+        ax.hist(
+            vals_in,
+            bins=bin_edges,
+            weights=weights_in,
+            histtype='step',
+            color=second_color,
+            linewidth=0.8,
+            zorder=4,
+        )
+    else:
+        vals_out_sorted = np.sort(vals_out)
+        vals_in_sorted = np.sort(vals_in)
+        cdf_out = 100.0 * np.arange(1, len(vals_out_sorted) + 1, dtype=float) / float(len(vals_out_sorted))
+        cdf_in = 100.0 * np.arange(1, len(vals_in_sorted) + 1, dtype=float) / float(len(vals_in_sorted))
+
+        ax.step(vals_out_sorted, cdf_out, where='post', color=first_color, linewidth=1.0, zorder=3, label=first_label)
+        ax.step(vals_in_sorted, cdf_in, where='post', color=second_color, linewidth=1.0, zorder=4, label=second_label)
+        ax.fill_between(vals_out_sorted, cdf_out, step='post', color=first_color, alpha=0.12, zorder=1)
+        ax.fill_between(vals_in_sorted, cdf_in, step='post', color=second_color, alpha=0.12, zorder=2)
+
+    if sig_label:
+        ax.text(
+            0.5,
+            0.99,
+            sig_label,
+            ha='center',
+            va='top',
+            fontsize=6,
+            fontname='Arial',
+            transform=ax.transAxes,
+        )
+
+    ax.set_xlabel(xlabel, fontsize=6, fontname='Arial')
+    ax.set_ylabel(ylabel, fontsize=6, fontname='Arial')
+    if show_legend:
+        ax.legend(
+            frameon=False,
+            loc=legend_loc,
+            fontsize=5,
+            handlelength=1.0,
+            borderaxespad=0.2,
+        )
+    ax.tick_params(labelsize=5)
+    for label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+        label.set_fontname('Arial')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    ax.set_xlim(*axis_config['xlim'])
+    xticks = axis_config.get('xticks')
+    if xticks is not None:
+        ax.set_xticks(xticks)
+
+    if plot_mode == 'hist':
+        y_max = 0.0
+        out_hist, _ = np.histogram(vals_out, bins=bin_edges, weights=np.full(vals_out.shape, 100.0 / len(vals_out), dtype=float))
+        in_hist, _ = np.histogram(vals_in, bins=bin_edges, weights=np.full(vals_in.shape, 100.0 / len(vals_in), dtype=float))
+        if out_hist.size > 0:
+            y_max = max(y_max, float(np.nanmax(out_hist)))
+        if in_hist.size > 0:
+            y_max = max(y_max, float(np.nanmax(in_hist)))
+        if np.isfinite(y_max) and y_max > 0:
+            ax.set_ylim(0, y_max * 1.15)
+    else:
+        ax.set_ylim(0, 100)
+        ax.set_yticks([0, 25, 50, 75, 100])
+
+
+def _plot_paired_violin_panel(
+    ax,
+    vals_first,
+    vals_second,
+    ylabel='',
+    sig_label='',
+    first_label='Quiet',
+    second_label='Moving',
+    first_color='#563C25',
+    second_color='#F9E800',
+    background_color=None,
+    ylim=None,
+):
+    vals_first = np.asarray(vals_first, dtype=float)
+    vals_second = np.asarray(vals_second, dtype=float)
+
+    if background_color is not None:
+        ax.set_facecolor(background_color)
+
+    if len(vals_first) < 2 or len(vals_second) < 2:
+        ax.axis('off')
+        return
+
+    plot_data = []
+    for vals in (vals_first, vals_second):
+        finite = vals[np.isfinite(vals)]
+        if finite.size == 0:
+            finite = np.array([np.nan], dtype=float)
+        plot_data.append(finite)
+
+    if any(len(arr) < 2 for arr in plot_data):
+        ax.axis('off')
+        return
+
+    positions = [1, 2]
+    half_sides = ['left', 'right']
+    colors = [first_color, second_color]
+    for pos, d, color, side in zip(positions, plot_data, colors, half_sides):
+        vp = ax.violinplot([d], positions=[pos], showmedians=True, showextrema=False)
+        body = vp['bodies'][0]
+        verts = body.get_paths()[0].vertices
+        if side == 'left':
+            verts[:, 0] = np.clip(verts[:, 0], -np.inf, pos)
+        else:
+            verts[:, 0] = np.clip(verts[:, 0], pos, np.inf)
+        body.set_facecolor(color)
+        body.set_edgecolor('none')
+        body.set_alpha(0.3)
+        _style_violin_medians(vp)
+
+        finite_mask = np.isfinite(d)
+        if np.any(finite_mask):
+            d_finite = d[finite_mask]
+            y_range = np.ptp(d_finite) if len(d_finite) > 1 else 1.0
+            y_spacing = max(y_range * 0.04, 1e-8)
+            x_step = 0.06
+            sorted_idx = np.argsort(d_finite)
+            xs_bee = np.zeros(len(d_finite))
+            for si, oi in enumerate(sorted_idx):
+                layer = 0
+                while True:
+                    candidate = x_step * layer
+                    conflict = False
+                    for sj in range(si):
+                        oj = sorted_idx[sj]
+                        if abs(d_finite[oi] - d_finite[oj]) < y_spacing:
+                            if abs(candidate - xs_bee[oj]) < x_step * 0.9:
+                                conflict = True
+                                break
+                    if not conflict:
+                        xs_bee[oi] = candidate
+                        break
+                    layer += 1
+            if side == 'left':
+                xs = pos + 0.05 + xs_bee
+            else:
+                xs = pos - 0.05 - xs_bee
+            ax.scatter(xs, d_finite, s=4, color='black', alpha=0.6, linewidths=0, zorder=3)
+
+    n_pairs = min(len(vals_first), len(vals_second))
+    for idx in range(n_pairs):
+        if np.isfinite(vals_first[idx]) and np.isfinite(vals_second[idx]):
+            ax.plot([1.12, 1.88], [vals_first[idx], vals_second[idx]], color='black', alpha=0.3, linewidth=0.6, zorder=2)
+
+    if sig_label:
+        ax.text(
+            1.5,
+            0.99,
+            sig_label,
+            ha='center',
+            va='top',
+            fontsize=6,
+            fontname='Arial',
+            transform=ax.get_xaxis_transform(),
+        )
+
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels([first_label, second_label], fontsize=5, fontname='Arial')
+    ax.set_xlim(0.5, 2.5)
+    ax.set_ylabel(ylabel, fontsize=6, fontname='Arial')
+    ax.tick_params(labelsize=5)
+    for label in list(ax.get_yticklabels()):
+        label.set_fontname('Arial')
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+def _plot_stacked_outcome_bar(
+    ax,
+    counts,
+    total_count: int,
+    ylabel='',
+    show_legend=False,
+):
+    quiet_higher = int(counts.get('quiet_higher', 0))
+    moving_higher = int(counts.get('moving_higher', 0))
+    nonsig = int(counts.get('nonsig', 0))
+
+    segments = [
+        ('Quiet > moving', quiet_higher, '#563C25'),
+        ('Moving > quiet', moving_higher, '#F9E800'),
+        ('n.s.', nonsig, '#BDBDBD'),
+    ]
+
+    left = 0.0
+    legend_handles = []
+    for label, value, color in segments:
+        bar = ax.barh(
+            [1.0],
+            [value],
+            left=left,
+            height=0.18,
+            color=color,
+            edgecolor='none',
+            zorder=2,
+            label=label,
+        )
+        legend_handles.append(bar[0])
+        if value > 0:
+            txt_color = 'white' if color == '#563C25' else 'black'
+            ax.text(
+                left + 0.5 * value,
+                1.0,
+                str(value),
+                ha='center',
+                va='center',
+                fontsize=5,
+                fontname='Arial',
+                color=txt_color,
+            )
+        left += value
+
+    ax.set_ylim(0.7, 1.3)
+    ax.set_xlim(0, max(int(total_count), 1))
+    ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_ylabel(ylabel, fontsize=6, fontname='Arial')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.spines['bottom'].set_visible(False)
+    if show_legend:
+        ax.legend(
+            handles=legend_handles,
+            frameon=False,
+            loc='upper right',
+            fontsize=5,
+            handlelength=1.0,
+            borderaxespad=0.2,
+        )
+
+
+def _format_csplus_cell_hist_label(cell, fallback_idx):
+    session = ''
+    if isinstance(cell, dict):
+        for key in ('session', 'animal_id', 'folder'):
+            val = cell.get(key)
+            if isinstance(val, str) and val.strip():
+                session = val.strip()
+                break
+
+    cell_num = None
+    if isinstance(cell, dict):
+        cell_idx = cell.get('cell_idx', None)
+        try:
+            if cell_idx is not None and np.isfinite(float(cell_idx)):
+                cell_num = int(cell_idx) + 1
+        except (TypeError, ValueError):
+            cell_num = None
+
+    if session and cell_num is not None:
+        return f'{session}\nCell {cell_num}'
+    if session:
+        return session
+    if cell_num is not None:
+        return f'Cell {cell_num}'
+    return f'Cell {int(fallback_idx) + 1}'
+
+
+def _collect_complex_burst_metric_cell_rows(
+    plcs_csplus,
+    metric_specs,
+    state_key: str = 'run',
+    min_bursts_per_condition: int = 3,
+):
     conds = [f'{state_key}_in', f'{state_key}_out']
-    condition_labels = ['In PF', 'Out PF']
+    rows = []
 
-    for ax, (metric_key, ylabel) in zip(axes, burst_metric_specs):
-        ax.axvspan(0.5, 2.5, alpha=0.3, color=CS_PLC_BG, zorder=0)
+    for fallback_idx, cell in enumerate(plcs_csplus):
+        bm = cell.get('burst_metrics') if isinstance(cell, dict) else None
+        complex_by_cond = bm.get('complex') if isinstance(bm, dict) else None
+        metric_arrays = {}
+        any_plottable = False
 
-        vals_in = np.asarray(burst_data_all[metric_key][conds[0]], dtype=float)
-        vals_out = np.asarray(burst_data_all[metric_key][conds[1]], dtype=float)
+        for metric_key, _ in metric_specs:
+            cond_arrays = {}
+            for cond in conds:
+                bursts = complex_by_cond.get(cond, []) if isinstance(complex_by_cond, dict) else []
+                if not isinstance(bursts, (list, tuple)) or len(bursts) < int(min_bursts_per_condition):
+                    cond_arrays[cond] = np.array([], dtype=float)
+                    continue
 
-        plot_data = []
-        for vals in [vals_in, vals_out]:
-            finite = vals[np.isfinite(vals)]
-            if finite.size == 0:
-                finite = np.array([np.nan])
-            plot_data.append(finite)
+                vals = []
+                for burst in bursts:
+                    if not isinstance(burst, dict):
+                        continue
+                    val = burst.get(metric_key, np.nan)
+                    try:
+                        val = float(val)
+                    except (TypeError, ValueError):
+                        val = np.nan
+                    if np.isfinite(val):
+                        vals.append(val)
+                cond_arrays[cond] = np.asarray(vals, dtype=float)
 
-        positions = [1, 2]
-        colors = ['magenta', 'gray']
-        alphas = [0.3, 0.3]
-        if any(len(arr) < 2 for arr in plot_data):
-            ax.axis('off')
+            metric_arrays[metric_key] = cond_arrays
+            if len(cond_arrays[conds[0]]) >= 2 and len(cond_arrays[conds[1]]) >= 2:
+                any_plottable = True
+
+        if any_plottable:
+            rows.append(
+                {
+                    'label': _format_csplus_cell_hist_label(cell, fallback_idx),
+                    'data': metric_arrays,
+                }
+            )
+
+    return rows
+
+
+def _validate_quiet_moving_speed_threshold(cell, speed_threshold_cm_s: float) -> None:
+    if not isinstance(cell, dict):
+        return
+    params = cell.get('params')
+    if not isinstance(params, dict):
+        return
+    saved_threshold = params.get('speed_threshold', np.nan)
+    try:
+        saved_threshold = float(saved_threshold)
+    except (TypeError, ValueError):
+        return
+    if not np.isfinite(saved_threshold):
+        return
+    if not np.isclose(saved_threshold, float(speed_threshold_cm_s), atol=1e-8):
+        session = str(cell.get('session', cell.get('animal_id', 'unknown_session')))
+        cell_idx = cell.get('cell_idx', cell.get('cell_id', '?'))
+        raise ValueError(
+            f"Cell {session}:{cell_idx} has saved speed_threshold={saved_threshold}, "
+            f"expected {float(speed_threshold_cm_s)} for quiet/moving comparison."
+        )
+
+
+def _collect_complex_burst_metric_pools_quiet_vs_moving_allcells(
+    plcs_csplus,
+    plcs_csminus,
+    non_plcs,
+    metric_specs,
+    speed_threshold_cm_s: float = 3.0,
+    min_bursts_per_state: int = 10,
+):
+    conditions = ['quiet', 'moving']
+    pooled = {metric: {cond: [] for cond in conditions} for metric, _ in metric_specs}
+    cell_means = {metric: {cond: [] for cond in conditions} for metric, _ in metric_specs}
+    cell_burst_values = {metric: {cond: [] for cond in conditions} for metric, _ in metric_specs}
+    eligible_cells = 0
+
+    all_cells = list(plcs_csplus) + list(plcs_csminus) + list(non_plcs)
+    for cell in all_cells:
+        _validate_quiet_moving_speed_threshold(cell, speed_threshold_cm_s=speed_threshold_cm_s)
+
+        bm = cell.get('burst_metrics') if isinstance(cell, dict) else None
+        complex_by_cond = bm.get('complex') if isinstance(bm, dict) else None
+        if not isinstance(complex_by_cond, dict):
             continue
 
-        half_sides = ['left', 'right']
-        rng = np.random.default_rng(0)
-        for pos, d, color, alpha, side in zip(positions, plot_data, colors, alphas, half_sides):
-            vp = ax.violinplot([d], positions=[pos], showmedians=True, showextrema=False)
-            body = vp['bodies'][0]
-            verts = body.get_paths()[0].vertices
-            if side == 'left':
-                verts[:, 0] = np.clip(verts[:, 0], -np.inf, pos)
+        state_bursts = {
+            'moving': [],
+            'quiet': [],
+        }
+        for cond_name, bursts in complex_by_cond.items():
+            if cond_name == 'params' or not isinstance(bursts, (list, tuple)):
+                continue
+            cond_name = str(cond_name).strip().lower()
+            for burst in bursts:
+                if not isinstance(burst, dict):
+                    continue
+                state = str(burst.get('state', '')).strip().lower()
+                if state == 'run':
+                    state_bursts['moving'].append(burst)
+                elif state == 'rest':
+                    state_bursts['quiet'].append(burst)
+                elif cond_name.startswith('run_'):
+                    state_bursts['moving'].append(burst)
+                elif cond_name.startswith('rest_'):
+                    state_bursts['quiet'].append(burst)
+
+        if len(state_bursts['moving']) <= int(min_bursts_per_state) or len(state_bursts['quiet']) <= int(min_bursts_per_state):
+            continue
+
+        eligible_cells += 1
+        per_cell_metric_values = {metric: {cond: [] for cond in conditions} for metric, _ in metric_specs}
+        for state_name in conditions:
+            bursts = state_bursts[state_name]
+            for burst in bursts:
+                if not isinstance(burst, dict):
+                    continue
+                for metric_key, _ in metric_specs:
+                    val = burst.get(metric_key, np.nan)
+                    try:
+                        val = float(val)
+                    except (TypeError, ValueError):
+                        val = np.nan
+                    if np.isfinite(val):
+                        pooled[metric_key][state_name].append(val)
+                        per_cell_metric_values[metric_key][state_name].append(val)
+
+        for metric_key, _ in metric_specs:
+            for state_name in conditions:
+                vals = np.asarray(per_cell_metric_values[metric_key][state_name], dtype=float)
+                cell_burst_values[metric_key][state_name].append(vals.copy())
+                cell_means[metric_key][state_name].append(float(np.nanmean(vals)) if vals.size > 0 else np.nan)
+
+    for metric_key, _ in metric_specs:
+        for state_name in conditions:
+            cell_means[metric_key][state_name] = np.asarray(cell_means[metric_key][state_name], dtype=float)
+
+    return pooled, cell_means, cell_burst_values, eligible_cells
+
+
+def _classify_quiet_moving_cell_outcomes(
+    cell_burst_values,
+    metric_specs,
+    alpha: float = 0.05,
+):
+    outcome_counts = {}
+    for metric_key, _ in metric_specs:
+        counts = {
+            'quiet_higher': 0,
+            'moving_higher': 0,
+            'nonsig': 0,
+        }
+        quiet_arrays = cell_burst_values[metric_key]['quiet']
+        moving_arrays = cell_burst_values[metric_key]['moving']
+        for quiet_vals, moving_vals in zip(quiet_arrays, moving_arrays):
+            p_val, _ = _unpaired_test_bursts(quiet_vals, moving_vals)
+            quiet_mean = float(np.nanmean(quiet_vals)) if np.asarray(quiet_vals).size > 0 else np.nan
+            moving_mean = float(np.nanmean(moving_vals)) if np.asarray(moving_vals).size > 0 else np.nan
+
+            if np.isfinite(p_val) and p_val < float(alpha) and np.isfinite(quiet_mean) and np.isfinite(moving_mean):
+                if quiet_mean > moving_mean:
+                    counts['quiet_higher'] += 1
+                elif moving_mean > quiet_mean:
+                    counts['moving_higher'] += 1
+                else:
+                    counts['nonsig'] += 1
             else:
-                verts[:, 0] = np.clip(verts[:, 0], pos, np.inf)
-            body.set_facecolor(color)
-            body.set_edgecolor('none')
-            body.set_alpha(alpha)
-            if 'cmedians' in vp:
-                segs = vp['cmedians'].get_segments()
-                if len(segs) > 0:
-                    seg = segs[0].copy()
-                    if side == 'left':
-                        seg[:, 0] = np.clip(seg[:, 0], -np.inf, pos)
-                    else:
-                        seg[:, 0] = np.clip(seg[:, 0], pos, np.inf)
-                    vp['cmedians'].set_segments([seg])
-                vp['cmedians'].set_color('#1F77B4')
-                vp['cmedians'].set_linewidth(1.0)
+                counts['nonsig'] += 1
+        outcome_counts[metric_key] = counts
+    return outcome_counts
 
-            finite_mask = np.isfinite(d)
-            n_finite = np.sum(finite_mask)
-            if n_finite > 0:
-                d_finite = d[finite_mask]
-                max_dots = 200
-                if n_finite > max_dots:
-                    idx_sub = rng.choice(n_finite, max_dots, replace=False)
-                    d_plot = d_finite[idx_sub]
-                else:
-                    d_plot = d_finite
-                y_range = np.ptp(d_plot) if len(d_plot) > 1 else 1.0
-                y_spacing = y_range * 0.04
-                x_step = 0.06
-                sorted_idx = np.argsort(d_plot)
-                xs_bee = np.zeros(len(d_plot))
-                for si, oi in enumerate(sorted_idx):
-                    layer = 0
-                    while True:
-                        candidate = x_step * layer
-                        conflict = False
-                        for sj in range(si):
-                            oj = sorted_idx[sj]
-                            if abs(d_plot[oi] - d_plot[oj]) < y_spacing:
-                                if abs(candidate - xs_bee[oj]) < x_step * 0.9:
-                                    conflict = True
-                                    break
-                        if not conflict:
-                            xs_bee[oi] = candidate
-                            break
-                        layer += 1
-                if side == 'left':
-                    xs = pos + 0.05 + xs_bee
-                else:
-                    xs = pos - 0.05 - xs_bee
-                ax.scatter(xs, d_plot, s=4, color='black', alpha=0.4, linewidths=0, zorder=3)
 
-        p_val, _ = _unpaired_test_bursts(vals_in, vals_out)
-        sig_label = _sig_label(p_val)
-        if sig_label:
-            ax.text(1.5, 0.99, sig_label, ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
+def _plot_complex_burst_metric_distribution_panels(
+    burst_data_all,
+    cell_rows,
+    metric_specs,
+    save_path: str,
+    state_key: str = 'run',
+):
+    panel_w = 1.1
+    panel_h = 1.1
+    n_rows = 1 + len(cell_rows)
+    fig, axes = plt.subplots(
+        n_rows,
+        len(metric_specs),
+        figsize=(panel_w * len(metric_specs), panel_h * n_rows),
+        sharex='col',
+        sharey=False,
+    )
+    if len(metric_specs) == 1:
+        axes = np.asarray(axes).reshape(n_rows, 1)
+    elif n_rows == 1:
+        axes = np.asarray(axes).reshape(1, len(metric_specs))
 
-        ax.set_xticks([1, 2])
-        ax.set_xticklabels(condition_labels, fontsize=5, fontname='Arial')
-        ax.set_xlim(0.5, 2.5)
-        ax.set_ylabel(ylabel, fontsize=6, fontname='Arial')
-        ax.tick_params(labelsize=5)
-        ylim = burst_ylim.get(metric_key)
-        if ylim is not None:
-            ax.set_ylim(*ylim)
-        for label in list(ax.get_yticklabels()):
-            label.set_fontname('Arial')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+    conds = [f'{state_key}_in', f'{state_key}_out']
+    axis_configs = {}
+    for metric_key, _ in metric_specs:
+        all_arrays = [
+            burst_data_all[metric_key][conds[0]],
+            burst_data_all[metric_key][conds[1]],
+        ]
+        for row in cell_rows:
+            all_arrays.append(row['data'][metric_key][conds[0]])
+            all_arrays.append(row['data'][metric_key][conds[1]])
+        axis_configs[metric_key] = _compute_hist_axis_config(
+            metric_key,
+            all_arrays,
+        )
 
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    for ax_idx, (metric_key, xlabel) in enumerate(metric_specs):
+        top_vals_in = burst_data_all[metric_key][conds[0]]
+        top_vals_out = burst_data_all[metric_key][conds[1]]
+        p_val_top, _ = _unpaired_test_bursts(top_vals_in, top_vals_out)
+        _plot_overlapping_hist_panel(
+            axes[0, ax_idx],
+            top_vals_in,
+            top_vals_out,
+            axis_configs[metric_key],
+            xlabel=xlabel,
+            ylabel='% of bursts' if ax_idx == 0 else '',
+            sig_label=_sig_label(p_val_top),
+            show_legend=(ax_idx == 0),
+        )
+
+        for row_idx, row in enumerate(cell_rows, start=1):
+            bottom_vals_in = row['data'][metric_key][conds[0]]
+            bottom_vals_out = row['data'][metric_key][conds[1]]
+            p_val_bottom, _ = _unpaired_test_bursts(bottom_vals_in, bottom_vals_out)
+            _plot_overlapping_hist_panel(
+                axes[row_idx, ax_idx],
+                bottom_vals_in,
+                bottom_vals_out,
+                axis_configs[metric_key],
+                xlabel=xlabel,
+                ylabel='% of bursts' if ax_idx == 0 else '',
+                sig_label=_sig_label(p_val_bottom),
+                show_legend=False,
+            )
+    plt.tight_layout(rect=[0, 0, 1, 0.985])
+
+    row_labels = ['Pooled'] + [row['label'] for row in cell_rows]
+    for row_idx, row_label in enumerate(row_labels):
+        left_ax = axes[row_idx, 0]
+        right_ax = axes[row_idx, -1]
+        pos_left = left_ax.get_position()
+        pos_right = right_ax.get_position()
+        x_center = 0.5 * (pos_left.x0 + pos_right.x1)
+        y_top = pos_left.y1 + 0.006
+        fig.text(
+            x_center,
+            y_top,
+            row_label,
+            ha='center',
+            va='bottom',
+            fontsize=5,
+            fontname='Arial',
+        )
+
+    fig.savefig(save_path, dpi=300)
+    return fig
+
+
+def plot_complex_burst_metrics_allbursts_csplus(
+    plcs_csplus,
+    save_path: str,
+    state_key: str = 'run',
+    min_bursts_per_condition: int = 3,
+):
+    burst_metric_specs = [
+        ('n_spikes', 'Spks./burst'),
+        ('peak_amp', 'Peak amp'),
+        ('duration_ms', 'Duration (ms)'),
+        ('auc', 'AUC'),
+    ]
+    burst_data_all, _ = _collect_complex_burst_metric_pools(
+        plcs_csplus,
+        burst_metric_specs,
+        min_bursts_per_condition=min_bursts_per_condition,
+    )
+    return _plot_complex_burst_metric_distribution_panels(
+        burst_data_all,
+        [],
+        burst_metric_specs,
+        save_path=save_path,
+        state_key=state_key,
+    )
+
+def plot_complex_burst_metric_distributions_csplus(
+    plcs_csplus,
+    save_path: str,
+    state_key: str = 'run',
+    min_bursts_per_condition: int = 3,
+):
+    """Plot pooled and per-cell complex-burst metric distributions for CS+ place cells."""
+    burst_metric_specs = [
+        ('n_spikes', 'Spks./burst'),
+        ('peak_amp', 'Peak amp'),
+        ('duration_ms', 'Duration (ms)'),
+        ('auc', 'AUC'),
+    ]
+    burst_data_all, _ = _collect_complex_burst_metric_pools(
+        plcs_csplus,
+        burst_metric_specs,
+        min_bursts_per_condition=min_bursts_per_condition,
+    )
+    cell_rows = _collect_complex_burst_metric_cell_rows(
+        plcs_csplus,
+        burst_metric_specs,
+        state_key=state_key,
+        min_bursts_per_condition=min_bursts_per_condition,
+    )
+    return _plot_complex_burst_metric_distribution_panels(
+        burst_data_all,
+        cell_rows,
+        burst_metric_specs,
+        save_path=save_path,
+        state_key=state_key,
+    )
+
+
+def plot_complex_burst_metric_distributions_quiet_vs_moving_allcells(
+    plcs_csplus,
+    plcs_csminus,
+    non_plcs,
+    save_path: str,
+    speed_threshold_cm_s: float = 3.0,
+    min_bursts_per_state: int = 10,
+    plot_mode: str = 'cumulative',
+    fig_width: float = 4.4,
+    fig_height: float = 3.15,
+):
+    """Plot pooled complex-burst metric distributions for quiet vs moving across all cell categories."""
+    metric_specs = [
+        ('n_spikes', 'Spks./burst'),
+        ('peak_amp', 'Peak amp'),
+        ('duration_ms', 'Duration (ms)'),
+        ('auc', 'AUC'),
+    ]
+    pooled, cell_means, cell_burst_values, eligible_cells = _collect_complex_burst_metric_pools_quiet_vs_moving_allcells(
+        plcs_csplus,
+        plcs_csminus,
+        non_plcs,
+        metric_specs,
+        speed_threshold_cm_s=speed_threshold_cm_s,
+        min_bursts_per_state=min_bursts_per_state,
+    )
+    outcome_counts = _classify_quiet_moving_cell_outcomes(
+        cell_burst_values,
+        metric_specs,
+    )
+
+    fig, axes = plt.subplots(
+        3,
+        len(metric_specs),
+        figsize=(fig_width, fig_height),
+        sharex=False,
+        sharey=False,
+        gridspec_kw={'height_ratios': [1.2, 1.15, 0.8]},
+    )
+    axes = np.asarray(axes)
+    if len(metric_specs) == 1:
+        axes = axes.reshape(3, 1)
+
+    axis_configs = {}
+    metric_ylims = {}
+    for metric_key, _ in metric_specs:
+        axis_configs[metric_key] = _compute_hist_axis_config(
+            metric_key,
+            [pooled[metric_key]['quiet'], pooled[metric_key]['moving']],
+        )
+        metric_ylims[metric_key] = _global_ylim(
+            [cell_means[metric_key]['quiet'], cell_means[metric_key]['moving']],
+        )
+
+    for ax_idx, (metric_key, xlabel) in enumerate(metric_specs):
+        vals_quiet = np.asarray(pooled[metric_key]['quiet'], dtype=float)
+        vals_moving = np.asarray(pooled[metric_key]['moving'], dtype=float)
+        p_val_hist, _ = _unpaired_test_bursts(vals_quiet, vals_moving)
+        _plot_overlapping_hist_panel(
+            axes[0, ax_idx],
+            vals_in=vals_moving,
+            vals_out=vals_quiet,
+            axis_config=axis_configs[metric_key],
+            xlabel=xlabel,
+            ylabel='% of bursts' if ax_idx == 0 else '',
+            sig_label=_sig_label(p_val_hist),
+            show_legend=(ax_idx == 0),
+            legend_loc='upper right',
+            first_label='Quiet',
+            second_label='Moving',
+            first_color='#563C25',
+            second_color='#F9E800',
+            background_color=None,
+            plot_mode=plot_mode,
+            fill_alpha=0.18,
+        )
+
+        mean_quiet = np.asarray(cell_means[metric_key]['quiet'], dtype=float)
+        mean_moving = np.asarray(cell_means[metric_key]['moving'], dtype=float)
+        p_val_violin, _, _, _, _ = _paired_test(mean_moving, mean_quiet)
+        _plot_paired_violin_panel(
+            axes[1, ax_idx],
+            vals_first=mean_moving,
+            vals_second=mean_quiet,
+            ylabel=xlabel,
+            sig_label=_sig_label(p_val_violin),
+            first_label='Loco.',
+            second_label='Quiet',
+            first_color='#F9E800',
+            second_color='#563C25',
+            background_color=None,
+            ylim=metric_ylims[metric_key],
+        )
+
+        _plot_stacked_outcome_bar(
+            axes[2, ax_idx],
+            outcome_counts[metric_key],
+            total_count=eligible_cells,
+            ylabel='Cells' if ax_idx == 0 else '',
+            show_legend=False,
+        )
+
+    if axes.size > 0:
+        axes[0, 0].text(
+            0.0,
+            1.08,
+            f'Eligible cells: {eligible_cells}',
+            ha='left',
+            va='bottom',
+            fontsize=5,
+            fontname='Arial',
+            transform=axes[0, 0].transAxes,
+        )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    if axes.size > 0:
+        top_left = axes[0, 0].get_position()
+        top_right = axes[0, -1].get_position()
+        bottom_left = axes[1, 0].get_position()
+        bottom_right = axes[1, -1].get_position()
+        summary_left = axes[2, 0].get_position()
+        summary_right = axes[2, -1].get_position()
+        fig.text(
+            0.5 * (top_left.x0 + top_right.x1),
+            top_left.y1 + 0.008,
+            'All CBs pooled',
+            ha='center',
+            va='bottom',
+            fontsize=5,
+            fontname='Arial',
+        )
+        fig.text(
+            0.5 * (bottom_left.x0 + bottom_right.x1),
+            bottom_left.y1 + 0.008,
+            f'Per-cell mean (paired, n={eligible_cells})',
+            ha='center',
+            va='bottom',
+            fontsize=5,
+            fontname='Arial',
+        )
+        fig.text(
+            0.5 * (summary_left.x0 + summary_right.x1),
+            summary_left.y1 + 0.008,
+            f'Per-cell burst test outcome (n={eligible_cells})',
+            ha='center',
+            va='bottom',
+            fontsize=5,
+            fontname='Arial',
+        )
     fig.savefig(save_path, dpi=300)
     return fig
 
@@ -1583,7 +2351,16 @@ def _add_bracket_compact(ax, x1, x2, y, h, text, color='black'):
     ax.text((x1 + x2) / 2, y + h + 0.003, text, ha='center', va='bottom', fontsize=5, color=color)
 
 
-def _plot_inout_panel(df_cs_plc, df_non_cs_plc, prefix: str, ylabel: str, title: str, save_path: str):
+def _plot_inout_panel(
+    df_cs_plc,
+    df_non_cs_plc,
+    prefix: str,
+    ylabel: str,
+    title: str,
+    save_path: str,
+    fig_width: float = 1.4,
+    fig_height: float = 1.5,
+):
     in_color = 'magenta'
     out_color = 'gray'
 
@@ -1595,7 +2372,7 @@ def _plot_inout_panel(df_cs_plc, df_non_cs_plc, prefix: str, ylabel: str, title:
     csminus_in_paired = df_csminus_paired[f'{prefix}_loco_in'].values
     csminus_out_paired = df_csminus_paired[f'{prefix}_loco_out'].values
 
-    fig, ax = plt.subplots(1, 1, figsize=(1.4, 1.5))
+    fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
     ax.axvspan(0.5, 2.5, alpha=0.3, color=CS_PLC_BG, zorder=0)
     ax.axvspan(3.0, 5.0, alpha=0.3, color=NON_CS_PLC_BG, zorder=0)
 
@@ -1713,7 +2490,13 @@ def _plot_inout_panel(df_cs_plc, df_non_cs_plc, prefix: str, ylabel: str, title:
     return fig
 
 
-def plot_theta_inout_loco_csplus_vs_csminus(df_cs_plc: pd.DataFrame, df_non_cs_plc: pd.DataFrame, save_path: str):
+def plot_theta_inout_loco_csplus_vs_csminus(
+    df_cs_plc: pd.DataFrame,
+    df_non_cs_plc: pd.DataFrame,
+    save_path: str,
+    fig_width: float = 1.4,
+    fig_height: float = 1.5,
+):
     return _plot_inout_panel(
         df_cs_plc,
         df_non_cs_plc,
@@ -1721,10 +2504,18 @@ def plot_theta_inout_loco_csplus_vs_csminus(df_cs_plc: pd.DataFrame, df_non_cs_p
         ylabel='Theta amp',
         title='Locomotion',
         save_path=save_path,
+        fig_width=fig_width,
+        fig_height=fig_height,
     )
 
 
-def plot_slow_vm_inout_loco_csplus_vs_csminus(df_cs_plc: pd.DataFrame, df_non_cs_plc: pd.DataFrame, save_path: str):
+def plot_slow_vm_inout_loco_csplus_vs_csminus(
+    df_cs_plc: pd.DataFrame,
+    df_non_cs_plc: pd.DataFrame,
+    save_path: str,
+    fig_width: float = 1.4,
+    fig_height: float = 1.5,
+):
     return _plot_inout_panel(
         df_cs_plc,
         df_non_cs_plc,
@@ -1732,4 +2523,6 @@ def plot_slow_vm_inout_loco_csplus_vs_csminus(df_cs_plc: pd.DataFrame, df_non_cs
         ylabel='Slow Vm',
         title='Locomotion',
         save_path=save_path,
+        fig_width=fig_width,
+        fig_height=fig_height,
     )
