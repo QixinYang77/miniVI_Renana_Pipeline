@@ -2,7 +2,8 @@
 """
 Step 1 of 3: Prepare for parallel egocentric analysis.
 
-- Ensures per-animal cache exists (spatial_analysis_full.pkl etc.)
+- Uses compact per-animal cluster_refined_spatial_classification.pkl files
+  unpacked from the local refined bundle.
 - Builds a cell manifest listing every (category, animal_id, cell_idx)
   that will be analyzed.
 - Saves the manifest as JSON so array tasks can pick their cell by index.
@@ -12,6 +13,7 @@ Submitted by HPC_egocentric_job_submission.ipynb via sbatch.
 import argparse
 import json
 import os
+import pickle
 import sys
 from pathlib import Path
 
@@ -29,6 +31,7 @@ os.environ['PYTHONPATH'] = str(HERE)
 from notebooks_HPC.egocentric_refined_config import (
     ANIMALS,
     CLUSTER_REFINED_METADATA_FILENAME,
+    CLUSTER_SPATIAL_CLASSIFICATION_FILENAME,
     DEFAULT_CATEGORIES,
     build_refined_config,
 )
@@ -38,7 +41,13 @@ from utils.placecell_pipeline import (
     _get_spatial_category_cells,
     _normalize_pf_category_name,
 )
-from utils.spatial_heatmaps import classify_spatial_cells
+from utils.spatial_heatmaps import (
+    SpatialCategoryData,
+    cell_has_cs_place_field,
+    classify_spatial_cells,
+    is_csplus_place_cell,
+    normalize_cs_plc_definition_mode,
+)
 
 
 def _path_record(path: Path) -> dict:
@@ -74,6 +83,7 @@ def collect_data_source_records(config):
             'runtime_merged_data': None,
             'manual_spike_sidecar': _path_record(animal_dir / 'manual_spike_detection_results.pkl'),
             'cluster_refined_metadata': _path_record(animal_dir / CLUSTER_REFINED_METADATA_FILENAME),
+            'cluster_spatial_classification': _path_record(animal_dir / CLUSTER_SPATIAL_CLASSIFICATION_FILENAME),
             'spatial_analysis_full': _path_record(animal_dir / 'spatial_analysis_full.pkl'),
             'animal_cache_bundle': _path_record(animal_dir / 'animal_cache_bundle_v1.pkl'),
         }
@@ -88,18 +98,82 @@ def collect_data_source_records(config):
     return records
 
 
-def validate_exported_spatial_analysis_files(config):
+def validate_exported_spatial_classification_files(config):
     missing = []
     for animal_id in config.animals:
-        spatial_path = config.data_root / animal_id / 'spatial_analysis_full.pkl'
+        spatial_path = config.data_root / animal_id / CLUSTER_SPATIAL_CLASSIFICATION_FILENAME
         if not spatial_path.exists():
             missing.append(spatial_path)
     if missing:
         raise FileNotFoundError(
-            'Missing exported spatial classification files. Run Step 0 unpack first, '
+            'Missing exported cluster spatial classification files. Run Step 0 unpack first, '
             'or rerun this script with --force-recompute when full trace data are available: '
             + ', '.join(str(p) for p in missing)
         )
+
+
+def load_exported_spatial_category_data(config):
+    """Load compact local-derived spatial classification files from Step 0 unpack."""
+    valid_spatial_cells = []
+    cb_in_pf_counts = {}
+    data_folder_abs = os.path.abspath(str(config.data_root))
+    mode = normalize_cs_plc_definition_mode(config.pooled.cs_plc_definition_mode)
+
+    for animal_id in config.animals:
+        spatial_path = config.data_root / animal_id / CLUSTER_SPATIAL_CLASSIFICATION_FILENAME
+        with spatial_path.open('rb') as f:
+            cells = pickle.load(f)
+        if not isinstance(cells, list):
+            raise ValueError(f'{spatial_path} is not a list')
+
+        loaded = 0
+        for raw_cell in cells:
+            if not isinstance(raw_cell, dict):
+                continue
+            cell = dict(raw_cell)
+            cell_idx = int(cell.get('cell_idx', -1))
+            if cell_idx < 0:
+                continue
+            cell['session'] = animal_id
+            cell['data_folder'] = data_folder_abs
+            n_cb = int(cell.get('n_cb_in_pf', 0) or 0)
+            has_cs_pf = cell_has_cs_place_field(cell)
+            cell['n_cb_in_pf'] = n_cb
+            cell['has_cs_place_field'] = has_cs_pf
+            cell['cs_plc_definition_mode'] = mode
+            cell['is_cs_plc'] = is_csplus_place_cell(
+                is_place_cell=bool(cell.get('is_place_cell', False)),
+                n_cb_in_pf=n_cb,
+                cs_peak_rate=float(cell.get('cs_peak_rate', float('nan'))),
+                cb_num_threshold=int(config.pooled.cb_num_threshold),
+                cs_peak_rate_threshold=float(config.pooled.cs_peak_rate_threshold),
+                has_cs_place_field=has_cs_pf,
+                cs_plc_definition_mode=mode,
+            )
+            valid_spatial_cells.append(cell)
+            cb_in_pf_counts[(animal_id, cell_idx)] = n_cb
+            loaded += 1
+        print(f'Loaded {loaded} classified cells from {animal_id}')
+
+    plcs_csplus, plcs_csminus, non_plcs = [], [], []
+    for cell in valid_spatial_cells:
+        if bool(cell.get('is_place_cell', False)):
+            if bool(cell.get('is_cs_plc', False)):
+                plcs_csplus.append(cell)
+            else:
+                plcs_csminus.append(cell)
+        else:
+            non_plcs.append(cell)
+
+    print(f'\nTotal: {len(valid_spatial_cells)} classified cells loaded')
+    return SpatialCategoryData(
+        valid_spatial_cells=valid_spatial_cells,
+        plcs_csplus=plcs_csplus,
+        plcs_csminus=plcs_csminus,
+        non_plcs=non_plcs,
+        deleted_cells=set(),
+        cb_in_pf_counts=cb_in_pf_counts,
+    )
 
 
 def build_config(data_root, figures_root, force_recompute=False):
@@ -130,24 +204,27 @@ def main():
         for st in statuses:
             print(f'  [{st.action}] {st.animal_id}')
     else:
-        print('--- Reusing exported spatial classification files; cache recomputation skipped ---')
-        validate_exported_spatial_analysis_files(config)
+        print('--- Reusing exported cluster spatial classification files; cache recomputation skipped ---')
+        validate_exported_spatial_classification_files(config)
         for animal_id in config.animals:
-            print(f'  [reused_exported_spatial] {animal_id}')
+            print(f'  [reused_exported_spatial_classification] {animal_id}')
 
     data_sources = collect_data_source_records(config)
     source_by_animal = {rec['animal_id']: rec for rec in data_sources}
 
     # Step 2: Load spatial data
-    print('\n--- Loading spatial data ---')
-    spatial_data = classify_spatial_cells(
-        data_folder=str(config.data_root),
-        folders=config.animals,
-        cb_num_threshold=config.pooled.cb_num_threshold,
-        cs_peak_rate_threshold=config.pooled.cs_peak_rate_threshold,
-        cs_plc_definition_mode=config.pooled.cs_plc_definition_mode,
-        snr_threshold=config.analysis.snr_threshold,
-    )
+    print('\n--- Loading spatial classification data ---')
+    if args.force_recompute:
+        spatial_data = classify_spatial_cells(
+            data_folder=str(config.data_root),
+            folders=config.animals,
+            cb_num_threshold=config.pooled.cb_num_threshold,
+            cs_peak_rate_threshold=config.pooled.cs_peak_rate_threshold,
+            cs_plc_definition_mode=config.pooled.cs_plc_definition_mode,
+            snr_threshold=config.analysis.snr_threshold,
+        )
+    else:
+        spatial_data = load_exported_spatial_category_data(config)
     print(f'  CS+ PLCs:  {len(spatial_data.plcs_csplus)}')
     print(f'  CS- PLCs:  {len(spatial_data.plcs_csminus)}')
     print(f'  Non-PLCs:  {len(spatial_data.non_plcs)}')
@@ -173,8 +250,13 @@ def main():
                 'runtime_merged_data_file': (
                     source_meta.get('runtime_merged_data') or {}
                 ).get('path', ''),
+                'spatial_classification_file': (
+                    source_meta.get('cluster_spatial_classification') or {}
+                ).get('path', ''),
                 'spatial_analysis_file': (
-                    source_meta.get('spatial_analysis_full') or {}
+                    source_meta.get('cluster_spatial_classification')
+                    or source_meta.get('spatial_analysis_full')
+                    or {}
                 ).get('path', ''),
             })
 

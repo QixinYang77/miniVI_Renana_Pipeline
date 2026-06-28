@@ -30,6 +30,7 @@ os.environ['PYTHONPATH'] = str(HERE)
 
 from notebooks_HPC.egocentric_refined_config import (
     ANIMALS,
+    CLUSTER_SPATIAL_CLASSIFICATION_FILENAME,
     DEFAULT_DIRECTION_MODE,
     DEFAULT_FIRST_N_MINUTES,
     build_refined_config,
@@ -40,9 +41,22 @@ from utils.placecell_pipeline import (
     _resolve_merged_data_path,
     _load_merged_data,
     _prepare_native_analysis_context,
-    _load_spatial_analysis_by_idx,
     _passes_egocentric_category_gate,
 )
+
+
+def load_spatial_classification_by_idx(animal_dir):
+    spatial_path = animal_dir / CLUSTER_SPATIAL_CLASSIFICATION_FILENAME
+    if not spatial_path.exists():
+        raise FileNotFoundError(f'Missing {CLUSTER_SPATIAL_CLASSIFICATION_FILENAME} for {animal_dir.name}')
+    with spatial_path.open('rb') as f:
+        cells = pickle.load(f)
+    out = {}
+    if isinstance(cells, list):
+        for item in cells:
+            if isinstance(item, dict) and 'cell_idx' in item:
+                out[int(item['cell_idx'])] = item
+    return out
 
 
 def build_config(data_root, figures_root):
@@ -135,13 +149,15 @@ def main():
         print(f"Manifest runtime merged data: {cell_info['runtime_merged_data_file']}")
     if cell_info.get('cache_merged_data_file'):
         print(f"Manifest cache merged data:   {cell_info['cache_merged_data_file']}")
+    if cell_info.get('spatial_classification_file'):
+        print(f"Manifest spatial class file:  {cell_info['spatial_classification_file']}")
     try:
         resolved_data_path = _resolve_merged_data_path(animal_dir, config)
         print(f'Resolved runtime merged data: {resolved_data_path}')
-        print(f'Spatial analysis file:        {animal_dir / "spatial_analysis_full.pkl"}')
+        print(f'Spatial classification file:  {animal_dir / CLUSTER_SPATIAL_CLASSIFICATION_FILENAME}')
         merged = _load_merged_data(animal_dir, config)
         ctx = _prepare_native_analysis_context(merged, config, require_traces=False)
-        spatial_by_idx = _load_spatial_analysis_by_idx(animal_dir)
+        spatial_by_idx = load_spatial_classification_by_idx(animal_dir)
     except Exception as exc:
         _save_skip(out_file, category, animal_id, cell_idx, f'data_load_failed({exc})')
         return
@@ -149,7 +165,7 @@ def main():
     # Validate cell
     analysis = spatial_by_idx.get(cell_idx)
     if not isinstance(analysis, dict):
-        _save_skip(out_file, category, animal_id, cell_idx, 'missing_spatial_analysis')
+        _save_skip(out_file, category, animal_id, cell_idx, 'missing_spatial_classification')
         return
 
     pass_gate, gate_reason = _passes_egocentric_category_gate(category=category, analysis=analysis)

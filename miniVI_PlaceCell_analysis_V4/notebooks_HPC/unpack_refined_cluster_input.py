@@ -23,8 +23,8 @@ os.environ["PYTHONPATH"] = str(HERE)
 REFINED_CLUSTER_INPUT_SCHEMA_VERSION = 1
 CLUSTER_REFINED_INPUT_FILENAME = "cluster_refined_analysis_data.pkl"
 CLUSTER_REFINED_METADATA_FILENAME = "cluster_refined_analysis_metadata.json"
-CLUSTER_SPATIAL_ANALYSIS_FILENAME = "spatial_analysis_full.pkl"
-CLUSTER_SPATIAL_METADATA_FILENAME = "spatial_analysis_cluster_metadata.json"
+CLUSTER_SPATIAL_CLASSIFICATION_FILENAME = "cluster_refined_spatial_classification.pkl"
+CLUSTER_SPATIAL_CLASSIFICATION_METADATA_FILENAME = "cluster_refined_spatial_classification_metadata.json"
 
 
 def _format_first_bytes(data: bytes) -> str:
@@ -147,8 +147,8 @@ def unpack_bundle(
         animal_dir = data_root / animal_id
         out_pickle = animal_dir / CLUSTER_REFINED_INPUT_FILENAME
         out_meta = animal_dir / CLUSTER_REFINED_METADATA_FILENAME
-        out_spatial = animal_dir / CLUSTER_SPATIAL_ANALYSIS_FILENAME
-        out_spatial_meta = animal_dir / CLUSTER_SPATIAL_METADATA_FILENAME
+        out_spatial = animal_dir / CLUSTER_SPATIAL_CLASSIFICATION_FILENAME
+        out_spatial_meta = animal_dir / CLUSTER_SPATIAL_CLASSIFICATION_METADATA_FILENAME
         if not validate_only and not force:
             existing = [p for p in (out_pickle, out_meta, out_spatial, out_spatial_meta) if p.exists()]
             if existing:

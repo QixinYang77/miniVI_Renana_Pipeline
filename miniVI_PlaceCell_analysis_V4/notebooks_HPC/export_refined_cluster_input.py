@@ -27,7 +27,8 @@ from notebooks_HPC.egocentric_refined_config import (
     ANIMALS,
     CLUSTER_REFINED_BUNDLE_FILENAME,
     CLUSTER_REFINED_INPUT_FILENAME,
-    CLUSTER_SPATIAL_ANALYSIS_FILENAME,
+    CLUSTER_SPATIAL_CLASSIFICATION_FILENAME,
+    LOCAL_SPATIAL_ANALYSIS_FILENAME,
     MANUAL_REFINED_SIDECAR_FILENAME,
     REFINED_BEHAVIOR_FILENAME,
     REFINED_CLUSTER_INPUT_SCHEMA_VERSION,
@@ -321,6 +322,7 @@ def egocentric_refined_payload_for_cluster(refined: dict[str, Any]) -> tuple[dic
         "float32_keys": list(EGOCENTRIC_FLOAT32_KEYS),
         "precomputed_bad_masks": True,
         "runtime_data_filename": CLUSTER_REFINED_INPUT_FILENAME,
+        "runtime_spatial_classification_filename": CLUSTER_SPATIAL_CLASSIFICATION_FILENAME,
     }
     slimmed["cluster_export_slimming"] = report
     return slimmed, report
@@ -347,10 +349,10 @@ def _minimal_spatial_cell(cell: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_minimal_spatial_analysis(animal_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    spatial_path = animal_dir / CLUSTER_SPATIAL_ANALYSIS_FILENAME
+    spatial_path = animal_dir / LOCAL_SPATIAL_ANALYSIS_FILENAME
     if not spatial_path.exists():
         raise FileNotFoundError(
-            f"Missing local {CLUSTER_SPATIAL_ANALYSIS_FILENAME} for {animal_dir.name}. "
+            f"Missing local {LOCAL_SPATIAL_ANALYSIS_FILENAME} for {animal_dir.name}. "
             "Run the refined notebook/place-cell cache locally before exporting the cluster bundle."
         )
     with spatial_path.open("rb") as f:
@@ -364,6 +366,7 @@ def _load_minimal_spatial_analysis(animal_dir: Path) -> tuple[list[dict[str, Any
         "n_cells": int(len(minimal)),
         "array_bytes": int(_array_nbytes_recursive(minimal)),
         "profile": "spatial_classification_minimal_v1",
+        "cluster_output_filename": CLUSTER_SPATIAL_CLASSIFICATION_FILENAME,
     }
 
 
@@ -437,7 +440,7 @@ def build_bundle(
         source_files[animal_id] = {
             MANUAL_REFINED_SIDECAR_FILENAME: _file_record(animal_dir / MANUAL_REFINED_SIDECAR_FILENAME),
             REFINED_BEHAVIOR_FILENAME: _file_record(animal_dir / REFINED_BEHAVIOR_FILENAME),
-            CLUSTER_SPATIAL_ANALYSIS_FILENAME: _file_record(animal_dir / CLUSTER_SPATIAL_ANALYSIS_FILENAME),
+            LOCAL_SPATIAL_ANALYSIS_FILENAME: _file_record(animal_dir / LOCAL_SPATIAL_ANALYSIS_FILENAME),
         }
         if include_data:
             animal_payloads[animal_id] = refined
