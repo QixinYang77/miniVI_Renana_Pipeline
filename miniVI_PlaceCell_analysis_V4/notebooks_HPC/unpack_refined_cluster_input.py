@@ -20,16 +20,78 @@ sys.path[:] = [
 sys.path.insert(0, str(HERE))
 os.environ["PYTHONPATH"] = str(HERE)
 
-from notebooks_HPC.egocentric_refined_config import (
-    CLUSTER_REFINED_INPUT_FILENAME,
-    CLUSTER_REFINED_METADATA_FILENAME,
-    REFINED_CLUSTER_INPUT_SCHEMA_VERSION,
-)
+REFINED_CLUSTER_INPUT_SCHEMA_VERSION = 1
+CLUSTER_REFINED_INPUT_FILENAME = "cluster_refined_analysis_data.pkl"
+CLUSTER_REFINED_METADATA_FILENAME = "cluster_refined_analysis_metadata.json"
+
+
+def _format_first_bytes(data: bytes) -> str:
+    return data.hex(" ") if data else "<empty>"
+
+
+def _bundle_file_diagnostics(path: Path) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "path": str(path),
+        "exists": bool(path.exists()),
+        "is_file": bool(path.is_file()),
+    }
+    if not path.exists() or not path.is_file():
+        return info
+    stat = path.stat()
+    with path.open("rb") as f:
+        first_bytes = f.read(16)
+    info.update(
+        {
+            "size_bytes": int(stat.st_size),
+            "first_bytes_hex": _format_first_bytes(first_bytes),
+            "first_bytes_repr": repr(first_bytes),
+        }
+    )
+    return info
+
+
+def _print_bundle_file_diagnostics(path: Path) -> dict[str, Any]:
+    info = _bundle_file_diagnostics(path)
+    print(f"Bundle path: {info['path']}")
+    print(f"Exists:      {info['exists']}")
+    print(f"Is file:     {info['is_file']}")
+    if info.get("is_file"):
+        print(f"Size bytes:  {info['size_bytes']}")
+        print(f"First bytes: {info['first_bytes_hex']}")
+    return info
+
+
+def _validate_bundle_file_header(path: Path) -> dict[str, Any]:
+    info = _bundle_file_diagnostics(path)
+    if not info["exists"]:
+        raise FileNotFoundError(f"Missing bundle file: {path}")
+    if not info["is_file"]:
+        raise ValueError(f"Bundle path is not a regular file: {path}")
+    if int(info["size_bytes"]) <= 0:
+        raise ValueError(f"Bundle file is empty: {path}")
+    first_hex = str(info.get("first_bytes_hex", ""))
+    if first_hex.startswith("00"):
+        raise ValueError(
+            "Bundle file starts with 0x00, so it is not a valid pickle. "
+            "This usually means the copied file is corrupted, incomplete, or zero-filled. "
+            f"Re-copy the local bundle to the cluster destination. Diagnostics: {info}"
+        )
+    return info
 
 
 def _load_bundle(path: Path) -> dict[str, Any]:
-    with path.open("rb") as f:
-        bundle = pickle.load(f)
+    _print_bundle_file_diagnostics(path)
+    _validate_bundle_file_header(path)
+    try:
+        with path.open("rb") as f:
+            bundle = pickle.load(f)
+    except (EOFError, pickle.UnpicklingError) as exc:
+        info = _bundle_file_diagnostics(path)
+        raise ValueError(
+            "Failed to unpickle refined cluster bundle. "
+            "The bundle is likely corrupted or incompletely copied. "
+            f"Re-copy the local bundle and rerun. Diagnostics: {info}"
+        ) from exc
     if not isinstance(bundle, dict):
         raise ValueError(f"Bundle is not a dict: {path}")
     schema_version = int(bundle.get("schema_version", -1))
@@ -101,8 +163,19 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, default=HERE / "data")
     parser.add_argument("--animals", nargs="+", default=None, help="Optional subset to unpack")
     parser.add_argument("--force", action="store_true", help="Overwrite existing per-animal outputs")
+    parser.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="Print bundle file size/header diagnostics without loading or unpacking it",
+    )
     parser.add_argument("--validate-only", action="store_true", help="Validate bundle and planned paths only")
     args = parser.parse_args()
+
+    if args.inspect_only:
+        _print_bundle_file_diagnostics(args.bundle)
+        _validate_bundle_file_header(args.bundle)
+        print("[INSPECT ONLY] Bundle file exists and does not start with zero bytes.")
+        return
 
     written = unpack_bundle(
         bundle_path=args.bundle,
