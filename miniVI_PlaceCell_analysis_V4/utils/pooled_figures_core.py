@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import pickle
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -12,9 +13,12 @@ import pandas as pd
 from scipy import stats as scipy_stats
 
 from utils.spatial_heatmaps import (
+    CS_PLC_DEFINITION_LEGACY,
+    cell_has_cs_place_field,
     compute_cb_in_pf_counts,
     get_deleted_cells_with_fallback,
     is_csplus_place_cell,
+    normalize_cs_plc_definition_mode,
 )
 
 
@@ -24,6 +28,7 @@ VIOLIN_MEDIAN_LINEWIDTH = 1.0
 ALL_COLOR = 'black'
 SS_COLOR = '#026C80'
 CS_COLOR = '#EE9B00'
+CB_COLOR = '#C1121F'
 CS_PLC_BG = '#FFF3E0'
 NON_CS_PLC_BG = '#E3F2FD'
 
@@ -37,6 +42,45 @@ class PooledStatsData:
     df_non_cs_plc: pd.DataFrame
     deleted_cells: set[tuple[str, int]]
     cb_in_pf_counts: dict[tuple[str, int], int]
+
+
+def _collect_complex_burst_pf_loco_metrics(
+    data_folder: str,
+    folders: list[str],
+) -> dict[tuple[str, int], dict[str, float]]:
+    metrics_by_cell: dict[tuple[str, int], dict[str, float]] = {}
+    for folder in folders:
+        spatial_path = os.path.join(data_folder, folder, 'spatial_analysis_full.pkl')
+        if not os.path.exists(spatial_path):
+            continue
+        with open(spatial_path, 'rb') as f:
+            spatial_cells = pickle.load(f)
+        for cell in spatial_cells:
+            cell_idx = int(cell.get('cell_idx'))
+            spike_burst_metrics = cell.get('spike_burst_rate_metrics', {})
+            if not isinstance(spike_burst_metrics, dict):
+                continue
+            burst_rate = spike_burst_metrics.get('burst_rate', {})
+            burst_counts = spike_burst_metrics.get('burst_counts', {})
+            time_s = spike_burst_metrics.get('time_s', {})
+            metrics_by_cell[(folder, cell_idx)] = {
+                'complex_burst_event_rate_loco_in_pf': (
+                    float(burst_rate.get('run_in', np.nan))
+                    if isinstance(burst_rate, dict)
+                    else np.nan
+                ),
+                'complex_burst_event_count_loco_in_pf': (
+                    float(burst_counts.get('run_in', np.nan))
+                    if isinstance(burst_counts, dict)
+                    else np.nan
+                ),
+                'complex_burst_time_loco_in_pf': (
+                    float(time_s.get('run_in', np.nan))
+                    if isinstance(time_s, dict)
+                    else np.nan
+                ),
+            }
+    return metrics_by_cell
 
 
 def _style_violin_medians(parts, color: str = VIOLIN_MEDIAN_COLOR, linewidth: float = VIOLIN_MEDIAN_LINEWIDTH) -> None:
@@ -86,6 +130,59 @@ def _sig_stars(p_val: float) -> str:
     if p_val < 0.05:
         return '*'
     return ''
+
+
+def _should_show_sig_bracket(p_val: float, show_only_significant: bool) -> bool:
+    if not np.isfinite(p_val):
+        return False
+    return (float(p_val) < 0.05) if bool(show_only_significant) else True
+
+
+def _draw_sig_bracket_levels(
+    ax,
+    bracket_levels,
+    ylim,
+    show_only_significant: bool,
+    sig_marker_offset_frac: float = 0.0001,
+) -> float:
+    """Draw visible significance brackets with compact vertical spacing."""
+    y_range = ylim[1] - ylim[0]
+    h = y_range * 0.03
+    text_h = y_range * 0.08
+    gap = y_range * 0.05
+    label_y_offset = y_range * float(sig_marker_offset_frac)
+    y = ylim[1] + y_range * 0.05
+    y_top = ylim[1]
+
+    for level in bracket_levels:
+        visible_specs = [
+            spec for spec in level
+            if _should_show_sig_bracket(spec['p'], show_only_significant)
+        ]
+        if not visible_specs:
+            continue
+        for spec in visible_specs:
+            sig_text = _sig_label(spec['p'])
+            text_kwargs = {}
+            if '*' in sig_text:
+                text_kwargs = {
+                    'text_y': y + h + label_y_offset,
+                    'text_va': 'bottom',
+                }
+            _add_bracket(
+                ax,
+                spec['pos1'],
+                spec['pos2'],
+                y,
+                h,
+                sig_text,
+                color=spec.get('color', 'black'),
+                **text_kwargs,
+            )
+        y_top = y + h + text_h
+        y += h + text_h + gap
+
+    return y_top
 
 
 def _paired_test(vals_in, vals_out):
@@ -157,17 +254,17 @@ def _unpaired_test_auto(data1, data2):
     return p_val, test_name, shapiro_p1, shapiro_p2
 
 
-def _add_bracket(ax, pos1, pos2, y, h, sig_text, color='black'):
+def _add_bracket(ax, pos1, pos2, y, h, sig_text, color='black', text_y=None, text_va='bottom'):
     drop = h
     ax.plot([pos1, pos1], [y, y + drop], color=color, linewidth=0.8)
     ax.plot([pos2, pos2], [y, y + drop], color=color, linewidth=0.8)
     ax.plot([pos1, pos2], [y + drop, y + drop], color=color, linewidth=0.8)
     ax.text(
         (pos1 + pos2) / 2,
-        y + drop + 0.02,
+        y + drop + 0.02 if text_y is None else text_y,
         sig_text,
         ha='center',
-        va='bottom',
+        va=text_va,
         fontsize=5,
         fontname='Arial',
         color=color,
@@ -179,6 +276,7 @@ def prepare_pooled_stats_tables(
     folders: list[str],
     cb_num_threshold: int = 10,
     cs_peak_rate_threshold: float = 0.5,
+    cs_plc_definition_mode: str = CS_PLC_DEFINITION_LEGACY,
     snr_threshold: float = 3.5,
     bad_frac_threshold: float = 0.9,
 ) -> PooledStatsData:
@@ -189,6 +287,7 @@ def prepare_pooled_stats_tables(
         bad_frac_threshold=bad_frac_threshold,
     )
     cb_in_pf_counts = compute_cb_in_pf_counts(data_folder, folders)
+    cb_pf_loco_metrics = _collect_complex_burst_pf_loco_metrics(data_folder, folders)
 
     all_dfs = []
     for folder in folders:
@@ -211,6 +310,8 @@ def prepare_pooled_stats_tables(
         axis=1,
     ).values
     cs_peak_rates = pd.to_numeric(df_pc.get('peak_rate_cs', np.nan), errors='coerce').to_numpy(dtype=float)
+    has_cs_place_field = df_pc.apply(lambda row: cell_has_cs_place_field(row.to_dict()), axis=1).to_numpy(dtype=bool)
+    cs_plc_mode = normalize_cs_plc_definition_mode(cs_plc_definition_mode)
     is_cs_plc = np.asarray(
         [
             is_csplus_place_cell(
@@ -219,26 +320,64 @@ def prepare_pooled_stats_tables(
                 cs_peak_rate=float(cs_peak),
                 cb_num_threshold=int(cb_num_threshold),
                 cs_peak_rate_threshold=float(cs_peak_rate_threshold),
+                has_cs_place_field=bool(has_cs_pf),
+                cs_plc_definition_mode=cs_plc_mode,
             )
-            for n_cb, cs_peak in zip(n_cb_in_pf, cs_peak_rates)
+            for n_cb, cs_peak, has_cs_pf in zip(
+                n_cb_in_pf,
+                cs_peak_rates,
+                has_cs_place_field,
+            )
         ],
         dtype=bool,
     )
 
     df_pc['is_cs_plc'] = is_cs_plc
     df_pc['n_cb_in_pf'] = n_cb_in_pf
+    df_pc['has_cs_place_field'] = has_cs_place_field
+    df_pc['cs_plc_definition_mode'] = cs_plc_mode
 
     df_all.loc[df_all['is_place_cell'] == True, 'is_cs_plc'] = False
     df_all.loc[df_all['is_place_cell'] == True, 'n_cb_in_pf'] = 0
+    df_all.loc[df_all['is_place_cell'] == True, 'has_cs_place_field'] = False
+    df_all.loc[df_all['is_place_cell'] == True, 'cs_plc_definition_mode'] = cs_plc_mode
     df_all.loc[df_pc.index, 'is_cs_plc'] = is_cs_plc
     df_all.loc[df_pc.index, 'n_cb_in_pf'] = n_cb_in_pf
+    df_all.loc[df_pc.index, 'has_cs_place_field'] = has_cs_place_field
+    df_all.loc[df_pc.index, 'cs_plc_definition_mode'] = cs_plc_mode
 
     # All-spike PF reference in-field firing-rate metrics (Hz).
     # These are directly sourced from in/out stats computed using the all-spike PF mask.
     df_all["fr_in_allpf_all"] = pd.to_numeric(df_all.get("all_inout_loco_in", np.nan), errors="coerce")
     df_all["fr_in_allpf_ss"] = pd.to_numeric(df_all.get("ss_inout_loco_in", np.nan), errors="coerce")
     df_all["fr_in_allpf_cs"] = pd.to_numeric(df_all.get("cs_inout_loco_in", np.nan), errors="coerce")
+    df_all["cs_rate_loco_in_pf"] = pd.to_numeric(df_all.get("cs_inout_loco_in", np.nan), errors="coerce")
+    df_all["complex_burst_event_rate_loco_in_pf"] = df_all.apply(
+        lambda row: cb_pf_loco_metrics.get(
+            (row["session"], int(row["cell_idx"])),
+            {},
+        ).get("complex_burst_event_rate_loco_in_pf", np.nan),
+        axis=1,
+    )
+    df_all["complex_burst_event_count_loco_in_pf"] = df_all.apply(
+        lambda row: cb_pf_loco_metrics.get(
+            (row["session"], int(row["cell_idx"])),
+            {},
+        ).get(
+            "complex_burst_event_count_loco_in_pf",
+            cb_in_pf_counts.get((row["session"], int(row["cell_idx"])), np.nan),
+        ),
+        axis=1,
+    )
+    df_all["complex_burst_time_loco_in_pf"] = df_all.apply(
+        lambda row: cb_pf_loco_metrics.get(
+            (row["session"], int(row["cell_idx"])),
+            {},
+        ).get("complex_burst_time_loco_in_pf", np.nan),
+        axis=1,
+    )
 
+    df_pc = df_all[df_all['is_place_cell'] == True].copy()
     df_cs_plc = df_pc[df_pc['is_cs_plc'] == True].copy()
     df_non_cs_plc = df_pc[df_pc['is_cs_plc'] == False].copy()
 
@@ -335,6 +474,34 @@ def _half_violin_panel(ax, positions, data_list, colors_list, paired_specs, rng_
                 layer += 1
         return base_x + direction * (0.02 + xs)
 
+    def _centered_beeswarm(vals, base_x):
+        vals = np.asarray(vals, dtype=float)
+        if len(vals) == 0:
+            return np.array([])
+        y_range = np.ptp(vals) if len(vals) > 1 else 1.0
+        if not np.isfinite(y_range) or y_range <= 0:
+            y_range = 1.0
+        y_spacing = y_range * 0.04
+        x_step = 0.045
+        sorted_idx = np.argsort(vals)
+        offsets = np.zeros(len(vals), dtype=float)
+        candidates = [0.0]
+        for layer in range(1, max(3, len(vals) + 1)):
+            candidates.extend([x_step * layer, -x_step * layer])
+        for si, oi in enumerate(sorted_idx):
+            for candidate in candidates:
+                conflict = False
+                for sj in range(si):
+                    oj = sorted_idx[sj]
+                    if abs(vals[oi] - vals[oj]) < y_spacing:
+                        if abs(candidate - offsets[oj]) < x_step * 0.9:
+                            conflict = True
+                            break
+                if not conflict:
+                    offsets[oi] = candidate
+                    break
+        return base_x + offsets
+
     for i, (pos, data) in enumerate(zip(positions, data_list)):
         if len(data) < 1:
             continue
@@ -343,7 +510,7 @@ def _half_violin_panel(ax, positions, data_list, colors_list, paired_specs, rng_
         elif i in paired_right:
             xs = _beeswarm(data, pos, direction=-1)
         else:
-            xs = _beeswarm(data, pos, direction=1)
+            xs = _centered_beeswarm(data, pos)
         ax.scatter(xs, data, s=4, color='black', alpha=0.5, linewidths=0)
 
 
@@ -394,6 +561,8 @@ def _plot_pf_style_panel(
     yticks: list[float] | None = None,
     zero_line: bool = False,
     clamp_unit_interval: bool = False,
+    show_only_significant: bool = False,
+    sig_marker_offset_frac: float = 0.0001,
 ):
     positions_5 = [1, 2, 3, 4.5, 5.5]
     cs_all, cs_ss, cs_cs, cs_ss_paired, cs_cs_paired = cs_metric
@@ -428,26 +597,25 @@ def _plot_pf_style_panel(
         ax.set_yticks(yticks)
 
     if ylim:
-        y_range = ylim[1] - ylim[0]
-        h = y_range * 0.03
-        text_h = y_range * 0.08
-        gap = y_range * 0.05
-        y_top = y1 = ylim[1] + y_range * 0.05
+        bracket_levels = []
         if len(cs_ss_paired) >= 3:
             p, _, _, _, _ = _paired_test(cs_ss_paired, cs_cs_paired)
-            _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
-            y_top = y1 + h + text_h
-        y2 = y1 + h + text_h + gap
+            bracket_levels.append([{'pos1': 2, 'pos2': 3, 'p': p}])
         if len(cs_all) >= 3 and len(non_all) >= 3:
             p, _, _, _ = _unpaired_test_auto(cs_all, non_all)
-            _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
-            y_top = y2 + h + text_h
-        y3 = y2 + h + text_h + gap
+            bracket_levels.append([{'pos1': 1, 'pos2': 4.5, 'p': p, 'color': ALL_COLOR}])
         if plot_cs_minus_ss and len(cs_ss) >= 3 and len(non_ss) >= 3:
             p, _, _, _ = _unpaired_test_auto(cs_ss, non_ss)
-            _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
-            y_top = y3 + h + text_h
+            bracket_levels.append([{'pos1': 2, 'pos2': 5.5, 'p': p, 'color': SS_COLOR}])
 
+        y_range = ylim[1] - ylim[0]
+        y_top = _draw_sig_bracket_levels(
+            ax,
+            bracket_levels,
+            ylim,
+            show_only_significant,
+            sig_marker_offset_frac=sig_marker_offset_frac,
+        )
         if clamp_unit_interval:
             lower = 0.0
             upper = max(1.0, y_top + y_range * 0.05)
@@ -464,6 +632,178 @@ def _plot_pf_style_panel(
         ax.set_ylim(0.0, 1.0)
 
 
+def plot_moving_epoch_cs_cb_metrics_allcells_placecells(
+    summary_df: pd.DataFrame,
+    save_path: str,
+    classification_df: pd.DataFrame | None = None,
+    hist_bins: int = 10,
+    count_bin_size: float = 5.0,
+    within_pf: bool = True,
+    fig_width: float = 4.8,
+    fig_height: float = 3.6,
+):
+    """Plot moving-epoch complex spike and complex burst metric histograms."""
+    moving_metric_summary_df = summary_df.copy()
+    if classification_df is not None:
+        key_cols = ['session', 'cell_idx']
+        missing_keys = [col for col in key_cols if col not in moving_metric_summary_df.columns or col not in classification_df.columns]
+        if missing_keys:
+            raise KeyError(f"summary_df and classification_df must both contain keys: {missing_keys}")
+        overlay_cols = [
+            'is_place_cell',
+            'is_cs_plc',
+            'n_cb_in_pf',
+            'cs_rate_loco_in_pf',
+            'complex_burst_event_rate_loco_in_pf',
+            'complex_burst_event_count_loco_in_pf',
+            'complex_burst_time_loco_in_pf',
+        ]
+        overlay_cols = [col for col in overlay_cols if col in classification_df.columns]
+        if overlay_cols:
+            moving_metric_summary_df = moving_metric_summary_df.drop(
+                columns=[col for col in overlay_cols if col in moving_metric_summary_df.columns],
+            ).merge(
+                classification_df[key_cols + overlay_cols],
+                on=key_cols,
+                how='left',
+                validate='one_to_one',
+            )
+
+    required_cols = [
+        'is_place_cell',
+        'is_cs_plc',
+        'cs_rate_loco',
+        'complex_burst_event_rate_loco',
+        'complex_burst_event_count_loco',
+    ]
+    missing_cols = [col for col in required_cols if col not in summary_df.columns]
+    if missing_cols:
+        raise KeyError(f"summary_df is missing required columns: {missing_cols}")
+    hist_bins = int(hist_bins)
+    if hist_bins <= 0:
+        raise ValueError("hist_bins must be a positive integer.")
+    count_bin_size = float(count_bin_size)
+    if (not np.isfinite(count_bin_size)) or count_bin_size <= 0:
+        raise ValueError("count_bin_size must be a finite number > 0.")
+
+    if 'cs_rate_loco_in_pf' not in moving_metric_summary_df.columns and 'cs_inout_loco_in' in moving_metric_summary_df.columns:
+        moving_metric_summary_df['cs_rate_loco_in_pf'] = pd.to_numeric(
+            moving_metric_summary_df['cs_inout_loco_in'],
+            errors='coerce',
+        )
+    if 'complex_burst_event_count_loco_in_pf' not in moving_metric_summary_df.columns and 'n_cb_in_pf' in moving_metric_summary_df.columns:
+        moving_metric_summary_df['complex_burst_event_count_loco_in_pf'] = pd.to_numeric(
+            moving_metric_summary_df['n_cb_in_pf'],
+            errors='coerce',
+        )
+
+    whole_epoch_specs = [
+        ('cs_rate_loco', 'CS firing rate\n(Hz)'),
+        ('complex_burst_event_rate_loco', 'CB event rate\n(Hz)'),
+        ('complex_burst_event_count_loco', 'CB event count'),
+    ]
+    within_pf_specs = [
+        ('cs_rate_loco_in_pf', 'CS firing rate\nin PF (Hz)'),
+        ('complex_burst_event_rate_loco_in_pf', 'CB event rate\nin PF (Hz)'),
+        ('complex_burst_event_count_loco_in_pf', 'CB event count\nin PF'),
+    ]
+    if within_pf:
+        missing_within_pf_cols = [
+            col for col, _ in within_pf_specs if col not in moving_metric_summary_df.columns
+        ]
+        if missing_within_pf_cols:
+            raise KeyError(
+                "summary_df is missing required within-PF columns: "
+                f"{missing_within_pf_cols}. Rebuild pooled_stats with prepare_pooled_stats_tables()."
+            )
+
+    is_place_cell = moving_metric_summary_df['is_place_cell'] == True
+    is_cs_minus_place_cell = is_place_cell & (moving_metric_summary_df['is_cs_plc'] == False)
+    moving_metric_groups = [
+        ('All cells', moving_metric_summary_df, whole_epoch_specs),
+        (
+            'Place cells',
+            moving_metric_summary_df[is_place_cell],
+            within_pf_specs if within_pf else whole_epoch_specs,
+        ),
+        (
+            'CS- place cells',
+            moving_metric_summary_df[is_cs_minus_place_cell],
+            within_pf_specs if within_pf else whole_epoch_specs,
+        ),
+    ]
+
+    fig, axes = plt.subplots(3, 3, figsize=(fig_width, fig_height), sharex=False, sharey=False)
+    axes = np.asarray(axes)
+    hist_color = CS_COLOR
+
+    def _count_hist_bins_from_values(values: list[np.ndarray]) -> np.ndarray:
+        finite_vals = []
+        for arr in values:
+            arr = np.asarray(arr, dtype=float)
+            finite = arr[np.isfinite(arr)]
+            if finite.size > 0:
+                finite_vals.append(finite)
+        if not finite_vals:
+            return np.array([-0.5, count_bin_size + 0.5], dtype=float)
+        max_val = float(np.nanmax(np.concatenate(finite_vals)))
+        if max_val <= count_bin_size:
+            return np.array([-0.5, count_bin_size + 0.5], dtype=float)
+        n_extra_bins = int(np.ceil((max_val - count_bin_size) / count_bin_size))
+        upper_edges = count_bin_size + 0.5 + np.arange(n_extra_bins + 1) * count_bin_size
+        return np.concatenate(([-0.5], upper_edges.astype(float)))
+
+    count_col_values = []
+    for _group_label, group_df, metric_specs in moving_metric_groups:
+        count_col = metric_specs[2][0]
+        count_col_values.append(pd.to_numeric(group_df[count_col], errors='coerce').to_numpy(dtype=float))
+    shared_count_bins = _count_hist_bins_from_values(count_col_values)
+
+    def _hist_bins(metric_col: str):
+        if metric_col.startswith('complex_burst_event_count_loco'):
+            return shared_count_bins
+        return hist_bins
+
+    for row_idx, (group_label, group_df, metric_specs) in enumerate(moving_metric_groups):
+        for col_idx, (metric_col, ylabel) in enumerate(metric_specs):
+            ax = axes[row_idx, col_idx]
+            vals = pd.to_numeric(group_df[metric_col], errors='coerce').to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+
+            if vals.size > 0:
+                ax.hist(
+                    vals,
+                    bins=_hist_bins(metric_col),
+                    color=hist_color,
+                    alpha=0.35,
+                    edgecolor='black',
+                    linewidth=0.4,
+                )
+
+            ax.text(
+                0.97,
+                0.95,
+                f'n={vals.size}',
+                ha='right',
+                va='top',
+                transform=ax.transAxes,
+                fontsize=5,
+                fontname='Arial',
+            )
+            ax.set_xlabel(ylabel, fontsize=6, fontname='Arial')
+            ax.set_ylabel('Cell count', fontsize=6, fontname='Arial')
+            ax.set_title(group_label, fontsize=6, fontname='Arial')
+            if metric_col.startswith('complex_burst_event_count_loco'):
+                ax.set_xlim(left=0.0)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.tick_params(axis='both', labelsize=5)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300)
+    return fig
+
+
 def plot_combined_cs_plus_minus_4panels(
     df_cs_plc: pd.DataFrame,
     df_non_cs_plc: pd.DataFrame,
@@ -471,13 +811,19 @@ def plot_combined_cs_plus_minus_4panels(
     plot_cs_minus_ss: bool = False,
     fig_width: float = 9.6,
     fig_height: float = 1.4,
+    show_only_significant: bool = True,
+    sig_marker_offset_frac: float = 0.0001,
 ):
+    sig_marker_offset_frac = float(sig_marker_offset_frac)
+    if not np.isfinite(sig_marker_offset_frac):
+        raise ValueError("sig_marker_offset_frac must be a finite number.")
+
     first_panel_ratio = 1.4
     fig, axes = plt.subplots(
         1,
-        7,
+        8,
         figsize=(fig_width, fig_height),
-        gridspec_kw={'width_ratios': [first_panel_ratio, 1, 1, 1, 1, 1, first_panel_ratio]},
+        gridspec_kw={'width_ratios': [first_panel_ratio, 1, 1, 1, 1, 1, 1, first_panel_ratio]},
     )
 
     positions_6 = [1, 2, 3, 4.5, 5.5, 6.5]
@@ -507,49 +853,53 @@ def plot_combined_cs_plus_minus_4panels(
     ax.tick_params(axis='both', labelsize=5)
 
     if ylim:
-        y_range = ylim[1] - ylim[0]
-        ax.set_ylim(ylim[0], ylim[1] + y_range * 0.65)
-        h = y_range * 0.03
-        text_h = y_range * 0.08
-        gap = y_range * 0.05
-        y1 = ylim[1] + y_range * 0.05
+        bracket_levels = []
+        paired_level = []
         if len(cs_ss_paired) >= 3:
             p, _, _, _, _ = _paired_test(cs_ss_paired, cs_cs_paired)
-            _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
+            paired_level.append({'pos1': 2, 'pos2': 3, 'p': p})
         if len(non_ss_paired) >= 3:
             p, _, _, _, _ = _paired_test(non_ss_paired, non_cs_paired)
-            _add_bracket(ax, 5.5, 6.5, y1, h, _sig_label(p))
-        y2 = y1 + h + text_h + gap
+            paired_level.append({'pos1': 5.5, 'pos2': 6.5, 'p': p})
+        if paired_level:
+            bracket_levels.append(paired_level)
         if len(cs_all) >= 3 and len(non_all) >= 3:
             p, _, _, _ = _unpaired_test_auto(cs_all, non_all)
-            _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
-        y3 = y2 + h + text_h + gap
+            bracket_levels.append([{'pos1': 1, 'pos2': 4.5, 'p': p, 'color': ALL_COLOR}])
         if len(cs_ss) >= 3 and len(non_ss) >= 3:
             p, _, _, _ = _unpaired_test_auto(cs_ss, non_ss)
-            _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
-        y4 = y3 + h + text_h + gap
+            bracket_levels.append([{'pos1': 2, 'pos2': 5.5, 'p': p, 'color': SS_COLOR}])
         if len(cs_cs) >= 3 and len(non_cs) >= 3:
             p, _, _, _ = _unpaired_test_auto(cs_cs, non_cs)
-            _add_bracket(ax, 3, 6.5, y4, h, _sig_label(p), color=CS_COLOR)
+            bracket_levels.append([{'pos1': 3, 'pos2': 6.5, 'p': p, 'color': CS_COLOR}])
+        y_range = ylim[1] - ylim[0]
+        y_top = _draw_sig_bracket_levels(
+            ax,
+            bracket_levels,
+            ylim,
+            show_only_significant,
+            sig_marker_offset_frac=sig_marker_offset_frac,
+        )
+        ax.set_ylim(ylim[0], y_top + y_range * 0.05)
 
-    def _get_pf_size_sum(df_subset: pd.DataFrame):
+    def _get_pf_size_data(df_subset: pd.DataFrame, reducer):
         all_sizes, ss_sizes, cs_sizes = [], [], []
         for idx in df_subset.index:
             sizes = df_subset.loc[idx, 'place_field_sizes_cm2']
             if isinstance(sizes, (list, np.ndarray)) and len(sizes) > 0:
-                all_sizes.append(np.sum(sizes) / arena_area_cm2 * 100)
+                all_sizes.append(reducer(sizes) / arena_area_cm2 * 100)
             else:
                 all_sizes.append(np.nan)
 
             sizes = df_subset.loc[idx, 'place_field_sizes_cm2_ss']
             if isinstance(sizes, (list, np.ndarray)) and len(sizes) > 0:
-                ss_sizes.append(np.sum(sizes) / arena_area_cm2 * 100)
+                ss_sizes.append(reducer(sizes) / arena_area_cm2 * 100)
             else:
                 ss_sizes.append(np.nan)
 
             sizes = df_subset.loc[idx, 'place_field_sizes_cm2_cs']
             if isinstance(sizes, (list, np.ndarray)) and len(sizes) > 0:
-                cs_sizes.append(np.sum(sizes) / arena_area_cm2 * 100)
+                cs_sizes.append(reducer(sizes) / arena_area_cm2 * 100)
             else:
                 cs_sizes.append(np.nan)
 
@@ -566,30 +916,52 @@ def plot_combined_cs_plus_minus_4panels(
         cs_paired = cs_sizes[paired_mask]
         return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
 
-    pf_cs_all, pf_cs_ss, pf_cs_cs, pf_cs_ss_paired, pf_cs_cs_paired = _get_pf_size_sum(df_cs_plc)
-    pf_non_all, pf_non_ss, pf_non_cs, pf_non_ss_paired, pf_non_cs_paired = _get_pf_size_sum(df_non_cs_plc)
+    def _sum_pf_sizes(sizes):
+        return float(np.nansum(np.asarray(sizes, dtype=float)))
+
+    def _primary_pf_size(sizes):
+        arr = np.asarray(sizes, dtype=float).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        return float(arr[0]) if arr.size > 0 else np.nan
+
+    pf_cs_all, pf_cs_ss, pf_cs_cs, pf_cs_ss_paired, pf_cs_cs_paired = _get_pf_size_data(df_cs_plc, _sum_pf_sizes)
+    pf_non_all, pf_non_ss, pf_non_cs, pf_non_ss_paired, pf_non_cs_paired = _get_pf_size_data(df_non_cs_plc, _sum_pf_sizes)
     _plot_pf_style_panel(
         axes[1],
         (pf_cs_all, pf_cs_ss, pf_cs_cs, pf_cs_ss_paired, pf_cs_cs_paired),
         (pf_non_all, pf_non_ss, pf_non_cs, pf_non_ss_paired, pf_non_cs_paired),
-        ylabel='PF size (% arena)',
+        ylabel='PF size all PFs (% arena)',
         plot_cs_minus_ss=plot_cs_minus_ss,
-        fixed_ylim=(0, 100),
-        yticks=[0, 25, 50, 75, 100],
+        show_only_significant=show_only_significant,
+        sig_marker_offset_frac=sig_marker_offset_frac,
     )
 
-    # Panel 3: Coherence.
+    primary_pf_cs_all, primary_pf_cs_ss, primary_pf_cs_cs, primary_pf_cs_ss_paired, primary_pf_cs_cs_paired = _get_pf_size_data(df_cs_plc, _primary_pf_size)
+    primary_pf_non_all, primary_pf_non_ss, primary_pf_non_cs, primary_pf_non_ss_paired, primary_pf_non_cs_paired = _get_pf_size_data(df_non_cs_plc, _primary_pf_size)
+    _plot_pf_style_panel(
+        axes[2],
+        (primary_pf_cs_all, primary_pf_cs_ss, primary_pf_cs_cs, primary_pf_cs_ss_paired, primary_pf_cs_cs_paired),
+        (primary_pf_non_all, primary_pf_non_ss, primary_pf_non_cs, primary_pf_non_ss_paired, primary_pf_non_cs_paired),
+        ylabel='Primary PF size (% arena)',
+        plot_cs_minus_ss=plot_cs_minus_ss,
+        show_only_significant=show_only_significant,
+        sig_marker_offset_frac=sig_marker_offset_frac,
+    )
+
+    # Panel 4: Coherence.
     coh_cs = _get_numeric_triplet_data(df_cs_plc, 'coherence_all', 'coherence_ss', 'coherence_cs')
     coh_non = _get_numeric_triplet_data(df_non_cs_plc, 'coherence_all', 'coherence_ss', 'coherence_cs')
     _plot_pf_style_panel(
-        axes[2],
+        axes[3],
         coh_cs,
         coh_non,
         ylabel='Coherence (z)',
         plot_cs_minus_ss=plot_cs_minus_ss,
+        show_only_significant=show_only_significant,
+        sig_marker_offset_frac=sig_marker_offset_frac,
     )
 
-    # Panel 4: Sparsity.
+    # Panel 5: Sparsity.
     sparsity_cs = _get_numeric_triplet_data(df_cs_plc, 'sparsity_all', 'sparsity_ss', 'sparsity_cs')
     sparsity_non = _get_numeric_triplet_data(df_non_cs_plc, 'sparsity_all', 'sparsity_ss', 'sparsity_cs')
     sparsity_data_list = (
@@ -598,23 +970,27 @@ def plot_combined_cs_plus_minus_4panels(
         else [sparsity_cs[0], sparsity_cs[1], sparsity_cs[2], sparsity_non[0]]
     )
     _plot_pf_style_panel(
-        axes[3],
+        axes[4],
         sparsity_cs,
         sparsity_non,
         ylabel='Sparsity',
         plot_cs_minus_ss=plot_cs_minus_ss,
         clamp_unit_interval=_all_finite_in_unit_interval(sparsity_data_list),
+        show_only_significant=show_only_significant,
+        sig_marker_offset_frac=sig_marker_offset_frac,
     )
 
-    # Panel 5: Spatial information.
+    # Panel 6: Spatial information.
     si_cs = _get_numeric_triplet_data(df_cs_plc, 'si_bits_per_spike', 'si_bits_per_spike_ss', 'si_bits_per_spike_cs')
     si_non = _get_numeric_triplet_data(df_non_cs_plc, 'si_bits_per_spike', 'si_bits_per_spike_ss', 'si_bits_per_spike_cs')
     _plot_pf_style_panel(
-        axes[4],
+        axes[5],
         si_cs,
         si_non,
         ylabel='SI (bits/spike)',
         plot_cs_minus_ss=plot_cs_minus_ss,
+        show_only_significant=show_only_significant,
+        sig_marker_offset_frac=sig_marker_offset_frac,
     )
 
     def _get_selectivity(df_subset: pd.DataFrame):
@@ -645,16 +1021,18 @@ def plot_combined_cs_plus_minus_4panels(
         cs_paired = cs_sel[paired_mask]
         return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
 
-    # Panel 6: Selectivity.
+    # Panel 7: Selectivity.
     sel_cs_all, sel_cs_ss, sel_cs_cs, sel_cs_ss_paired, sel_cs_cs_paired = _get_selectivity(df_cs_plc)
     sel_non_all, sel_non_ss, sel_non_cs, sel_non_ss_paired, sel_non_cs_paired = _get_selectivity(df_non_cs_plc)
     _plot_pf_style_panel(
-        axes[5],
+        axes[6],
         (sel_cs_all, sel_cs_ss, sel_cs_cs, sel_cs_ss_paired, sel_cs_cs_paired),
         (sel_non_all, sel_non_ss, sel_non_cs, sel_non_ss_paired, sel_non_cs_paired),
         ylabel='Selectivity',
         plot_cs_minus_ss=plot_cs_minus_ss,
         zero_line=True,
+        show_only_significant=show_only_significant,
+        sig_marker_offset_frac=sig_marker_offset_frac,
     )
 
     def _get_fr_in_ref_pf_data(df_subset: pd.DataFrame):
@@ -676,9 +1054,9 @@ def plot_combined_cs_plus_minus_4panels(
         cs_paired = cs_fr[paired_mask]
         return all_valid, ss_valid, cs_valid, ss_paired, cs_paired
 
-    # Panel 7: In-field firing rate using all-spike PF reference mask.
+    # Panel 8: In-field firing rate using all-spike PF reference mask.
     # Match Panel 1 layout/style: All/SS/CS for both CS+ and CS- PLC.
-    ax = axes[6]
+    ax = axes[7]
     fr_cs_all, fr_cs_ss, fr_cs_cs, fr_cs_ss_paired, fr_cs_cs_paired = _get_fr_in_ref_pf_data(df_cs_plc)
     fr_non_all, fr_non_ss, fr_non_cs, fr_non_ss_paired, fr_non_cs_paired = _get_fr_in_ref_pf_data(df_non_cs_plc)
 
@@ -700,39 +1078,928 @@ def plot_combined_cs_plus_minus_4panels(
     ax.tick_params(axis='both', labelsize=5)
 
     if ylim:
-        y_range = ylim[1] - ylim[0]
-        h = y_range * 0.03
-        text_h = y_range * 0.08
-        gap = y_range * 0.05
-        y_top = y1 = ylim[1] + y_range * 0.05
+        bracket_levels = []
+        paired_level = []
         if len(fr_cs_ss_paired) >= 3:
             p, _, _, _, _ = _paired_test(fr_cs_ss_paired, fr_cs_cs_paired)
-            _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
-            y_top = y1 + h + text_h
+            paired_level.append({'pos1': 2, 'pos2': 3, 'p': p})
         if len(fr_non_ss_paired) >= 3:
             p, _, _, _, _ = _paired_test(fr_non_ss_paired, fr_non_cs_paired)
-            _add_bracket(ax, 5.5, 6.5, y1, h, _sig_label(p))
-            y_top = max(y_top, y1 + h + text_h)
-        y2 = y1 + h + text_h + gap
+            paired_level.append({'pos1': 5.5, 'pos2': 6.5, 'p': p})
+        if paired_level:
+            bracket_levels.append(paired_level)
         if len(fr_cs_all) >= 3 and len(fr_non_all) >= 3:
             p, _, _, _ = _unpaired_test_auto(fr_cs_all, fr_non_all)
-            _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
-            y_top = y2 + h + text_h
-        y3 = y2 + h + text_h + gap
+            bracket_levels.append([{'pos1': 1, 'pos2': 4.5, 'p': p, 'color': ALL_COLOR}])
         if len(fr_cs_ss) >= 3 and len(fr_non_ss) >= 3:
             p, _, _, _ = _unpaired_test_auto(fr_cs_ss, fr_non_ss)
-            _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
-            y_top = y3 + h + text_h
-        y4 = y3 + h + text_h + gap
+            bracket_levels.append([{'pos1': 2, 'pos2': 5.5, 'p': p, 'color': SS_COLOR}])
         if len(fr_cs_cs) >= 3 and len(fr_non_cs) >= 3:
             p, _, _, _ = _unpaired_test_auto(fr_cs_cs, fr_non_cs)
-            _add_bracket(ax, 3, 6.5, y4, h, _sig_label(p), color=CS_COLOR)
-            y_top = y4 + h + text_h
+            bracket_levels.append([{'pos1': 3, 'pos2': 6.5, 'p': p, 'color': CS_COLOR}])
+        y_range = ylim[1] - ylim[0]
+        y_top = _draw_sig_bracket_levels(
+            ax,
+            bracket_levels,
+            ylim,
+            show_only_significant,
+            sig_marker_offset_frac=sig_marker_offset_frac,
+        )
         ax.set_ylim(ylim[0], y_top + y_range * 0.05)
 
     plt.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches='tight')
     return fig
+
+
+def plot_combined_cs_plus_minus_4panels_2sessions(
+    session_tables: dict[str, dict[str, pd.DataFrame]],
+    save_path: str,
+    plot_cs_minus_ss: bool = False,
+    fig_width: float = 7.5,
+    fig_height: float = 2.4,
+):
+    """Plot the CS+/CS- pooled 7-panel summary separately for session 1 and session 2."""
+    first_panel_ratio = 1.4
+    fig, axes = plt.subplots(
+        2,
+        7,
+        figsize=(fig_width, fig_height),
+        gridspec_kw={'width_ratios': [first_panel_ratio, 1, 1, 1, 1, 1, first_panel_ratio]},
+    )
+    axes = np.asarray(axes)
+    positions_6 = [1, 2, 3, 4.5, 5.5, 6.5]
+    arena_area_cm2 = 20.0 * 35.5
+
+    required_cols = [
+        'peak_rate_all', 'peak_rate_ss', 'peak_rate_cs',
+        'place_field_sizes_cm2', 'place_field_sizes_cm2_ss', 'place_field_sizes_cm2_cs',
+        'coherence_all', 'coherence_ss', 'coherence_cs',
+        'sparsity_all', 'sparsity_ss', 'sparsity_cs',
+        'si_bits_per_spike', 'si_bits_per_spike_ss', 'si_bits_per_spike_cs',
+        'all_inout_loco_in', 'all_inout_loco_out',
+        'ss_inout_loco_in', 'ss_inout_loco_out',
+        'cs_inout_loco_in', 'cs_inout_loco_out',
+        'fr_in_allpf_all', 'fr_in_allpf_ss', 'fr_in_allpf_cs',
+    ]
+
+    def _coerce_df(df: pd.DataFrame | None) -> pd.DataFrame:
+        if df is None:
+            df = pd.DataFrame()
+        return df.reindex(columns=list(dict.fromkeys(list(df.columns) + required_cols)))
+
+    def _session_pair(session_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        block = session_tables.get(session_key, {})
+        return _coerce_df(block.get('df_cs_plc')), _coerce_df(block.get('df_non_cs_plc'))
+
+    def _get_pf_size_sum(df_subset: pd.DataFrame):
+        all_sizes, ss_sizes, cs_sizes = [], [], []
+        for idx in df_subset.index:
+            sizes = df_subset.loc[idx, 'place_field_sizes_cm2']
+            all_sizes.append(np.sum(sizes) / arena_area_cm2 * 100 if isinstance(sizes, (list, np.ndarray)) and len(sizes) > 0 else np.nan)
+            sizes = df_subset.loc[idx, 'place_field_sizes_cm2_ss']
+            ss_sizes.append(np.sum(sizes) / arena_area_cm2 * 100 if isinstance(sizes, (list, np.ndarray)) and len(sizes) > 0 else np.nan)
+            sizes = df_subset.loc[idx, 'place_field_sizes_cm2_cs']
+            cs_sizes.append(np.sum(sizes) / arena_area_cm2 * 100 if isinstance(sizes, (list, np.ndarray)) and len(sizes) > 0 else np.nan)
+
+        all_sizes = np.asarray(all_sizes, dtype=float)
+        ss_sizes = np.asarray(ss_sizes, dtype=float)
+        cs_sizes = np.asarray(cs_sizes, dtype=float)
+        paired_mask = np.isfinite(ss_sizes) & np.isfinite(cs_sizes)
+        return (
+            all_sizes[np.isfinite(all_sizes)],
+            ss_sizes[np.isfinite(ss_sizes)],
+            cs_sizes[np.isfinite(cs_sizes)],
+            ss_sizes[paired_mask],
+            cs_sizes[paired_mask],
+        )
+
+    def _get_selectivity(df_subset: pd.DataFrame):
+        all_in = pd.to_numeric(df_subset['all_inout_loco_in'], errors='coerce').to_numpy(dtype=float)
+        all_out = pd.to_numeric(df_subset['all_inout_loco_out'], errors='coerce').to_numpy(dtype=float)
+        ss_in = pd.to_numeric(df_subset['ss_inout_loco_in'], errors='coerce').to_numpy(dtype=float)
+        ss_out = pd.to_numeric(df_subset['ss_inout_loco_out'], errors='coerce').to_numpy(dtype=float)
+        cs_in = pd.to_numeric(df_subset['cs_inout_loco_in'], errors='coerce').to_numpy(dtype=float)
+        cs_out = pd.to_numeric(df_subset['cs_inout_loco_out'], errors='coerce').to_numpy(dtype=float)
+
+        def _sel(v_in, v_out):
+            denom = v_in + v_out
+            with np.errstate(divide='ignore', invalid='ignore'):
+                return np.where((denom > 0) & np.isfinite(v_in) & np.isfinite(v_out), (v_in - v_out) / denom, np.nan)
+
+        all_sel = _sel(all_in, all_out)
+        ss_sel = _sel(ss_in, ss_out)
+        cs_sel = _sel(cs_in, cs_out)
+        paired_mask = np.isfinite(ss_sel) & np.isfinite(cs_sel)
+        return (
+            all_sel[np.isfinite(all_sel)],
+            ss_sel[np.isfinite(ss_sel)],
+            cs_sel[np.isfinite(cs_sel)],
+            ss_sel[paired_mask],
+            cs_sel[paired_mask],
+        )
+
+    def _get_fr_in_ref_pf_data(df_subset: pd.DataFrame):
+        all_fr = pd.to_numeric(df_subset['fr_in_allpf_all'], errors='coerce').to_numpy(dtype=float)
+        ss_fr = pd.to_numeric(df_subset['fr_in_allpf_ss'], errors='coerce').to_numpy(dtype=float)
+        cs_fr = pd.to_numeric(df_subset['fr_in_allpf_cs'], errors='coerce').to_numpy(dtype=float)
+        paired_mask = np.isfinite(ss_fr) & np.isfinite(cs_fr)
+        return (
+            all_fr[np.isfinite(all_fr)],
+            ss_fr[np.isfinite(ss_fr)],
+            cs_fr[np.isfinite(cs_fr)],
+            ss_fr[paired_mask],
+            cs_fr[paired_mask],
+        )
+
+    def _draw_six_position_panel(ax, cs_metric, non_metric, ylabel: str):
+        cs_all, cs_ss, cs_cs, cs_ss_paired, cs_cs_paired = cs_metric
+        non_all, non_ss, non_cs, non_ss_paired, non_cs_paired = non_metric
+        ax.axvspan(0.5, 3.5, alpha=0.3, color=CS_PLC_BG, zorder=0)
+        ax.axvspan(4.0, 7.0, alpha=0.3, color=NON_CS_PLC_BG, zorder=0)
+        ax.text(2, -0.22, 'CS+ PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
+        ax.text(5.5, -0.22, 'CS- PLC', ha='center', va='top', fontsize=6, fontname='Arial', transform=ax.get_xaxis_transform())
+
+        data_list = [cs_all, cs_ss, cs_cs, non_all, non_ss, non_cs]
+        colors_list = [ALL_COLOR, SS_COLOR, CS_COLOR, ALL_COLOR, SS_COLOR, CS_COLOR]
+        ylim = _global_ylim(data_list)
+        _half_violin_panel(ax, positions_6, data_list, colors_list, paired_specs=[(1, 2), (4, 5)])
+        ax.set_ylabel(ylabel, fontsize=6, fontname='Arial')
+        ax.set_xticks(positions_6)
+        ax.set_xticklabels(['All', 'SS', 'CS', 'All', 'SS', 'CS'], fontsize=4, fontname='Arial')
+        ax.set_xlim(0.3, 7.2)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(axis='both', labelsize=5)
+
+        if ylim:
+            y_range = ylim[1] - ylim[0]
+            h = y_range * 0.03
+            text_h = y_range * 0.08
+            gap = y_range * 0.05
+            y1 = ylim[1] + y_range * 0.05
+            y_top = y1
+            if len(cs_ss_paired) >= 3:
+                p, _, _, _, _ = _paired_test(cs_ss_paired, cs_cs_paired)
+                _add_bracket(ax, 2, 3, y1, h, _sig_label(p))
+                y_top = max(y_top, y1 + h + text_h)
+            if len(non_ss_paired) >= 3:
+                p, _, _, _, _ = _paired_test(non_ss_paired, non_cs_paired)
+                _add_bracket(ax, 5.5, 6.5, y1, h, _sig_label(p))
+                y_top = max(y_top, y1 + h + text_h)
+            y2 = y1 + h + text_h + gap
+            if len(cs_all) >= 3 and len(non_all) >= 3:
+                p, _, _, _ = _unpaired_test_auto(cs_all, non_all)
+                _add_bracket(ax, 1, 4.5, y2, h, _sig_label(p), color=ALL_COLOR)
+                y_top = max(y_top, y2 + h + text_h)
+            y3 = y2 + h + text_h + gap
+            if len(cs_ss) >= 3 and len(non_ss) >= 3:
+                p, _, _, _ = _unpaired_test_auto(cs_ss, non_ss)
+                _add_bracket(ax, 2, 5.5, y3, h, _sig_label(p), color=SS_COLOR)
+                y_top = max(y_top, y3 + h + text_h)
+            y4 = y3 + h + text_h + gap
+            if len(cs_cs) >= 3 and len(non_cs) >= 3:
+                p, _, _, _ = _unpaired_test_auto(cs_cs, non_cs)
+                _add_bracket(ax, 3, 6.5, y4, h, _sig_label(p), color=CS_COLOR)
+                y_top = max(y_top, y4 + h + text_h)
+            ax.set_ylim(ylim[0], y_top + y_range * 0.05)
+
+    def _draw_row(row_idx: int, session_key: str, row_label: str):
+        df_cs_plc, df_non_cs_plc = _session_pair(session_key)
+        row_axes = axes[row_idx]
+
+        _draw_six_position_panel(
+            row_axes[0],
+            _get_peak_rate_data(df_cs_plc),
+            _get_peak_rate_data(df_non_cs_plc),
+            'Peak rate (Hz)',
+        )
+
+        _plot_pf_style_panel(
+            row_axes[1],
+            _get_pf_size_sum(df_cs_plc),
+            _get_pf_size_sum(df_non_cs_plc),
+            ylabel='PF size (% arena)',
+            plot_cs_minus_ss=plot_cs_minus_ss,
+            fixed_ylim=(0, 100),
+            yticks=[0, 25, 50, 75, 100],
+        )
+        _plot_pf_style_panel(
+            row_axes[2],
+            _get_numeric_triplet_data(df_cs_plc, 'coherence_all', 'coherence_ss', 'coherence_cs'),
+            _get_numeric_triplet_data(df_non_cs_plc, 'coherence_all', 'coherence_ss', 'coherence_cs'),
+            ylabel='Coherence (z)',
+            plot_cs_minus_ss=plot_cs_minus_ss,
+        )
+        sparsity_cs = _get_numeric_triplet_data(df_cs_plc, 'sparsity_all', 'sparsity_ss', 'sparsity_cs')
+        sparsity_non = _get_numeric_triplet_data(df_non_cs_plc, 'sparsity_all', 'sparsity_ss', 'sparsity_cs')
+        sparsity_data_list = (
+            [sparsity_cs[0], sparsity_cs[1], sparsity_cs[2], sparsity_non[0], sparsity_non[1]]
+            if plot_cs_minus_ss
+            else [sparsity_cs[0], sparsity_cs[1], sparsity_cs[2], sparsity_non[0]]
+        )
+        _plot_pf_style_panel(
+            row_axes[3],
+            sparsity_cs,
+            sparsity_non,
+            ylabel='Sparsity',
+            plot_cs_minus_ss=plot_cs_minus_ss,
+            clamp_unit_interval=_all_finite_in_unit_interval(sparsity_data_list),
+        )
+        _plot_pf_style_panel(
+            row_axes[4],
+            _get_numeric_triplet_data(df_cs_plc, 'si_bits_per_spike', 'si_bits_per_spike_ss', 'si_bits_per_spike_cs'),
+            _get_numeric_triplet_data(df_non_cs_plc, 'si_bits_per_spike', 'si_bits_per_spike_ss', 'si_bits_per_spike_cs'),
+            ylabel='SI (bits/spike)',
+            plot_cs_minus_ss=plot_cs_minus_ss,
+        )
+        _plot_pf_style_panel(
+            row_axes[5],
+            _get_selectivity(df_cs_plc),
+            _get_selectivity(df_non_cs_plc),
+            ylabel='Selectivity',
+            plot_cs_minus_ss=plot_cs_minus_ss,
+            zero_line=True,
+        )
+        _draw_six_position_panel(
+            row_axes[6],
+            _get_fr_in_ref_pf_data(df_cs_plc),
+            _get_fr_in_ref_pf_data(df_non_cs_plc),
+            'In-PF FR (Hz)',
+        )
+        row_axes[0].text(
+            -0.42,
+            0.5,
+            row_label,
+            transform=row_axes[0].transAxes,
+            rotation=90,
+            ha='center',
+            va='center',
+            fontsize=6,
+            fontname='Arial',
+        )
+
+    _draw_row(0, 'session1', 'Session 1')
+    _draw_row(1, 'session2', 'Session 2')
+
+    for col_idx in range(axes.shape[1]):
+        ylims = [axes[row_idx, col_idx].get_ylim() for row_idx in range(axes.shape[0])]
+        y_min = min(y[0] for y in ylims)
+        y_max = max(y[1] for y in ylims)
+        for row_idx in range(axes.shape[0]):
+            axes[row_idx, col_idx].set_ylim(y_min, y_max)
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    return fig
+
+
+def plot_combined_cs_plus_minus_session_pair_metrics_14cols(
+    session_tables: dict[str, dict[str, pd.DataFrame]],
+    save_path: str,
+    fig_width: float = 14.5,
+    fig_height: float = 7.0,
+    min_included_minutes_per_session: float | None = None,
+):
+    """Compare session 1 vs session 2 for each metric, spike type, and CS class.
+
+    The CS+ CB row is populated only for FR columns and reports complex-burst
+    event rate in the matching state/PF region.
+    """
+    fig, axes = plt.subplots(7, 14, figsize=(fig_width, fig_height), sharex=False, sharey=False)
+    axes = np.asarray(axes)
+    arena_area_cm2 = 20.0 * 35.5
+
+    def _get_table(session_key: str, class_key: str) -> pd.DataFrame:
+        block = session_tables.get(session_key, {})
+        table_key = 'df_cs_plc' if class_key == 'csplus' else 'df_non_cs_plc'
+        df = block.get(table_key, pd.DataFrame())
+        if df is None:
+            df = pd.DataFrame()
+        return df.copy()
+
+    def _resolved_min_included_minutes() -> float:
+        if min_included_minutes_per_session is None:
+            return 0.0
+        try:
+            value = float(min_included_minutes_per_session)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if np.isfinite(value) else 0.0
+
+    min_minutes = _resolved_min_included_minutes()
+
+    def _included_minutes_from_paired_columns(df: pd.DataFrame, suffix: str) -> np.ndarray:
+        for col in (f'included_minutes_{suffix}', f'included_time_min_{suffix}'):
+            if col in df.columns:
+                vals = pd.to_numeric(df[col], errors='coerce').to_numpy(dtype=float)
+                if vals.size == len(df):
+                    return vals
+
+        kept_col = f'n_frames_kept_total_{suffix}'
+        frame_rate_col = f'frame_rate_{suffix}'
+        if kept_col in df.columns and frame_rate_col in df.columns:
+            kept = pd.to_numeric(df[kept_col], errors='coerce').to_numpy(dtype=float)
+            frame_rate = pd.to_numeric(df[frame_rate_col], errors='coerce').to_numpy(dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                vals = kept / frame_rate / 60.0
+            vals[~np.isfinite(vals)] = np.nan
+            return vals
+
+        return np.full(len(df), np.nan, dtype=float)
+
+    def _filter_paired_by_included_minutes(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or min_minutes <= 0:
+            return df
+        s1_minutes = _included_minutes_from_paired_columns(df, 's1')
+        s2_minutes = _included_minutes_from_paired_columns(df, 's2')
+        keep = (
+            np.isfinite(s1_minutes)
+            & np.isfinite(s2_minutes)
+            & (s1_minutes >= min_minutes)
+            & (s2_minutes >= min_minutes)
+        )
+        return df.loc[keep].copy()
+
+    def _paired_frame(class_key: str) -> pd.DataFrame:
+        s1 = _get_table('session1', class_key)
+        s2 = _get_table('session2', class_key)
+        required_keys = ['session', 'cell_idx']
+        if any(col not in s1.columns for col in required_keys) or any(col not in s2.columns for col in required_keys):
+            return pd.DataFrame()
+        paired = s1.merge(
+            s2,
+            on=required_keys,
+            how='inner',
+            suffixes=('_s1', '_s2'),
+            validate='one_to_one',
+        )
+        return _filter_paired_by_included_minutes(paired)
+
+    paired_by_class = {
+        'csplus': _paired_frame('csplus'),
+        'csminus': _paired_frame('csminus'),
+    }
+
+    def _pooled_paired_frame() -> pd.DataFrame:
+        frames = [df for df in paired_by_class.values() if not df.empty]
+        if len(frames) == 0:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    pooled_pair = _pooled_paired_frame()
+
+    def _numeric_pair(df: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray]:
+        if df.empty or f'{col}_s1' not in df.columns or f'{col}_s2' not in df.columns:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        s1 = pd.to_numeric(df[f'{col}_s1'], errors='coerce').to_numpy(dtype=float)
+        s2 = pd.to_numeric(df[f'{col}_s2'], errors='coerce').to_numpy(dtype=float)
+        mask = np.isfinite(s1) & np.isfinite(s2)
+        return s1[mask], s2[mask]
+
+    def _pf_size_pair(df: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray]:
+        if df.empty or f'{col}_s1' not in df.columns or f'{col}_s2' not in df.columns:
+            return np.array([], dtype=float), np.array([], dtype=float)
+
+        def _size_pct(value: Any) -> float:
+            if isinstance(value, (list, tuple, np.ndarray)) and len(value) > 0:
+                return float(np.nansum(np.asarray(value, dtype=float)) / arena_area_cm2 * 100.0)
+            return np.nan
+
+        s1 = df[f'{col}_s1'].apply(_size_pct).to_numpy(dtype=float)
+        s2 = df[f'{col}_s2'].apply(_size_pct).to_numpy(dtype=float)
+        mask = np.isfinite(s1) & np.isfinite(s2)
+        return s1[mask], s2[mask]
+
+    def _selectivity_pair(df: pd.DataFrame, prefix: str) -> tuple[np.ndarray, np.ndarray]:
+        in_col = f'{prefix}_inout_loco_in'
+        out_col = f'{prefix}_inout_loco_out'
+        required = [f'{in_col}_s1', f'{out_col}_s1', f'{in_col}_s2', f'{out_col}_s2']
+        if df.empty or any(col not in df.columns for col in required):
+            return np.array([], dtype=float), np.array([], dtype=float)
+
+        def _sel(v_in, v_out):
+            denom = v_in + v_out
+            with np.errstate(divide='ignore', invalid='ignore'):
+                return np.where((denom > 0) & np.isfinite(v_in) & np.isfinite(v_out), (v_in - v_out) / denom, np.nan)
+
+        s1_in = pd.to_numeric(df[f'{in_col}_s1'], errors='coerce').to_numpy(dtype=float)
+        s1_out = pd.to_numeric(df[f'{out_col}_s1'], errors='coerce').to_numpy(dtype=float)
+        s2_in = pd.to_numeric(df[f'{in_col}_s2'], errors='coerce').to_numpy(dtype=float)
+        s2_out = pd.to_numeric(df[f'{out_col}_s2'], errors='coerce').to_numpy(dtype=float)
+        s1 = _sel(s1_in, s1_out)
+        s2 = _sel(s2_in, s2_out)
+        mask = np.isfinite(s1) & np.isfinite(s2)
+        return s1[mask], s2[mask]
+
+    def _pf_rank_fr_pair(df: pd.DataFrame, spike_key: str, pf_rank: int) -> tuple[np.ndarray, np.ndarray]:
+        col = f'fr_in_pf{pf_rank}_{spike_key}'
+        if df.empty or f'{col}_s1' not in df.columns or f'{col}_s2' not in df.columns:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        s1 = pd.to_numeric(df[f'{col}_s1'], errors='coerce').to_numpy(dtype=float)
+        s2 = pd.to_numeric(df[f'{col}_s2'], errors='coerce').to_numpy(dtype=float)
+        if 'n_combined_reference_pfs_s1' in df.columns:
+            n_pf_s1 = pd.to_numeric(df['n_combined_reference_pfs_s1'], errors='coerce').to_numpy(dtype=float)
+        else:
+            n_pf_s1 = np.full(len(df), np.nan)
+        if 'n_combined_reference_pfs_s2' in df.columns:
+            n_pf_s2 = pd.to_numeric(df['n_combined_reference_pfs_s2'], errors='coerce').to_numpy(dtype=float)
+        else:
+            n_pf_s2 = np.full(len(df), np.nan)
+        has_ranked_combined_pf = (n_pf_s1 >= pf_rank) & (n_pf_s2 >= pf_rank)
+        mask = has_ranked_combined_pf & np.isfinite(s1) & np.isfinite(s2)
+        return s1[mask], s2[mask]
+
+    def _cb_event_rate_pair(df: pd.DataFrame, metric_title: str) -> tuple[np.ndarray, np.ndarray]:
+        metric_to_col = {
+            'In-PF FR': 'complex_burst_event_rate_loco_in_pf',
+            'Out-PF FR': 'complex_burst_event_rate_loco_out_pf',
+            'Quiet FR': 'complex_burst_event_rate_quiet',
+            'Quiet In-PF FR': 'complex_burst_event_rate_quiet_in_pf',
+            'Quiet Out-PF FR': 'complex_burst_event_rate_quiet_out_pf',
+        }
+        col = metric_to_col.get(metric_title)
+        if col is None:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        return _numeric_pair(df, col)
+
+    def _cb_pf_rank_event_rate_pair(df: pd.DataFrame, pf_rank: int) -> tuple[np.ndarray, np.ndarray]:
+        col = f'complex_burst_event_rate_loco_in_pf{pf_rank}'
+        if df.empty or f'{col}_s1' not in df.columns or f'{col}_s2' not in df.columns:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        s1 = pd.to_numeric(df[f'{col}_s1'], errors='coerce').to_numpy(dtype=float)
+        s2 = pd.to_numeric(df[f'{col}_s2'], errors='coerce').to_numpy(dtype=float)
+        if 'n_combined_reference_pfs_s1' in df.columns:
+            n_pf_s1 = pd.to_numeric(df['n_combined_reference_pfs_s1'], errors='coerce').to_numpy(dtype=float)
+        else:
+            n_pf_s1 = np.full(len(df), np.nan)
+        if 'n_combined_reference_pfs_s2' in df.columns:
+            n_pf_s2 = pd.to_numeric(df['n_combined_reference_pfs_s2'], errors='coerce').to_numpy(dtype=float)
+        else:
+            n_pf_s2 = np.full(len(df), np.nan)
+        has_ranked_combined_pf = (n_pf_s1 >= pf_rank) & (n_pf_s2 >= pf_rank)
+        mask = has_ranked_combined_pf & np.isfinite(s1) & np.isfinite(s2)
+        return s1[mask], s2[mask]
+
+    metric_specs = [
+        ('Peak rate', 'Peak rate (Hz)', lambda df, sp: _numeric_pair(df, f'peak_rate_{sp}' if sp != 'all' else 'peak_rate_all')),
+        ('PF size', 'PF size (% arena)', lambda df, sp: _pf_size_pair(df, 'place_field_sizes_cm2' if sp == 'all' else f'place_field_sizes_cm2_{sp}')),
+        ('Coherence', 'Coherence (z)', lambda df, sp: _numeric_pair(df, f'coherence_{sp}' if sp != 'all' else 'coherence_all')),
+        ('Sparsity', 'Sparsity', lambda df, sp: _numeric_pair(df, f'sparsity_{sp}' if sp != 'all' else 'sparsity_all')),
+        ('SI', 'SI (bits/spike)', lambda df, sp: _numeric_pair(df, 'si_bits_per_spike' if sp == 'all' else f'si_bits_per_spike_{sp}')),
+        ('Selectivity', 'Selectivity', lambda df, sp: _selectivity_pair(df, sp)),
+        ('In-PF FR', 'In-PF FR (Hz)', lambda df, sp: _numeric_pair(df, f'fr_in_allpf_{sp}' if sp != 'all' else 'fr_in_allpf_all')),
+        ('Out-PF FR', 'Out-PF FR (Hz)', lambda df, sp: _numeric_pair(df, f'fr_out_allpf_{sp}' if sp != 'all' else 'fr_out_allpf_all')),
+        ('PF1 FR', 'PF1 FR (Hz)', lambda df, sp: _pf_rank_fr_pair(df, sp, 1)),
+        ('PF2 FR', 'PF2 FR (Hz)', lambda df, sp: _pf_rank_fr_pair(df, sp, 2)),
+        ('Quiet FR', 'Quiet FR (Hz)', lambda df, sp: _numeric_pair(df, f'fr_quiet_all_allpf_{sp}' if sp != 'all' else 'fr_quiet_all_allpf_all')),
+        ('Quiet In-PF FR', 'Quiet In-PF FR (Hz)', lambda df, sp: _numeric_pair(df, f'fr_quiet_in_allpf_{sp}' if sp != 'all' else 'fr_quiet_in_allpf_all')),
+        ('Quiet Out-PF FR', 'Quiet Out-PF FR (Hz)', lambda df, sp: _numeric_pair(df, f'fr_quiet_out_allpf_{sp}' if sp != 'all' else 'fr_quiet_out_allpf_all')),
+    ]
+    row_specs = [
+        ('csplus', 'all', 'CS+ All', ALL_COLOR, 'spike'),
+        ('csplus', 'ss', 'CS+ SS', SS_COLOR, 'spike'),
+        ('csplus', 'cs', 'CS+ CS', CS_COLOR, 'spike'),
+        ('csplus', 'cb', 'CS+ CB', CB_COLOR, 'complex_burst'),
+        ('csminus', 'all', 'CS- All', ALL_COLOR, 'spike'),
+        ('csminus', 'ss', 'CS- SS', SS_COLOR, 'spike'),
+        ('csminus', 'cs', 'CS- CS', CS_COLOR, 'spike'),
+    ]
+    cb_row_indices = {
+        row_idx
+        for row_idx, row_spec in enumerate(row_specs)
+        if row_spec[4] == 'complex_burst'
+    }
+
+    has_data_grid = np.zeros(axes.shape, dtype=bool)
+
+    def _draw_pair_panel(ax, s1_vals: np.ndarray, s2_vals: np.ndarray, color: str, ylabel: str) -> bool:
+        data = [np.asarray(s1_vals, dtype=float), np.asarray(s2_vals, dtype=float)]
+        for pos, vals in zip([1, 2], data):
+            if vals.size >= 3:
+                parts = ax.violinplot([vals], positions=[pos], showmedians=True, showextrema=False, widths=0.55)
+                _style_violin_medians(parts)
+                body = parts['bodies'][0]
+                body.set_facecolor(color)
+                body.set_edgecolor('none')
+                body.set_alpha(0.35)
+
+        for i in range(min(len(s1_vals), len(s2_vals))):
+            ax.plot([1, 2], [s1_vals[i], s2_vals[i]], color='black', alpha=0.22, linewidth=0.45, zorder=1)
+        if len(s1_vals) > 0:
+            jitter = np.linspace(-0.08, 0.08, len(s1_vals)) if len(s1_vals) > 1 else np.array([0.0])
+            ax.scatter(np.full(len(s1_vals), 1.0) + jitter, s1_vals, s=4, color='black', alpha=0.55, linewidths=0, zorder=2)
+            ax.scatter(np.full(len(s2_vals), 2.0) + jitter, s2_vals, s=4, color='black', alpha=0.55, linewidths=0, zorder=2)
+
+        ylim = _global_ylim(data)
+        if ylim is not None:
+            y_range = ylim[1] - ylim[0]
+            y_top = ylim[1]
+            if len(s1_vals) >= 3:
+                p, _, _, _, _ = _paired_test(s1_vals, s2_vals)
+                h = y_range * 0.03
+                y = ylim[1] + y_range * 0.06
+                _add_bracket(ax, 1, 2, y, h, _sig_label(p))
+                y_top = y + h + y_range * 0.13
+            ax.set_ylim(ylim[0], y_top + y_range * 0.05)
+
+        ax.set_xlim(0.55, 2.45)
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels(['S1', 'S2'], fontsize=5, fontname='Arial')
+        ax.set_ylabel(ylabel, fontsize=6, fontname='Arial')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(axis='both', labelsize=5)
+        ax.text(0.96, 0.94, f'n={len(s1_vals)}', transform=ax.transAxes, ha='right', va='top', fontsize=5, fontname='Arial')
+        return len(s1_vals) > 0
+
+    for col_idx, (title, ylabel, getter) in enumerate(metric_specs):
+        axes[0, col_idx].set_title(title, fontsize=6, fontname='Arial')
+        for row_idx, (class_key, spike_key, row_label, color, row_kind) in enumerate(row_specs):
+            df_pair = paired_by_class[class_key]
+            if row_kind == 'complex_burst':
+                if 'FR' not in title:
+                    axes[row_idx, col_idx].axis('off')
+                    if col_idx == 0:
+                        axes[row_idx, col_idx].text(
+                            -0.45,
+                            0.5,
+                            row_label,
+                            transform=axes[row_idx, col_idx].transAxes,
+                            rotation=90,
+                            ha='center',
+                            va='center',
+                            fontsize=6,
+                            fontname='Arial',
+                        )
+                    continue
+                if title == 'PF1 FR':
+                    s1_vals, s2_vals = _cb_pf_rank_event_rate_pair(df_pair, 1)
+                elif title == 'PF2 FR':
+                    s1_vals, s2_vals = _cb_pf_rank_event_rate_pair(df_pair, 2)
+                else:
+                    s1_vals, s2_vals = _cb_event_rate_pair(df_pair, title)
+                panel_ylabel = 'CB event rate (Hz)'
+            else:
+                s1_vals, s2_vals = getter(df_pair, spike_key)
+                panel_ylabel = ylabel
+            has_data_grid[row_idx, col_idx] = _draw_pair_panel(axes[row_idx, col_idx], s1_vals, s2_vals, color, panel_ylabel)
+            if col_idx == 0:
+                axes[row_idx, col_idx].text(
+                    -0.45,
+                    0.5,
+                    row_label,
+                    transform=axes[row_idx, col_idx].transAxes,
+                    rotation=90,
+                    ha='center',
+                    va='center',
+                    fontsize=6,
+                    fontname='Arial',
+                )
+
+    pooled_col_idx = len(metric_specs)
+    pooled_metric_specs = [
+        ('Quiet FR', 'Quiet FR (Hz)', 'fr_quiet_all_allpf_all'),
+        ('Quiet In-PF FR', 'Quiet In-PF FR (Hz)', 'fr_quiet_in_allpf_all'),
+        ('Quiet Out-PF FR', 'Quiet Out-PF FR (Hz)', 'fr_quiet_out_allpf_all'),
+        ('Locomotion FR', 'Locomotion FR (Hz)', 'fr_loco_all_allpf_all'),
+        ('Loc IN-PF FR', 'Loc IN-PF FR (Hz)', 'fr_in_allpf_all'),
+        ('Loc Out-PF FR', 'Loc Out-PF FR (Hz)', 'fr_out_allpf_all'),
+    ]
+    axes[0, pooled_col_idx].set_title('Pooled All', fontsize=6, fontname='Arial')
+    for pooled_row_idx, (_title, ylabel, col) in enumerate(pooled_metric_specs):
+        s1_vals, s2_vals = _numeric_pair(pooled_pair, col)
+        has_data_grid[pooled_row_idx, pooled_col_idx] = _draw_pair_panel(
+            axes[pooled_row_idx, pooled_col_idx],
+            s1_vals,
+            s2_vals,
+            ALL_COLOR,
+            ylabel,
+        )
+    for row_idx in range(len(pooled_metric_specs), axes.shape[0]):
+        axes[row_idx, pooled_col_idx].axis('off')
+
+    for col_idx in range(axes.shape[1]):
+        data_rows = np.flatnonzero(has_data_grid[:, col_idx])
+        shared_data_rows = [row_idx for row_idx in data_rows if row_idx not in cb_row_indices]
+        ylims = [axes[row_idx, col_idx].get_ylim() for row_idx in shared_data_rows]
+        y_min = min(y[0] for y in ylims) if ylims else None
+        y_max = max(y[1] for y in ylims) if ylims else None
+        for row_idx in range(axes.shape[0]):
+            if y_min is not None and row_idx not in cb_row_indices:
+                axes[row_idx, col_idx].set_ylim(y_min, y_max)
+            if row_idx != axes.shape[0] - 1:
+                axes[row_idx, col_idx].set_xticklabels([])
+    axes[len(pooled_metric_specs) - 1, pooled_col_idx].set_xticklabels(['S1', 'S2'], fontsize=5, fontname='Arial')
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    return fig
+
+
+def plot_all_cells_session_state_rate_comparison_4cols(
+    session_compare_groups,
+    save_path,
+    fig_width: float = 6.5,
+    fig_height: float = 3.6,
+    cs_min_rate_hz: float = 0.5,
+    cb_min_event_rate_hz: float = 0.1,
+    min_included_minutes_per_session: float | None = None,
+    show_only_significant: bool = False,
+):
+    """Plot quiet/moving S1/S2 rate comparisons for all retained cells."""
+    cs_min_rate_hz = float(cs_min_rate_hz)
+    cb_min_event_rate_hz = float(cb_min_event_rate_hz)
+    if (not np.isfinite(cs_min_rate_hz)) or cs_min_rate_hz < 0:
+        raise ValueError("cs_min_rate_hz must be a finite number >= 0.")
+    if (not np.isfinite(cb_min_event_rate_hz)) or cb_min_event_rate_hz < 0:
+        raise ValueError("cb_min_event_rate_hz must be a finite number >= 0.")
+
+    def _resolved_min_minutes() -> float:
+        if min_included_minutes_per_session is None:
+            return 0.0
+        try:
+            value = float(min_included_minutes_per_session)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if np.isfinite(value) else 0.0
+
+    min_minutes = _resolved_min_minutes()
+
+    def _included_minutes(cell: dict[str, Any]) -> float:
+        for col in ("included_minutes", "included_time_min"):
+            if col in cell:
+                try:
+                    value = float(cell.get(col, np.nan))
+                except (TypeError, ValueError):
+                    value = np.nan
+                if np.isfinite(value):
+                    return value
+        try:
+            kept = float(cell.get("n_frames_kept_total", np.nan))
+            frame_rate = float(cell.get("frame_rate", np.nan))
+        except (TypeError, ValueError):
+            return np.nan
+        if np.isfinite(kept) and np.isfinite(frame_rate) and frame_rate > 0:
+            return kept / frame_rate / 60.0
+        return np.nan
+
+    def _passes_included_minutes(cell: dict[str, Any]) -> bool:
+        if min_minutes <= 0:
+            return True
+        minutes = _included_minutes(cell)
+        return bool(np.isfinite(minutes) and minutes >= min_minutes)
+
+    def _cell_condition(cell: dict[str, Any]) -> str:
+        label = str(cell.get("condition_label", "")).lower()
+        condition = str(cell.get("condition", "")).lower()
+        if "session 1" in label or condition == "session1":
+            return "session1"
+        if "session 2" in label or condition == "session2":
+            return "session2"
+        return ""
+
+    def _session_cell(group, session_key: str, fallback_idx: int) -> dict[str, Any] | None:
+        if not isinstance(group, (list, tuple)):
+            return None
+        for cell in group:
+            if isinstance(cell, dict) and _cell_condition(cell) == session_key:
+                return cell
+        if len(group) >= 3:
+            idx = 1 if session_key == "session1" else 2
+            if isinstance(group[idx], dict):
+                return group[idx]
+        if len(group) > fallback_idx and isinstance(group[fallback_idx], dict):
+            return group[fallback_idx]
+        return None
+
+    def _valid_session_pair(group) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        s1 = _session_cell(group, "session1", 0)
+        s2 = _session_cell(group, "session2", 1)
+        if not isinstance(s1, dict) or not isinstance(s2, dict):
+            return None
+        if bool(s1.get("is_na_panel", False)) or bool(s2.get("is_na_panel", False)):
+            return None
+        if not _passes_included_minutes(s1) or not _passes_included_minutes(s2):
+            return None
+        return s1, s2
+
+    all_groups = []
+    for key in ("csplus_groups", "csminus_groups", "nonpc_groups"):
+        groups = session_compare_groups.get(key, []) if isinstance(session_compare_groups, dict) else []
+        if isinstance(groups, (list, tuple)):
+            all_groups.extend(groups)
+
+    paired_cells = []
+    for group in all_groups:
+        pair = _valid_session_pair(group)
+        if pair is not None:
+            paired_cells.append(pair)
+
+    def _numeric(cell: dict[str, Any], col: str) -> float:
+        try:
+            return float(cell.get(col, np.nan))
+        except (TypeError, ValueError):
+            return np.nan
+
+    def _panel_matrix(quiet_col: str, moving_col: str, threshold: float | None = None) -> np.ndarray:
+        rows = []
+        for s1, s2 in paired_cells:
+            vals = np.array(
+                [
+                    _numeric(s1, quiet_col),
+                    _numeric(s1, moving_col),
+                    _numeric(s2, quiet_col),
+                    _numeric(s2, moving_col),
+                ],
+                dtype=float,
+            )
+            if not np.all(np.isfinite(vals)):
+                continue
+            if threshold is not None and not np.any(vals >= float(threshold)):
+                continue
+            rows.append(vals)
+        if not rows:
+            return np.empty((0, 4), dtype=float)
+        return np.vstack(rows).astype(float, copy=False)
+
+    panel_specs = [
+        ("All spikes", "all_rate_quiet", "all_rate_loco", None, ALL_COLOR),
+        ("Simple spikes", "ss_rate_quiet", "ss_rate_loco", None, SS_COLOR),
+        (f"Complex spikes\n>= {cs_min_rate_hz:g} Hz", "cs_rate_quiet", "cs_rate_loco", cs_min_rate_hz, CS_COLOR),
+        (
+            f"Complex bursts\n>= {cb_min_event_rate_hz:g} Hz",
+            "complex_burst_event_rate_quiet",
+            "complex_burst_event_rate_loco",
+            cb_min_event_rate_hz,
+            CB_COLOR,
+        ),
+    ]
+
+    fig, axes = plt.subplots(2, 4, figsize=(fig_width, fig_height), sharex=False, sharey=False)
+    axes = np.asarray(axes)
+    positions = np.array([1.0, 2.0], dtype=float)
+    xticklabels = ["S1", "S2"]
+
+    def _draw_state_panel(
+        ax,
+        matrix: np.ndarray,
+        value_indices: tuple[int, int],
+        title: str,
+        color: str,
+        row_label: str,
+        show_title: bool,
+    ) -> None:
+        if matrix.size:
+            panel_matrix = matrix[:, list(value_indices)]
+            finite_rows = np.all(np.isfinite(panel_matrix), axis=1)
+            panel_matrix = panel_matrix[finite_rows]
+        else:
+            panel_matrix = np.empty((0, 2), dtype=float)
+        data = [
+            panel_matrix[:, idx] if panel_matrix.size else np.array([], dtype=float)
+            for idx in range(2)
+        ]
+
+        for pos, vals in zip(positions, data):
+            if vals.size >= 3:
+                parts = ax.violinplot([vals], positions=[pos], showmedians=True, showextrema=False, widths=0.55)
+                _style_violin_medians(parts)
+                body = parts["bodies"][0]
+                body.set_facecolor(color)
+                body.set_edgecolor("none")
+                body.set_alpha(0.35)
+
+        for row in panel_matrix:
+            ax.plot(positions, row, color="black", alpha=0.16, linewidth=0.45, zorder=1)
+
+        for pos, vals in zip(positions, data):
+            if vals.size == 0:
+                continue
+            jitter = np.linspace(-0.08, 0.08, vals.size) if vals.size > 1 else np.array([0.0])
+            ax.scatter(np.full(vals.size, pos) + jitter, vals, s=5, color="black", alpha=0.55, linewidths=0, zorder=2)
+
+        ylim = _global_ylim(data)
+        if ylim is None:
+            ylim = (0.0, 1.0)
+        bracket_levels = []
+        if panel_matrix.shape[0] >= 3:
+            p_s1_s2, _, _, _, _ = _paired_test(panel_matrix[:, 0], panel_matrix[:, 1])
+            bracket_levels = [
+                [{"pos1": positions[0], "pos2": positions[1], "p": p_s1_s2, "color": color}],
+            ]
+
+        y_range = ylim[1] - ylim[0]
+        y_top = _draw_sig_bracket_levels(ax, bracket_levels, ylim, bool(show_only_significant))
+        ax.set_ylim(ylim[0], y_top + y_range * 0.05)
+        ax.set_xlim(0.55, 2.45)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(xticklabels, fontsize=5, fontname="Arial")
+        if show_title:
+            ax.set_title(title, fontsize=6, fontname="Arial")
+        ax.set_ylabel("Rate (Hz)", fontsize=6, fontname="Arial")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(axis="both", labelsize=5)
+        ax.text(
+            0.96,
+            0.94,
+            f"n={panel_matrix.shape[0]}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=5,
+            fontname="Arial",
+        )
+        if row_label:
+            ax.text(
+                -0.38,
+                0.5,
+                row_label,
+                transform=ax.transAxes,
+                rotation=90,
+                ha="center",
+                va="center",
+                fontsize=6,
+                fontname="Arial",
+                clip_on=False,
+            )
+
+    for col_idx, (title, quiet_col, moving_col, threshold, color) in enumerate(panel_specs):
+        matrix = _panel_matrix(quiet_col, moving_col, threshold=threshold)
+        _draw_state_panel(
+            axes[0, col_idx],
+            matrix,
+            (0, 2),
+            title,
+            color,
+            "Quiet" if col_idx == 0 else "",
+            show_title=True,
+        )
+        _draw_state_panel(
+            axes[1, col_idx],
+            matrix,
+            (1, 3),
+            title,
+            color,
+            "Moving" if col_idx == 0 else "",
+            show_title=False,
+        )
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    return fig
+
+
+def plot_combined_cs_plus_minus_session_pair_metrics_13cols(
+    session_tables: dict[str, dict[str, pd.DataFrame]],
+    save_path: str,
+    fig_width: float = 14.5,
+    fig_height: float = 7.0,
+    min_included_minutes_per_session: float | None = None,
+):
+    """Backward-compatible wrapper; the session-pair summary now includes 14 columns."""
+    return plot_combined_cs_plus_minus_session_pair_metrics_14cols(
+        session_tables=session_tables,
+        save_path=save_path,
+        fig_width=fig_width,
+        fig_height=fig_height,
+        min_included_minutes_per_session=min_included_minutes_per_session,
+    )
+
+
+def plot_combined_cs_plus_minus_session_pair_metrics_9cols(
+    session_tables: dict[str, dict[str, pd.DataFrame]],
+    save_path: str,
+    fig_width: float = 14.5,
+    fig_height: float = 7.0,
+    min_included_minutes_per_session: float | None = None,
+):
+    """Backward-compatible wrapper; the session-pair summary now includes 14 columns."""
+    return plot_combined_cs_plus_minus_session_pair_metrics_14cols(
+        session_tables=session_tables,
+        save_path=save_path,
+        fig_width=fig_width,
+        fig_height=fig_height,
+        min_included_minutes_per_session=min_included_minutes_per_session,
+    )
+
+
+def plot_combined_cs_plus_minus_session_pair_metrics_7cols(
+    session_tables: dict[str, dict[str, pd.DataFrame]],
+    save_path: str,
+    fig_width: float = 9.5,
+    fig_height: float = 7.0,
+    min_included_minutes_per_session: float | None = None,
+):
+    """Backward-compatible wrapper; the session-pair summary now includes 14 columns."""
+    return plot_combined_cs_plus_minus_session_pair_metrics_14cols(
+        session_tables=session_tables,
+        save_path=save_path,
+        fig_width=fig_width,
+        fig_height=fig_height,
+        min_included_minutes_per_session=min_included_minutes_per_session,
+    )
 
 
 def _confidence_interval_corr(x, y, x_pred, confidence: float = 0.95):
@@ -813,59 +2080,300 @@ def _selectivity_from_cols(df, in_col, out_col):
         return np.where((v_sum > 0) & np.isfinite(v_in) & np.isfinite(v_out), (v_in - v_out) / v_sum, np.nan)
 
 
+def plot_in_pf_fr_vs_all_pf_size_by_cs_group(
+    df_cs_plc: pd.DataFrame,
+    df_non_cs_plc: pd.DataFrame,
+    save_path: str,
+    fig_width: float = 1.6,
+    fig_height: float = 1.35,
+    arena_area_cm2: float = 20.0 * 35.5,
+    fr_metric: str = "mean",
+):
+    """Plot all-spike in-PF firing rate against summed all-spike PF size.
+
+    fr_metric='mean' uses the mean all-spike in-field FR. fr_metric='peak'
+    uses the all-spike spatial-map peak rate within the place-field map.
+    """
+
+    metric_key = str(fr_metric).strip().lower().replace("-", "_")
+    metric_aliases = {
+        "mean": "mean",
+        "mean_fr": "mean",
+        "in_pf_mean": "mean",
+        "in_pf_mean_fr": "mean",
+        "peak": "peak",
+        "peak_fr": "peak",
+        "in_pf_peak": "peak",
+        "in_pf_peak_fr": "peak",
+    }
+    metric_key = metric_aliases.get(metric_key)
+    if metric_key is None:
+        raise ValueError("fr_metric must be one of {'mean', 'peak'}.")
+
+    if metric_key == "mean":
+        fr_label = "Mean In-PF FR"
+        fr_column_label = "fr_in_allpf_all"
+        x_label = "Mean In-PF FR (Hz)"
+    else:
+        fr_label = "Peak In-PF FR"
+        fr_column_label = "peak_rate_all"
+        x_label = "Peak In-PF FR (Hz)"
+
+    def _extract_group(df: pd.DataFrame, group_label: str) -> pd.DataFrame:
+        if metric_key == "mean":
+            fr_col = "fr_in_allpf_all" if "fr_in_allpf_all" in df.columns else "all_inout_loco_in"
+            if fr_col not in df.columns:
+                raise KeyError("df missing 'fr_in_allpf_all' and fallback 'all_inout_loco_in'")
+        else:
+            fr_col = "peak_rate_all"
+            if fr_col not in df.columns:
+                raise KeyError("df missing column 'peak_rate_all'")
+        if "place_field_sizes_cm2" not in df.columns:
+            raise KeyError("df missing column 'place_field_sizes_cm2'")
+
+        x = pd.to_numeric(df[fr_col], errors="coerce").to_numpy(dtype=float)
+        y = _pf_sizes_pct_from_col(df, "place_field_sizes_cm2", arena_area_cm2)
+        rows = []
+        for row_i, (_, row) in enumerate(df.iterrows()):
+            session = row.get("session", "")
+            cell_idx_raw = row.get("cell_idx", np.nan)
+            try:
+                cell_idx = int(cell_idx_raw)
+            except Exception:
+                cell_idx = np.nan
+            cell_num = int(cell_idx + 1) if np.isfinite(cell_idx) else np.nan
+            rows.append(
+                {
+                    "group": group_label,
+                    "session": session,
+                    "cell_idx": cell_idx,
+                    "cell_num": cell_num,
+                    "fr_metric": metric_key,
+                    "fr_source_column": fr_col,
+                    "in_pf_fr_hz": float(x[row_i]) if np.isfinite(x[row_i]) else np.nan,
+                    "pf_size_all_pfs_pct_arena": float(y[row_i]) if np.isfinite(y[row_i]) else np.nan,
+                }
+            )
+        out = pd.DataFrame(rows)
+        return out[np.isfinite(out["in_pf_fr_hz"]) & np.isfinite(out["pf_size_all_pfs_pct_arena"])].copy()
+
+    def _stats_for_group(data: pd.DataFrame, group_label: str) -> dict[str, Any]:
+        x = data["in_pf_fr_hz"].to_numpy(dtype=float)
+        y = data["pf_size_all_pfs_pct_arena"].to_numpy(dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x = x[mask]
+        y = y[mask]
+        out = {
+            "group": group_label,
+            "fr_metric": metric_key,
+            "fr_source_column": fr_column_label,
+            "n": int(x.size),
+            "pearson_r": np.nan,
+            "p_value": np.nan,
+            "slope": np.nan,
+            "intercept": np.nan,
+        }
+        if x.size < 3 or np.nanstd(x) == 0 or np.nanstd(y) == 0:
+            return out
+        lr = scipy_stats.linregress(x, y)
+        r, p = scipy_stats.pearsonr(x, y)
+        out.update(
+            {
+                "pearson_r": float(r),
+                "p_value": float(p),
+                "slope": float(lr.slope),
+                "intercept": float(lr.intercept),
+            }
+        )
+        return out
+
+    data_df = pd.concat(
+        [
+            _extract_group(df_cs_plc, "CS+ PLC"),
+            _extract_group(df_non_cs_plc, "CS- PLC"),
+        ],
+        ignore_index=True,
+    )
+    stats_df = pd.DataFrame(
+        [
+            _stats_for_group(data_df[data_df["group"] == "CS+ PLC"], "CS+ PLC"),
+            _stats_for_group(data_df[data_df["group"] == "CS- PLC"], "CS- PLC"),
+        ]
+    )
+
+    fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+    ax.set_facecolor(CS_PLC_BG)
+    ax.patch.set_alpha(0.22)
+    ax.tick_params(labelsize=5)
+    for label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+        label.set_fontname("Arial")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    group_specs = [
+        ("CS+ PLC", CS_COLOR, 0.82),
+        ("CS- PLC", "#1F77B4", 0.70),
+    ]
+    for group_label, color, text_y in group_specs:
+        sub = data_df[data_df["group"] == group_label]
+        _plot_corr_series(
+            ax,
+            sub["in_pf_fr_hz"].to_numpy(dtype=float),
+            sub["pf_size_all_pfs_pct_arena"].to_numpy(dtype=float),
+            series_label=group_label,
+            color=color,
+            xlabel=x_label,
+            ylabel="PF size all PFs (% arena)",
+            panel_name=f"{fr_label} vs all PF size",
+            text_y=text_y,
+            linestyle="-",
+        )
+
+    ax.set_xlabel(x_label, fontsize=6, fontname="Arial")
+    ax.set_ylabel("PF size all PFs (% arena)", fontsize=6, fontname="Arial")
+    plt.tight_layout()
+
+    figure_path = None
+    if save_path:
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        figure_path = save_path
+
+    return {
+        "fig": fig,
+        "data_df": data_df,
+        "stats_df": stats_df,
+        "fr_metric": metric_key,
+        "figure_path": figure_path,
+    }
+
+
 def plot_cs_plus_plc_correlations_overlay_cs_ss(
     df_cs_plc: pd.DataFrame,
     save_path: str,
     overlay_ss_metrics: bool = True,
+    fr_metric: str = "peak",
+    df_non_cs_plc: pd.DataFrame | None = None,
+    csminus_spike_metric: str = "ss",
 ):
     cs_color_local = CS_COLOR
     ss_color_local = SS_COLOR
+    all_color_local = ALL_COLOR
+    cb_color_local = CB_COLOR
     # In the original pooled notebook this resolves from global `cs_plc_bg`,
     # which is set to light orange.
     cs_plc_bg_local = CS_PLC_BG
+    non_cs_plc_bg_local = NON_CS_PLC_BG
 
     arena_area_cm2_local = 20.0 * 35.5
 
-    if 'peak_rate_cs' not in df_cs_plc.columns:
-        raise KeyError("df_cs_plc missing column 'peak_rate_cs'")
-    x_peak_cs = np.asarray(df_cs_plc['peak_rate_cs'].values, dtype=float)
+    metric_key = str(fr_metric).strip().lower().replace("-", "_")
+    metric_aliases = {
+        "peak": "peak",
+        "peak_fr": "peak",
+        "mean": "mean",
+        "mean_fr": "mean",
+        "in_pf_mean": "mean",
+        "in_pf_mean_fr": "mean",
+    }
+    metric_key = metric_aliases.get(metric_key)
+    if metric_key is None:
+        raise ValueError("fr_metric must be one of {'peak', 'mean'}.")
 
-    pf_sizes_cs_pct = _pf_sizes_pct_from_col(df_cs_plc, 'place_field_sizes_cm2_cs', arena_area_cm2_local)
+    csminus_metric_key = str(csminus_spike_metric).strip().lower().replace("-", "_")
+    csminus_metric_aliases = {
+        "ss": "ss",
+        "simple": "ss",
+        "simple_spike": "ss",
+        "simple_spikes": "ss",
+        "all": "all",
+        "all_spike": "all",
+        "all_spikes": "all",
+    }
+    csminus_metric_key = csminus_metric_aliases.get(csminus_metric_key)
+    if csminus_metric_key is None:
+        raise ValueError("csminus_spike_metric must be one of {'ss', 'all'}.")
 
-    if 'si_bits_per_spike_cs' not in df_cs_plc.columns:
-        raise KeyError("df_cs_plc missing column 'si_bits_per_spike_cs'")
-    si_cs = np.asarray(df_cs_plc['si_bits_per_spike_cs'].values, dtype=float)
+    if metric_key == "mean":
+        rate_label = "Mean In-PF FR"
+        rate_axis_label = "Mean In-PF FR (Hz)"
+    else:
+        rate_label = "Peak rate"
+        rate_axis_label = "Peak rate (Hz)"
 
-    cs_selectivity = _selectivity_from_cols(df_cs_plc, 'cs_inout_loco_in', 'cs_inout_loco_out')
+    def _column_label(spike_key: str, base_col: str) -> str:
+        return base_col if spike_key == "all" else f"{base_col}_{spike_key}"
 
-    fig, axes = plt.subplots(1, 6, figsize=(1.0 * 6, 1.2))
-    axes[4].sharey(axes[3])
+    def _mean_pf_fr_values(df: pd.DataFrame, spike_key: str, inout_key: str, df_label: str) -> np.ndarray:
+        col = f"fr_{inout_key}_allpf_{spike_key}"
+        fallback_col = f"{spike_key}_inout_loco_{inout_key}"
+        if col not in df.columns:
+            col = fallback_col
+        if col not in df.columns:
+            raise KeyError(
+                f"{df_label} missing 'fr_{inout_key}_allpf_{spike_key}' and fallback '{fallback_col}'"
+            )
+        return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
 
-    x_peak_ss = None
-    pf_sizes_ss_pct = None
-    si_ss = None
-    ss_selectivity = None
+    def _rate_values(df: pd.DataFrame, spike_key: str, df_label: str) -> np.ndarray:
+        if metric_key == "peak":
+            col = f"peak_rate_{spike_key}"
+            if col not in df.columns:
+                raise KeyError(f"{df_label} missing column '{col}'")
+        else:
+            return _mean_pf_fr_values(df, spike_key, "in", df_label)
+        return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+
+    def _spike_metric_values(df: pd.DataFrame, spike_key: str, df_label: str) -> dict[str, Any]:
+        pf_col = _column_label(spike_key, "place_field_sizes_cm2")
+        si_col = _column_label(spike_key, "si_bits_per_spike")
+        if si_col not in df.columns:
+            raise KeyError(f"{df_label} missing column '{si_col}'")
+        return {
+            "rate": _rate_values(df, spike_key, df_label),
+            "mean_in_fr": _mean_pf_fr_values(df, spike_key, "in", df_label),
+            "mean_out_fr": _mean_pf_fr_values(df, spike_key, "out", df_label),
+            "pf_size": _pf_sizes_pct_from_col(df, pf_col, arena_area_cm2_local),
+            "si": pd.to_numeric(df[si_col], errors="coerce").to_numpy(dtype=float),
+            "selectivity": _selectivity_from_cols(
+                df,
+                f"{spike_key}_inout_loco_in",
+                f"{spike_key}_inout_loco_out",
+            ),
+            "label": {"all": "All", "ss": "SS", "cs": "CS"}.get(spike_key, spike_key.upper()),
+            "color": {"all": all_color_local, "ss": ss_color_local, "cs": cs_color_local}.get(
+                spike_key,
+                "black",
+            ),
+        }
+
+    cs_metrics = _spike_metric_values(df_cs_plc, "cs", "df_cs_plc")
+    ss_metrics = None
     if overlay_ss_metrics:
-        if 'peak_rate_ss' not in df_cs_plc.columns:
-            raise KeyError("df_cs_plc missing column 'peak_rate_ss'")
-        if 'si_bits_per_spike_ss' not in df_cs_plc.columns:
-            raise KeyError("df_cs_plc missing column 'si_bits_per_spike_ss'")
-        x_peak_ss = np.asarray(df_cs_plc['peak_rate_ss'].values, dtype=float)
-        pf_sizes_ss_pct = _pf_sizes_pct_from_col(df_cs_plc, 'place_field_sizes_cm2_ss', arena_area_cm2_local)
-        si_ss = np.asarray(df_cs_plc['si_bits_per_spike_ss'].values, dtype=float)
-        ss_selectivity = _selectivity_from_cols(df_cs_plc, 'ss_inout_loco_in', 'ss_inout_loco_out')
+        ss_metrics = _spike_metric_values(df_cs_plc, "ss", "df_cs_plc")
 
-    panels = [
-        (axes[0], x_peak_cs, pf_sizes_cs_pct, x_peak_ss, pf_sizes_ss_pct, 'Peak rate (Hz)', 'PF size (% arena)', 'Peak rate vs PF size'),
-        (axes[1], si_cs, x_peak_cs, si_ss, x_peak_ss, 'SI (bits/spike)', 'Peak rate (Hz)', 'SI vs Peak rate'),
-        (axes[2], x_peak_cs, cs_selectivity, x_peak_ss, ss_selectivity, 'Peak rate (Hz)', 'Selectivity', 'Peak rate vs Selectivity'),
-        (axes[3], si_cs, pf_sizes_cs_pct, si_ss, pf_sizes_ss_pct, 'SI (bits/spike)', 'PF size (% arena)', 'SI vs PF size'),
-        (axes[4], cs_selectivity, pf_sizes_cs_pct, ss_selectivity, pf_sizes_ss_pct, 'Selectivity', 'PF size (% arena)', 'Selectivity vs PF size'),
-        (axes[5], si_cs, cs_selectivity, si_ss, ss_selectivity, 'SI (bits/spike)', 'Selectivity', 'SI vs Selectivity'),
-    ]
+    if 'complex_burst_event_rate_loco_in_pf' not in df_cs_plc.columns:
+        raise KeyError("df_cs_plc missing column 'complex_burst_event_rate_loco_in_pf'")
+    cb_rate = pd.to_numeric(
+        df_cs_plc['complex_burst_event_rate_loco_in_pf'],
+        errors="coerce",
+    ).to_numpy(dtype=float)
 
-    for ax, x_cs, y_cs, x_ss, y_ss, xlabel, ylabel, panel_name in panels:
-        ax.set_facecolor(cs_plc_bg_local)
+    has_csminus_row = df_non_cs_plc is not None
+    n_rows = 2 if has_csminus_row else 1
+    fig, axes = plt.subplots(n_rows, 9, figsize=(1.0 * 9, 1.2 * n_rows))
+    axes = np.asarray(axes)
+    if axes.ndim == 1:
+        axes = axes.reshape(1, -1)
+
+    axes[0, 5].sharey(axes[0, 4])
+    axes[0, 7].sharey(axes[0, 0])
+    axes[0, 8].sharey(axes[0, 2])
+
+    def _style_corr_axis(ax, bg_color: str) -> None:
+        ax.set_facecolor(bg_color)
         ax.patch.set_alpha(0.3)
         ax.tick_params(labelsize=5)
         for label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
@@ -873,40 +2381,789 @@ def plot_cs_plus_plc_correlations_overlay_cs_ss(
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
 
+    def _plot_six_corr_panels(ax_row, primary, overlay, bg_color: str) -> None:
+        panels = [
+            (ax_row[0], primary["rate"], primary["pf_size"], None if overlay is None else overlay["rate"], None if overlay is None else overlay["pf_size"], rate_axis_label, 'PF size (% arena)', f'{rate_label} vs PF size'),
+            (ax_row[1], primary["si"], primary["rate"], None if overlay is None else overlay["si"], None if overlay is None else overlay["rate"], 'SI (bits/spike)', rate_axis_label, f'SI vs {rate_label}'),
+            (ax_row[2], primary["rate"], primary["selectivity"], None if overlay is None else overlay["rate"], None if overlay is None else overlay["selectivity"], rate_axis_label, 'Selectivity', f'{rate_label} vs Selectivity'),
+            (ax_row[3], primary["mean_in_fr"], primary["mean_out_fr"], None if overlay is None else overlay["mean_in_fr"], None if overlay is None else overlay["mean_out_fr"], 'Mean In-PF FR (Hz)', 'Mean Out-PF FR (Hz)', 'Mean In-PF FR vs Mean Out-PF FR'),
+            (ax_row[4], primary["si"], primary["pf_size"], None if overlay is None else overlay["si"], None if overlay is None else overlay["pf_size"], 'SI (bits/spike)', 'PF size (% arena)', 'SI vs PF size'),
+            (ax_row[5], primary["selectivity"], primary["pf_size"], None if overlay is None else overlay["selectivity"], None if overlay is None else overlay["pf_size"], 'Selectivity', 'PF size (% arena)', 'Selectivity vs PF size'),
+            (ax_row[6], primary["si"], primary["selectivity"], None if overlay is None else overlay["si"], None if overlay is None else overlay["selectivity"], 'SI (bits/spike)', 'Selectivity', 'SI vs Selectivity'),
+        ]
+
+        for ax, x_primary, y_primary, x_overlay, y_overlay, xlabel, ylabel, panel_name in panels:
+            _style_corr_axis(ax, bg_color)
+            any_plotted = False
+            any_plotted |= _plot_corr_series(
+                ax,
+                x_primary,
+                y_primary,
+                series_label=primary["label"],
+                color=primary["color"],
+                xlabel=xlabel,
+                ylabel=ylabel,
+                panel_name=panel_name,
+                text_y=0.82,
+                linestyle='-',
+            )
+
+            if overlay is not None:
+                any_plotted |= _plot_corr_series(
+                    ax,
+                    x_overlay,
+                    y_overlay,
+                    series_label=overlay["label"],
+                    color=overlay["color"],
+                    xlabel=xlabel,
+                    ylabel=ylabel,
+                    panel_name=panel_name,
+                    text_y=0.92,
+                    linestyle='-',
+                )
+
+            if not any_plotted:
+                ax.axis('off')
+
+    _plot_six_corr_panels(axes[0], cs_metrics, ss_metrics, cs_plc_bg_local)
+
+    cb_panels = [
+        (axes[0, 7], cb_rate, cs_metrics["pf_size"], 'CB event rate in PF (Hz)', 'PF size (% arena)', 'CB rate vs PF size'),
+        (axes[0, 8], cb_rate, cs_metrics["selectivity"], 'CB event rate in PF (Hz)', 'Selectivity', 'CB rate vs Selectivity'),
+    ]
+    for ax, x_cb, y_cb, xlabel, ylabel, panel_name in cb_panels:
+        _style_corr_axis(ax, cs_plc_bg_local)
         any_plotted = False
         any_plotted |= _plot_corr_series(
             ax,
-            x_cs,
-            y_cs,
-            series_label='CS',
-            color=cs_color_local,
+            x_cb,
+            y_cb,
+            series_label='CB',
+            color=cb_color_local,
             xlabel=xlabel,
             ylabel=ylabel,
             panel_name=panel_name,
             text_y=0.82,
             linestyle='-',
         )
-
-        if overlay_ss_metrics:
-            any_plotted |= _plot_corr_series(
-                ax,
-                x_ss,
-                y_ss,
-                series_label='SS',
-                color=ss_color_local,
-                xlabel=xlabel,
-                ylabel=ylabel,
-                panel_name=panel_name,
-                text_y=0.92,
-                linestyle='-',
-            )
-
         if not any_plotted:
+            ax.axis('off')
+
+    if has_csminus_row:
+        axes[1, 5].sharey(axes[1, 4])
+        csminus_metrics = _spike_metric_values(
+            df_non_cs_plc,
+            csminus_metric_key,
+            "df_non_cs_plc",
+        )
+        _plot_six_corr_panels(axes[1], csminus_metrics, None, non_cs_plc_bg_local)
+        for ax in axes[1, 7:]:
             ax.axis('off')
 
     plt.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches='tight')
     return fig
+
+
+def plot_map_pair_similarity_by_cell_type(
+    plcs_csplus,
+    plcs_csminus,
+    non_plcs,
+    save_path: str,
+    min_firing_rate_map_peak_hz: float = 1.0,
+    fig_width: float = 7.2,
+    fig_height: float = 3.8,
+    show_pairwise_stats: bool = True,
+    show_only_significant_stats: bool = True,
+):
+    """Compare per-cell similarity between selected spatial maps by cell type."""
+    group_specs = [
+        ("CS+ PLC", list(plcs_csplus), "#D81B60"),
+        ("CS- PLC", list(plcs_csminus), "#1F77B4"),
+        ("Non-PLC", list(non_plcs), "#8A8A8A"),
+    ]
+    map_pair_specs = [
+        ("ss_vs_cs", "SS vs CS", "ss_norm_map", "cs_norm_map", ("ss_rate_map", "cs_rate_map")),
+        ("theta_vs_cs", "Theta vs CS", "theta_map", "cs_norm_map", ("cs_rate_map",)),
+        ("slow_vs_all", "Slow Vm vs all", "slow_map", "rate_map", ("rate_map",)),
+        ("slow_vs_ss", "Slow Vm vs SS", "slow_map", "ss_norm_map", ("ss_rate_map",)),
+        ("slow_vs_cs", "Slow Vm vs CS", "slow_map", "cs_norm_map", ("cs_rate_map",)),
+    ]
+    csplus_paired_map_pair_specs = [
+        ("all_vs_ss", "All vs SS", "rate_map", "ss_norm_map", ("rate_map", "ss_rate_map")),
+        ("all_vs_cs", "All vs CS", "rate_map", "cs_norm_map", ("rate_map", "cs_rate_map")),
+    ]
+    similarity_specs = [
+        ("pearson", "Pearson r"),
+        ("spearman", "Spearman rho"),
+        ("cosine", "Cosine similarity"),
+    ]
+
+    def _map_peak(cell: dict[str, Any], key: str) -> float:
+        arr = np.asarray(cell.get(key, None), dtype=float)
+        if arr.size == 0 or not np.any(np.isfinite(arr)):
+            return np.nan
+        return float(np.nanmax(arr))
+
+    def _valid_flat_pair(map_a: Any, map_b: Any) -> tuple[np.ndarray, np.ndarray]:
+        if not isinstance(map_a, np.ndarray) or not isinstance(map_b, np.ndarray):
+            return np.array([], dtype=float), np.array([], dtype=float)
+        if map_a.shape != map_b.shape:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        a = np.asarray(map_a, dtype=float).ravel()
+        b = np.asarray(map_b, dtype=float).ravel()
+        valid = np.isfinite(a) & np.isfinite(b)
+        return a[valid], b[valid]
+
+    def _similarity(a: np.ndarray, b: np.ndarray, metric: str) -> float:
+        if a.size < 3 or b.size < 3:
+            return np.nan
+        if metric == "pearson":
+            if np.nanstd(a) == 0 or np.nanstd(b) == 0:
+                return np.nan
+            r, _p = scipy_stats.pearsonr(a, b)
+            return float(r) if np.isfinite(r) else np.nan
+        if metric == "spearman":
+            if np.nanstd(a) == 0 or np.nanstd(b) == 0:
+                return np.nan
+            rho, _p = scipy_stats.spearmanr(a, b)
+            return float(rho) if np.isfinite(rho) else np.nan
+
+        norm_a = float(np.linalg.norm(a))
+        norm_b = float(np.linalg.norm(b))
+        if norm_a <= 0 or norm_b <= 0:
+            return np.nan
+        return float(np.clip(np.dot(a, b) / (norm_a * norm_b), -1.0, 1.0))
+
+    def _holm_adjust(p_values: list[float]) -> list[float]:
+        p = np.asarray(p_values, dtype=float)
+        adjusted = np.full(p.shape, np.nan, dtype=float)
+        finite = np.isfinite(p)
+        if not np.any(finite):
+            return adjusted.tolist()
+        finite_idx = np.flatnonzero(finite)
+        order = finite_idx[np.argsort(p[finite])]
+        m = len(order)
+        running = 0.0
+        for rank, idx in enumerate(order):
+            raw_adj = (m - rank) * p[idx]
+            running = max(running, raw_adj)
+            adjusted[idx] = min(running, 1.0)
+        return adjusted.tolist()
+
+    def _omnibus_test(groups: list[np.ndarray]) -> tuple[float, float, str, list[float]]:
+        clean = [np.asarray(g, dtype=float) for g in groups]
+        clean = [g[np.isfinite(g)] for g in clean]
+        usable = [g for g in clean if g.size >= 2]
+        shapiro_ps = [
+            float(scipy_stats.shapiro(g).pvalue) if 3 <= g.size <= 5000 else np.nan
+            for g in clean
+        ]
+        if len(usable) < 2:
+            return np.nan, np.nan, "insufficient data", shapiro_ps
+        all_normal = all(
+            (g.size >= 3) and np.isfinite(sp) and sp >= 0.05
+            for g, sp in zip(clean, shapiro_ps)
+            if g.size >= 2
+        )
+        try:
+            if all_normal:
+                stat, p_val = scipy_stats.f_oneway(*usable)
+                test_name = "one-way ANOVA"
+            else:
+                stat, p_val = scipy_stats.kruskal(*usable)
+                test_name = "Kruskal-Wallis"
+        except ValueError as exc:
+            if "All numbers are identical" in str(exc):
+                return 0.0, 1.0, "Kruskal-Wallis", shapiro_ps
+            return np.nan, np.nan, "test failed", shapiro_ps
+        return float(stat), float(p_val), test_name, shapiro_ps
+
+    def _draw_axis_fraction_bracket(ax, pos1, pos2, y, h, text, color="black") -> None:
+        trans = ax.get_xaxis_transform()
+        ax.plot(
+            [pos1, pos1, pos2, pos2],
+            [y, y + h, y + h, y],
+            color=color,
+            linewidth=0.45,
+            transform=trans,
+            clip_on=False,
+            zorder=5,
+        )
+        ax.text(
+            (pos1 + pos2) / 2,
+            y + h,
+            text,
+            ha="center",
+            va="bottom",
+            fontsize=4,
+            fontname="Arial",
+            color=color,
+            transform=trans,
+            clip_on=False,
+            zorder=6,
+        )
+
+    def _dynamic_similarity_ylim(arrays: list[np.ndarray]) -> tuple[float, float]:
+        finite_arrays = []
+        for arr in arrays:
+            vals = np.asarray(arr, dtype=float).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                finite_arrays.append(vals)
+        if not finite_arrays:
+            return -1.0, 1.0
+        merged = np.concatenate(finite_arrays)
+        lo = float(np.nanmin(merged))
+        hi = float(np.nanmax(merged))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            return -1.0, 1.0
+        span = float(hi - lo)
+        if span <= 1e-9:
+            center = 0.5 * (lo + hi)
+            pad = max(0.05, abs(center) * 0.05)
+        else:
+            pad = max(0.025, span * 0.18)
+        y0 = max(-1.0, lo - pad)
+        y1 = min(1.0, hi + pad)
+        if y1 - y0 < 0.08:
+            center = 0.5 * (y0 + y1)
+            y0 = max(-1.0, center - 0.04)
+            y1 = min(1.0, center + 0.04)
+        if y1 <= y0:
+            return -1.0, 1.0
+        return float(y0), float(y1)
+
+    min_peak = float(min_firing_rate_map_peak_hz)
+    if not np.isfinite(min_peak) or min_peak < 0:
+        raise ValueError("min_firing_rate_map_peak_hz must be a finite number >= 0.")
+
+    value_rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
+    for group_label, cells, _color in group_specs:
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            animal_id = str(cell.get("animal_id", cell.get("session", "")))
+            cell_idx = int(cell.get("cell_idx", -1))
+            for pair_key, pair_label, map_a_key, map_b_key, cutoff_keys in map_pair_specs:
+                cutoff_peaks = {key: _map_peak(cell, key) for key in cutoff_keys}
+                passes_cutoff = all(
+                    np.isfinite(val) and val >= min_peak
+                    for val in cutoff_peaks.values()
+                )
+                if not passes_cutoff:
+                    skipped_rows.append(
+                        {
+                            "group": group_label,
+                            "animal_id": animal_id,
+                            "session": animal_id,
+                            "cell_idx": cell_idx,
+                            "cell_num": cell_idx + 1 if cell_idx >= 0 else np.nan,
+                            "map_pair": pair_key,
+                            "map_pair_label": pair_label,
+                            "map_a": map_a_key,
+                            "map_b": map_b_key,
+                            "cutoff_map_keys": ",".join(cutoff_keys),
+                            "min_firing_rate_map_peak_hz": min_peak,
+                            **{f"{key}_peak_hz": cutoff_peaks.get(key, np.nan) for key in cutoff_keys},
+                            "reason": "below_min_firing_rate_map_peak_hz",
+                        }
+                    )
+                    continue
+
+                a, b = _valid_flat_pair(cell.get(map_a_key, None), cell.get(map_b_key, None))
+                if a.size < 3:
+                    skipped_rows.append(
+                        {
+                            "group": group_label,
+                            "animal_id": animal_id,
+                            "session": animal_id,
+                            "cell_idx": cell_idx,
+                            "cell_num": cell_idx + 1 if cell_idx >= 0 else np.nan,
+                            "map_pair": pair_key,
+                            "map_pair_label": pair_label,
+                            "map_a": map_a_key,
+                            "map_b": map_b_key,
+                            "cutoff_map_keys": ",".join(cutoff_keys),
+                            "min_firing_rate_map_peak_hz": min_peak,
+                            **{f"{key}_peak_hz": cutoff_peaks.get(key, np.nan) for key in cutoff_keys},
+                            "reason": "fewer_than_three_valid_bins_or_shape_mismatch",
+                        }
+                    )
+                    continue
+
+                for metric_key, metric_label in similarity_specs:
+                    val = _similarity(a, b, metric_key)
+                    if not np.isfinite(val):
+                        continue
+                    value_rows.append(
+                        {
+                            "group": group_label,
+                            "animal_id": animal_id,
+                            "session": animal_id,
+                            "cell_idx": cell_idx,
+                            "cell_num": cell_idx + 1 if cell_idx >= 0 else np.nan,
+                            "map_pair": pair_key,
+                            "map_pair_label": pair_label,
+                            "map_a": map_a_key,
+                            "map_b": map_b_key,
+                            "similarity_metric": metric_key,
+                            "similarity_label": metric_label,
+                            "similarity": float(val),
+                            "n_valid_bins": int(a.size),
+                            "cutoff_map_keys": ",".join(cutoff_keys),
+                            "min_firing_rate_map_peak_hz": min_peak,
+                            **{f"{key}_peak_hz": cutoff_peaks.get(key, np.nan) for key in cutoff_keys},
+                        }
+                    )
+
+    for cell in list(plcs_csplus):
+        if not isinstance(cell, dict):
+            continue
+        animal_id = str(cell.get("animal_id", cell.get("session", "")))
+        cell_idx = int(cell.get("cell_idx", -1))
+        for pair_key, pair_label, map_a_key, map_b_key, cutoff_keys in csplus_paired_map_pair_specs:
+            cutoff_peaks = {key: _map_peak(cell, key) for key in cutoff_keys}
+            passes_cutoff = all(
+                np.isfinite(val) and val >= min_peak
+                for val in cutoff_peaks.values()
+            )
+            if not passes_cutoff:
+                skipped_rows.append(
+                    {
+                        "group": "CS+ PLC",
+                        "animal_id": animal_id,
+                        "session": animal_id,
+                        "cell_idx": cell_idx,
+                        "cell_num": cell_idx + 1 if cell_idx >= 0 else np.nan,
+                        "map_pair": pair_key,
+                        "map_pair_label": pair_label,
+                        "map_a": map_a_key,
+                        "map_b": map_b_key,
+                        "cutoff_map_keys": ",".join(cutoff_keys),
+                        "min_firing_rate_map_peak_hz": min_peak,
+                        **{f"{key}_peak_hz": cutoff_peaks.get(key, np.nan) for key in cutoff_keys},
+                        "reason": "below_min_firing_rate_map_peak_hz",
+                    }
+                )
+                continue
+
+            a, b = _valid_flat_pair(cell.get(map_a_key, None), cell.get(map_b_key, None))
+            if a.size < 3:
+                skipped_rows.append(
+                    {
+                        "group": "CS+ PLC",
+                        "animal_id": animal_id,
+                        "session": animal_id,
+                        "cell_idx": cell_idx,
+                        "cell_num": cell_idx + 1 if cell_idx >= 0 else np.nan,
+                        "map_pair": pair_key,
+                        "map_pair_label": pair_label,
+                        "map_a": map_a_key,
+                        "map_b": map_b_key,
+                        "cutoff_map_keys": ",".join(cutoff_keys),
+                        "min_firing_rate_map_peak_hz": min_peak,
+                        **{f"{key}_peak_hz": cutoff_peaks.get(key, np.nan) for key in cutoff_keys},
+                        "reason": "fewer_than_three_valid_bins_or_shape_mismatch",
+                    }
+                )
+                continue
+
+            for metric_key, metric_label in similarity_specs:
+                val = _similarity(a, b, metric_key)
+                if not np.isfinite(val):
+                    continue
+                value_rows.append(
+                    {
+                        "group": "CS+ PLC",
+                        "animal_id": animal_id,
+                        "session": animal_id,
+                        "cell_idx": cell_idx,
+                        "cell_num": cell_idx + 1 if cell_idx >= 0 else np.nan,
+                        "map_pair": pair_key,
+                        "map_pair_label": pair_label,
+                        "map_a": map_a_key,
+                        "map_b": map_b_key,
+                        "similarity_metric": metric_key,
+                        "similarity_label": metric_label,
+                        "similarity": float(val),
+                        "n_valid_bins": int(a.size),
+                        "cutoff_map_keys": ",".join(cutoff_keys),
+                        "min_firing_rate_map_peak_hz": min_peak,
+                        **{f"{key}_peak_hz": cutoff_peaks.get(key, np.nan) for key in cutoff_keys},
+                    }
+                )
+
+    values_df = pd.DataFrame(value_rows)
+    skipped_df = pd.DataFrame(skipped_rows)
+    if values_df.empty:
+        values_df = pd.DataFrame(
+            columns=[
+                "group",
+                "animal_id",
+                "session",
+                "cell_idx",
+                "cell_num",
+                "map_pair",
+                "map_pair_label",
+                "map_a",
+                "map_b",
+                "similarity_metric",
+                "similarity_label",
+                "similarity",
+                "n_valid_bins",
+                "cutoff_map_keys",
+                "min_firing_rate_map_peak_hz",
+            ]
+        )
+
+    summary_rows: list[dict[str, Any]] = []
+    for metric_key, metric_label in similarity_specs:
+        for pair_key, pair_label, _map_a_key, _map_b_key, _cutoff_keys in map_pair_specs:
+            for group_label, _cells, _color in group_specs:
+                vals = values_df[
+                    (values_df["similarity_metric"] == metric_key)
+                    & (values_df["map_pair"] == pair_key)
+                    & (values_df["group"] == group_label)
+                ]["similarity"].to_numpy(dtype=float)
+                vals = vals[np.isfinite(vals)]
+                n = int(vals.size)
+                sd = float(np.nanstd(vals, ddof=1)) if n > 1 else np.nan
+                summary_rows.append(
+                    {
+                        "similarity_metric": metric_key,
+                        "similarity_label": metric_label,
+                        "map_pair": pair_key,
+                        "map_pair_label": pair_label,
+                        "group": group_label,
+                        "n": n,
+                        "mean": float(np.nanmean(vals)) if n > 0 else np.nan,
+                        "median": float(np.nanmedian(vals)) if n > 0 else np.nan,
+                        "sd": sd,
+                        "sem": float(sd / np.sqrt(n)) if n > 1 and np.isfinite(sd) else np.nan,
+                        "min": float(np.nanmin(vals)) if n > 0 else np.nan,
+                        "max": float(np.nanmax(vals)) if n > 0 else np.nan,
+                    }
+                )
+        for pair_key, pair_label, _map_a_key, _map_b_key, _cutoff_keys in csplus_paired_map_pair_specs:
+            vals = values_df[
+                (values_df["similarity_metric"] == metric_key)
+                & (values_df["map_pair"] == pair_key)
+                & (values_df["group"] == "CS+ PLC")
+            ]["similarity"].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            n = int(vals.size)
+            sd = float(np.nanstd(vals, ddof=1)) if n > 1 else np.nan
+            summary_rows.append(
+                {
+                    "similarity_metric": metric_key,
+                    "similarity_label": metric_label,
+                    "map_pair": pair_key,
+                    "map_pair_label": pair_label,
+                    "group": "CS+ PLC",
+                    "n": n,
+                    "mean": float(np.nanmean(vals)) if n > 0 else np.nan,
+                    "median": float(np.nanmedian(vals)) if n > 0 else np.nan,
+                    "sd": sd,
+                    "sem": float(sd / np.sqrt(n)) if n > 1 and np.isfinite(sd) else np.nan,
+                    "min": float(np.nanmin(vals)) if n > 0 else np.nan,
+                    "max": float(np.nanmax(vals)) if n > 0 else np.nan,
+                }
+            )
+    summary_df = pd.DataFrame(summary_rows)
+
+    comparison_specs = [
+        ("CS+ PLC", "CS- PLC"),
+        ("CS+ PLC", "Non-PLC"),
+        ("CS- PLC", "Non-PLC"),
+    ]
+    omnibus_rows: list[dict[str, Any]] = []
+    for metric_key, metric_label in similarity_specs:
+        for pair_key, pair_label, _map_a_key, _map_b_key, _cutoff_keys in map_pair_specs:
+            group_values = []
+            group_ns = {}
+            for group_label, _cells, _color in group_specs:
+                vals = values_df[
+                    (values_df["similarity_metric"] == metric_key)
+                    & (values_df["map_pair"] == pair_key)
+                    & (values_df["group"] == group_label)
+                ]["similarity"].to_numpy(dtype=float)
+                vals = vals[np.isfinite(vals)]
+                group_values.append(vals)
+                group_ns[group_label] = int(vals.size)
+            stat, p_val, test_name, shapiro_ps = _omnibus_test(group_values)
+            omnibus_rows.append(
+                {
+                    "similarity_metric": metric_key,
+                    "similarity_label": metric_label,
+                    "map_pair": pair_key,
+                    "map_pair_label": pair_label,
+                    "test": test_name,
+                    "statistic": stat,
+                    "p_value": p_val,
+                    "significance": _sig_label(float(p_val)) if np.isfinite(p_val) else "",
+                    **{f"n_{label}": group_ns[label] for label, _cells, _color in group_specs},
+                    **{f"shapiro_p_{label}": shapiro_ps[idx] for idx, (label, _cells, _color) in enumerate(group_specs)},
+                }
+            )
+    omnibus_df = pd.DataFrame(omnibus_rows)
+
+    pairwise_rows: list[dict[str, Any]] = []
+    for metric_key, metric_label in similarity_specs:
+        for pair_key, pair_label, _map_a_key, _map_b_key, _cutoff_keys in map_pair_specs:
+            start_idx = len(pairwise_rows)
+            for group1, group2 in comparison_specs:
+                vals1 = values_df[
+                    (values_df["similarity_metric"] == metric_key)
+                    & (values_df["map_pair"] == pair_key)
+                    & (values_df["group"] == group1)
+                ]["similarity"].to_numpy(dtype=float)
+                vals2 = values_df[
+                    (values_df["similarity_metric"] == metric_key)
+                    & (values_df["map_pair"] == pair_key)
+                    & (values_df["group"] == group2)
+                ]["similarity"].to_numpy(dtype=float)
+                vals1 = vals1[np.isfinite(vals1)]
+                vals2 = vals2[np.isfinite(vals2)]
+                p_val, test_name, shapiro_p1, shapiro_p2 = _unpaired_test_auto(vals1, vals2)
+                pairwise_rows.append(
+                    {
+                        "similarity_metric": metric_key,
+                        "similarity_label": metric_label,
+                        "map_pair": pair_key,
+                        "map_pair_label": pair_label,
+                        "comparison": f"{group1} vs {group2}",
+                        "group1": group1,
+                        "group2": group2,
+                        "n_group1": int(vals1.size),
+                        "n_group2": int(vals2.size),
+                        "test": test_name,
+                        "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                        "p_adjust_method": "holm",
+                        "p_value_adj": np.nan,
+                        "significance": "",
+                        "shapiro_p_group1": shapiro_p1,
+                        "shapiro_p_group2": shapiro_p2,
+                    }
+                )
+            p_adj = _holm_adjust([row["p_value"] for row in pairwise_rows[start_idx:]])
+            for row, adj in zip(pairwise_rows[start_idx:], p_adj):
+                row["p_value_adj"] = float(adj) if np.isfinite(adj) else np.nan
+                row["significance"] = _sig_label(float(adj)) if np.isfinite(adj) else ""
+    pairwise_df = pd.DataFrame(pairwise_rows)
+
+    paired_rows: list[dict[str, Any]] = []
+    paired_values_by_metric: dict[str, pd.DataFrame] = {}
+    for metric_key, metric_label in similarity_specs:
+        left = values_df[
+            (values_df["similarity_metric"] == metric_key)
+            & (values_df["map_pair"] == "all_vs_ss")
+            & (values_df["group"] == "CS+ PLC")
+        ][["animal_id", "session", "cell_idx", "cell_num", "similarity"]].rename(
+            columns={"similarity": "all_vs_ss_similarity"}
+        )
+        right = values_df[
+            (values_df["similarity_metric"] == metric_key)
+            & (values_df["map_pair"] == "all_vs_cs")
+            & (values_df["group"] == "CS+ PLC")
+        ][["animal_id", "session", "cell_idx", "cell_num", "similarity"]].rename(
+            columns={"similarity": "all_vs_cs_similarity"}
+        )
+        paired = left.merge(
+            right,
+            on=["animal_id", "session", "cell_idx", "cell_num"],
+            how="inner",
+        )
+        paired_values_by_metric[metric_key] = paired
+        vals_ss = paired["all_vs_ss_similarity"].to_numpy(dtype=float) if not paired.empty else np.array([], dtype=float)
+        vals_cs = paired["all_vs_cs_similarity"].to_numpy(dtype=float) if not paired.empty else np.array([], dtype=float)
+        p_val, statistic, test_name, n_valid, shapiro_p = _paired_test(vals_ss, vals_cs)
+        paired_rows.append(
+            {
+                "similarity_metric": metric_key,
+                "similarity_label": metric_label,
+                "comparison": "CS+ PLC all_vs_ss vs all_vs_cs",
+                "group": "CS+ PLC",
+                "map_pair_1": "all_vs_ss",
+                "map_pair_label_1": "All vs SS",
+                "map_pair_2": "all_vs_cs",
+                "map_pair_label_2": "All vs CS",
+                "n_pairs": int(n_valid),
+                "median_1": float(np.nanmedian(vals_ss)) if vals_ss.size else np.nan,
+                "median_2": float(np.nanmedian(vals_cs)) if vals_cs.size else np.nan,
+                "median_delta_1_minus_2": (
+                    float(np.nanmedian(vals_ss) - np.nanmedian(vals_cs)) if vals_ss.size and vals_cs.size else np.nan
+                ),
+                "test": test_name,
+                "statistic": float(statistic) if np.isfinite(statistic) else np.nan,
+                "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                "significance": _sig_label(float(p_val)) if np.isfinite(p_val) else "",
+                "shapiro_p_diff": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+            }
+        )
+    paired_df = pd.DataFrame(paired_rows)
+
+    n_plot_cols = len(map_pair_specs) + 1
+    fig, axes = plt.subplots(len(similarity_specs), n_plot_cols, figsize=(fig_width, fig_height), sharey=False)
+    axes = np.asarray(axes)
+    rng = np.random.default_rng(42)
+    x = np.arange(len(group_specs), dtype=float)
+    group_tick_base = ["CS+\nPLC", "CS-\nPLC", "Non-\nPLC"]
+
+    for row_idx, (metric_key, metric_label) in enumerate(similarity_specs):
+        for col_idx, (pair_key, pair_label, _map_a_key, _map_b_key, _cutoff_keys) in enumerate(map_pair_specs):
+            ax = axes[row_idx, col_idx]
+            ns_for_ticks: list[int] = []
+            subplot_vals: list[np.ndarray] = []
+            subplot_colors: list[str] = []
+            for group_idx, (group_label, _cells, color) in enumerate(group_specs):
+                vals = values_df[
+                    (values_df["similarity_metric"] == metric_key)
+                    & (values_df["map_pair"] == pair_key)
+                    & (values_df["group"] == group_label)
+                ]["similarity"].to_numpy(dtype=float)
+                vals = vals[np.isfinite(vals)]
+                ns_for_ticks.append(int(vals.size))
+                subplot_vals.append(vals)
+                subplot_colors.append(color)
+            _half_violin_panel(
+                ax,
+                list(x),
+                subplot_vals,
+                subplot_colors,
+                paired_specs=[],
+                rng_seed=int(42 + row_idx * 17 + col_idx),
+            )
+
+            ax.axhline(0, color="black", linewidth=0.4, zorder=1)
+            ax.set_ylim(*_dynamic_similarity_ylim(subplot_vals))
+            ax.set_xlim(-0.6, len(group_specs) - 0.4)
+            if row_idx == 0:
+                title_y = 1.24 if show_pairwise_stats else 1.05
+                ax.set_title(pair_label, fontsize=6, fontname="Arial", y=title_y, pad=0)
+            if col_idx == 0:
+                ax.set_ylabel(metric_label, fontsize=6, fontname="Arial")
+            ax.set_xticks(x)
+            ax.set_xticklabels(
+                [f"{label}\nn={n}" for label, n in zip(group_tick_base, ns_for_ticks)],
+                fontsize=5,
+                fontname="Arial",
+            )
+            if show_pairwise_stats and not pairwise_df.empty:
+                bracket_specs = [
+                    ("CS+ PLC", "CS- PLC", 0, 1, 1.01),
+                    ("CS+ PLC", "Non-PLC", 0, 2, 1.065),
+                    ("CS- PLC", "Non-PLC", 1, 2, 1.12),
+                ]
+                for group1, group2, pos1, pos2, y_bracket in bracket_specs:
+                    stat_row = pairwise_df[
+                        (pairwise_df["similarity_metric"] == metric_key)
+                        & (pairwise_df["map_pair"] == pair_key)
+                        & (pairwise_df["group1"] == group1)
+                        & (pairwise_df["group2"] == group2)
+                    ]
+                    if stat_row.empty:
+                        continue
+                    p_adj = float(stat_row.iloc[0]["p_value_adj"])
+                    if not np.isfinite(p_adj):
+                        continue
+                    if show_only_significant_stats and p_adj >= 0.05:
+                        continue
+                    _draw_axis_fraction_bracket(
+                        ax,
+                        pos1,
+                        pos2,
+                        y_bracket,
+                        0.018,
+                        _sig_label(p_adj),
+                    )
+            ax.tick_params(axis="both", labelsize=5, width=0.5, length=1.75, direction="in")
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.5)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        ax = axes[row_idx, len(map_pair_specs)]
+        paired = paired_values_by_metric.get(metric_key, pd.DataFrame())
+        vals_ss = (
+            paired["all_vs_ss_similarity"].to_numpy(dtype=float)
+            if not paired.empty
+            else np.array([], dtype=float)
+        )
+        vals_cs = (
+            paired["all_vs_cs_similarity"].to_numpy(dtype=float)
+            if not paired.empty
+            else np.array([], dtype=float)
+        )
+        vals_ss_vs_cs = values_df[
+            (values_df["similarity_metric"] == metric_key)
+            & (values_df["map_pair"] == "ss_vs_cs")
+            & (values_df["group"] == "CS+ PLC")
+        ]["similarity"].to_numpy(dtype=float)
+        paired_vals = [
+            vals_ss[np.isfinite(vals_ss)],
+            vals_cs[np.isfinite(vals_cs)],
+            vals_ss_vs_cs[np.isfinite(vals_ss_vs_cs)],
+        ]
+        paired_colors = [SS_COLOR, CS_COLOR, "#D81B60"]
+        paired_labels = ["All vs\nSS", "All vs\nCS", "SS vs\nCS"]
+        pair_x = np.arange(3, dtype=float)
+        _half_violin_panel(
+            ax,
+            list(pair_x),
+            paired_vals,
+            paired_colors,
+            paired_specs=[(0, 1)],
+            rng_seed=int(142 + row_idx),
+        )
+        ax.axhline(0, color="black", linewidth=0.4, zorder=1)
+        ax.set_ylim(*_dynamic_similarity_ylim(paired_vals))
+        ax.set_xlim(-0.55, 2.55)
+        if row_idx == 0:
+            title_y = 1.24 if show_pairwise_stats else 1.05
+            ax.set_title("CS+ only", fontsize=6, fontname="Arial", y=title_y, pad=0)
+        ns_for_ticks = [int(vals.size) for vals in paired_vals]
+        ax.set_xticks(pair_x)
+        ax.set_xticklabels(
+            [f"{label}\nn={n}" for label, n in zip(paired_labels, ns_for_ticks)],
+            fontsize=5,
+            fontname="Arial",
+        )
+        if show_pairwise_stats and not paired_df.empty:
+            stat_row = paired_df[paired_df["similarity_metric"] == metric_key]
+            if not stat_row.empty:
+                p_val = float(stat_row.iloc[0]["p_value"])
+                if np.isfinite(p_val) and (not show_only_significant_stats or p_val < 0.05):
+                    _draw_axis_fraction_bracket(
+                        ax,
+                        0,
+                        1,
+                        1.01,
+                        0.018,
+                        _sig_label(p_val),
+                    )
+        ax.tick_params(axis="both", labelsize=5, width=0.5, length=1.75, direction="in")
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.tight_layout(w_pad=0.5, h_pad=1.2)
+    figure_path = str(save_path) if save_path is not None else None
+    if save_path:
+        plt.rcParams["svg.fonttype"] = "none"
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    return {
+        "fig": fig,
+        "values_df": values_df,
+        "summary_df": summary_df,
+        "omnibus_df": omnibus_df,
+        "pairwise_df": pairwise_df,
+        "paired_df": paired_df,
+        "skipped_df": skipped_df,
+        "figure_path": figure_path,
+    }
 
 
 def _build_metric_data_csplus(plcs_csplus, min_bursts_per_condition=3, plateau_threshold_ms=100.0):

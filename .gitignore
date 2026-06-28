@@ -16,5 +16,21 @@ ln-model-of-mec-neurons/
 
 # Inside miniVI_PlaceCell_analysis_V4
 miniVI_PlaceCell_analysis_V4/data/
+miniVI_PlaceCell_analysis_V4/data_first10min/
 miniVI_PlaceCell_analysis_V4/figures/
 miniVI_PlaceCell_analysis_V4/logs/
+miniVI_PlaceCell_analysis_V4/cluster_exports/
+miniVI_PlaceCell_analysis_V4/*.log
+
+# Generated figure exports
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.svg
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.pdf
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.png
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.jpg
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.jpeg
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.tif
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.tiff
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.eps
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.html
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.pkl
+miniVI_PlaceCell_analysis_V4/Figure*_code/*.pickle

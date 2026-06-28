@@ -3,8 +3,8 @@
 Step 5b: Summarize egocentric tuning statistics across all categories.
 
 Reads per-cell .npz results directly from per_cell_results/ (no aggregation
-step needed). Extends the original CSplus-vs-CSminus comparison to include
-all-nonPLC.
+step needed). Defaults to the refined-notebook CSplus-vs-CSminus comparison,
+while allowing explicit category overrides.
 
 Generates:
   1. Bar chart of pass counts (pass_95, pass_99, pass_100) per category
@@ -26,7 +26,11 @@ from itertools import combinations
 # --------------- path surgery ---------------
 HERE = Path(__file__).parent.parent.resolve()
 _top_repo = str(HERE.parent)
-sys.path[:] = [p for p in sys.path if os.path.normpath(p) != os.path.normpath(_top_repo)]
+_top_repo_norm = os.path.normpath(_top_repo)
+sys.path[:] = [
+    p for p in sys.path
+    if os.path.normpath(os.path.abspath(p or os.getcwd())) != _top_repo_norm
+]
 sys.path.insert(0, str(HERE))
 os.environ['PYTHONPATH'] = str(HERE)
 
@@ -34,6 +38,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+from notebooks_HPC.egocentric_refined_config import DEFAULT_CATEGORIES
 from utils.placecell_pipeline import _filter_egocentric_summary_row_by_valid_bins
 
 # Default color palette for categories
@@ -113,7 +118,7 @@ def main():
                         help='Direction/spike-specific output dir with per_cell_results/')
     parser.add_argument('--manifest-dir', type=str, default=None,
                         help='Directory containing manifest.json. Defaults to parent of --output-dir.')
-    parser.add_argument('--categories', nargs='+', default=['CSplus', 'CSminus', 'all-nonPLC'],
+    parser.add_argument('--categories', nargs='+', default=list(DEFAULT_CATEGORIES),
                         help='Categories to include in the summary')
     parser.add_argument('--save-formats', nargs='+', default=['svg', 'png'])
     parser.add_argument('--fig-width', type=float, default=4.5)

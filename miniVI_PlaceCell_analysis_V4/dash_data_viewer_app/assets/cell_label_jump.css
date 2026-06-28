@@ -1,0 +1,5 @@
+.js-plotly-plot .yaxislayer-above .ytick text,
+.js-plotly-plot .yaxislayer-below .ytick text {
+  pointer-events: all;
+  cursor: pointer;
+}

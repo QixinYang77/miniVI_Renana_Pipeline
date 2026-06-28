@@ -35,7 +35,11 @@ import numpy as np
 # --------------- path surgery (same as other HPC scripts) ---------------
 HERE = Path(__file__).parent.parent.resolve()
 _top_repo = str(HERE.parent)
-sys.path[:] = [p for p in sys.path if os.path.normpath(p) != os.path.normpath(_top_repo)]
+_top_repo_norm = os.path.normpath(_top_repo)
+sys.path[:] = [
+    p for p in sys.path
+    if os.path.normpath(os.path.abspath(p or os.getcwd())) != _top_repo_norm
+]
 sys.path.insert(0, str(HERE))
 os.environ['PYTHONPATH'] = str(HERE)
 
@@ -96,8 +100,17 @@ def build_config(data_root, figures_root):
             bin_size=1.5, place_field_threshold=0.35, min_component_peak_ratio=0.45,
             split_multi_peak_fields=True, split_secondary_peak_ratio=0.6,
             split_secondary_peak_min_separation_cm=6.0, min_peak_rate=0.5,
-            max_field_area_ratio=0.5, min_field_bins=10, min_pf_reliability=0.2,
-            min_pf_traversals=5, pf_reliability_dilation_bins=3,
+            max_field_area_ratio=0.5, min_field_bins=10, min_pf_firing_traversals=5,
+            pf_firing_traversal_distance_window_cm=15.0,
+            pf_firing_traversal_detection_window_cm=8.0,
+            pf_firing_traversal_distance_bin_cm=1.5,
+            pf_firing_traversal_distance_mode='euclidean_to_peak',
+            pf_firing_traversal_center_vicinity_min_cm=1,
+            pf_firing_traversal_center_vicinity_max_cm=5,
+            pf_firing_traversal_resting_speed_threshold=0.5,
+            pf_firing_traversal_merge_gap_s=2.0,
+            pf_firing_traversal_exclude_trials_with_bad_frames=True,
+            pf_reliability_dilation_bins=3,
             pf_reliability_dilation_shape='disk', smooth_sigma=1.5, min_occupancy_s=0.001,
             occ_smooth_sigma=1.5, num_shuffles=1000, random_seed=42,
             ss_shape_min_separation_ms=14.0, trim_sparse_top_row_for_analysis=True,
@@ -112,7 +125,8 @@ def build_config(data_root, figures_root):
             max_pf_distance_cm=8.0, plateau_min_duration_ms=100.0,
         ),
         pooled=PooledParams(
-            cb_num_threshold=5, cs_peak_rate_threshold=0.5, run_psd_sections=True,
+            cb_num_threshold=5, cs_peak_rate_threshold=0.5, cs_plc_definition_mode='cs_place_field',
+            run_psd_sections=True,
             cs_plc_only=True, psd_speed_threshold=3, psd_chunk_s=2.0, psd_nperseg_s=1.0,
             psd_noverlap_frac=0.5, simple_event_window_ms=80.0, simple_event_min_gap_ms=50.0,
             min_chunk_valid_fraction=1.0, max_freq=100.0, normalize_psd=True,
@@ -180,6 +194,51 @@ def load_npz_summary_lookup(results_dir, manifest):
 
     print(f'NPZ lookup ({results_dir.parent.name}): {n_found} success, {n_skipped} skipped, {n_missing} missing')
     return lookup
+
+
+def _lookup_npz_row_by_cell(lookup, animal_id, cell_idx, preferred_category=None):
+    """Return an NPZ summary row by cell identity, independent of stale manifest category."""
+    animal_id = str(animal_id)
+    cell_idx = int(cell_idx)
+    if preferred_category is not None:
+        row = lookup.get((str(preferred_category), animal_id, cell_idx))
+        if isinstance(row, dict):
+            return dict(row)
+    for (_category, animal, idx), row in lookup.items():
+        if str(animal) == animal_id and int(idx) == cell_idx and isinstance(row, dict):
+            return dict(row)
+    return None
+
+
+def _current_category_lookup_from_spatial_data(spatial_data):
+    """Build current category labels from cached Unified pipeline spatial results."""
+    lookup = {}
+    for category, cells in (
+        ('CSplus', getattr(spatial_data, 'plcs_csplus', [])),
+        ('CSminus', getattr(spatial_data, 'plcs_csminus', [])),
+        ('all-nonPLC', getattr(spatial_data, 'non_plcs', [])),
+    ):
+        for cell in cells or []:
+            if not isinstance(cell, dict):
+                continue
+            animal_id = str(cell.get('session', ''))
+            try:
+                cell_idx = int(cell.get('cell_idx', -1))
+            except Exception:
+                continue
+            if animal_id and cell_idx >= 0:
+                lookup[(animal_id, cell_idx)] = str(category)
+    return lookup
+
+
+def _override_row_category(row, category, manifest_category=None):
+    if not isinstance(row, dict):
+        return row
+    out = dict(row)
+    out['category'] = str(category)
+    if manifest_category is not None:
+        out['manifest_category'] = str(manifest_category)
+    return out
 
 
 def _safe_float(v, default=np.nan):
@@ -2313,9 +2372,26 @@ def main(argv=None):
         folders=config.animals,
         cb_num_threshold=config.pooled.cb_num_threshold,
         cs_peak_rate_threshold=config.pooled.cs_peak_rate_threshold,
+        cs_plc_definition_mode=config.pooled.cs_plc_definition_mode,
         snr_threshold=config.analysis.snr_threshold,
     )
     print(f'Using spatial cache root: {spatial_cache_root}')
+    current_category_by_cell = _current_category_lookup_from_spatial_data(spatial_data)
+    print(
+        'Using current cached spatial classifications for category labels '
+        f'({len(current_category_by_cell)} cells). Manifest categories are used only as NPZ execution labels.'
+    )
+    n_category_changed = 0
+    for cell_info in manifest:
+        try:
+            key = (str(cell_info.get('animal_id', '')), int(cell_info.get('cell_idx', -1)))
+        except Exception:
+            continue
+        current_category = current_category_by_cell.get(key)
+        if current_category is not None and str(current_category) != str(cell_info.get('category', '')):
+            n_category_changed += 1
+    if n_category_changed:
+        print(f'Category labels updated from cached spatial results for {n_category_changed} manifest cells.')
 
     cells_by_animal = defaultdict(list)
     for cell_info in manifest:
@@ -2357,14 +2433,29 @@ def main(argv=None):
             continue
 
         for cell_info in cells:
-            category = str(cell_info['category'])
+            manifest_category = str(cell_info['category'])
             cell_idx = int(cell_info['cell_idx'])
+            category = str(
+                current_category_by_cell.get(
+                    (str(animal_id), int(cell_idx)),
+                    manifest_category,
+                )
+            )
+            category_changed = category != manifest_category
             counts['attempted'] += 1
 
-            key = (category, str(animal_id), int(cell_idx))
-            row_all = lookup_all.get(key)
-            row_ss = lookup_ss.get(key)
-            row_cs = lookup_cs.get(key)
+            row_all = _lookup_npz_row_by_cell(
+                lookup_all, animal_id, cell_idx, preferred_category=manifest_category,
+            )
+            row_ss = _lookup_npz_row_by_cell(
+                lookup_ss, animal_id, cell_idx, preferred_category=manifest_category,
+            )
+            row_cs = _lookup_npz_row_by_cell(
+                lookup_cs, animal_id, cell_idx, preferred_category=manifest_category,
+            )
+            row_all = _override_row_category(row_all, category, manifest_category)
+            row_ss = _override_row_category(row_ss, category, manifest_category)
+            row_cs = _override_row_category(row_cs, category, manifest_category)
             row_all = _filter_egocentric_summary_row_by_valid_bins(row_all, min_valid_bins=tuning_min_valid_bins)
             row_ss = _filter_egocentric_summary_row_by_valid_bins(row_ss, min_valid_bins=tuning_min_valid_bins)
             row_cs = _filter_egocentric_summary_row_by_valid_bins(row_cs, min_valid_bins=tuning_min_valid_bins)
@@ -2428,9 +2519,11 @@ def main(argv=None):
             else:
                 row_primary = {
                     'category': category,
+                    'manifest_category': manifest_category,
                     'animal_id': animal_id,
                     'cell_idx': int(cell_idx),
                 }
+            row_primary = _override_row_category(row_primary, category, manifest_category)
 
             bad_mask = np.asarray(ctx['bad_masks'][cell_idx], dtype=bool)
 
@@ -2618,6 +2711,8 @@ def main(argv=None):
                     counts['plotted_fail'] += 1
                 manifest_rows.append({
                     'category': category,
+                    'manifest_category': manifest_category,
+                    'category_changed_from_manifest': bool(category_changed),
                     'animal_id': animal_id,
                     'cell_idx': cell_idx,
                     'cell_num': cell_idx + 1,
@@ -2662,6 +2757,7 @@ def main(argv=None):
                 })
                 print(
                     f'  [OK] [{plot_group}] {category} / cell {cell_idx + 1} '
+                    f'(manifest={manifest_category}) '
                     f'({any_pass_key}: all={pass_thr_all}, ss={pass_thr_ss}, cs={pass_thr_cs})'
                 )
 
@@ -2677,6 +2773,8 @@ def main(argv=None):
 
     manifest_columns = [
         'category',
+        'manifest_category',
+        'category_changed_from_manifest',
         'animal_id',
         'cell_idx',
         'cell_num',
