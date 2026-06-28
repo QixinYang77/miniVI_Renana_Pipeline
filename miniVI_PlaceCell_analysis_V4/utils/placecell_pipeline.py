@@ -2392,6 +2392,8 @@ def _compute_bad_masks(
     y_neural = np.asarray(merged_data.get("y_neural", np.full_like(x_neural, np.nan)), dtype=float).reshape(-1)
     speed = np.asarray(merged_data.get("speed", np.full_like(x_neural, np.nan)), dtype=float).reshape(-1)
     frame_rate = float(merged_data.get("frame_rate", np.nan))
+    if not np.isfinite(frame_rate) or frame_rate <= 0:
+        frame_rate = 1.0
     pos_nan_mask = (~np.isfinite(x_neural)) | (~np.isfinite(y_neural)) | (~np.isfinite(speed))
     raw_hd = merged_data.get("hd_angles_neural", None)
     hd_missing = raw_hd is None
@@ -2405,15 +2407,101 @@ def _compute_bad_masks(
         n_hd = min(x_neural.size, hd.size)
         if n_hd > 0:
             hd_nan_mask[:n_hd] = ~np.isfinite(hd[:n_hd])
+    n_cells = len(merged_data["spikes"])
+
+    precomputed_bad_masks = merged_data.get("cluster_precomputed_bad_masks", None)
+    if precomputed_bad_masks is not None:
+        mask_params = merged_data.get("cluster_precomputed_bad_mask_params", {})
+        if isinstance(mask_params, dict):
+            if "snr_threshold" in mask_params and not np.isclose(
+                float(mask_params["snr_threshold"]),
+                float(snr_threshold),
+            ):
+                raise ValueError(
+                    "cluster_precomputed_bad_masks were generated with "
+                    f"snr_threshold={mask_params['snr_threshold']}, requested {snr_threshold}"
+                )
+            if "min_good_minutes" in mask_params and not np.isclose(
+                float(mask_params["min_good_minutes"]),
+                float(min_good_minutes),
+            ):
+                raise ValueError(
+                    "cluster_precomputed_bad_masks were generated with "
+                    f"min_good_minutes={mask_params['min_good_minutes']}, requested {min_good_minutes}"
+                )
+        bad_masks_arr = np.asarray(precomputed_bad_masks, dtype=bool)
+        if bad_masks_arr.ndim != 2 or bad_masks_arr.shape != (n_cells, x_neural.size):
+            raise RuntimeError(
+                "Invalid cluster_precomputed_bad_masks shape: expected "
+                f"{(n_cells, x_neural.size)}, got {bad_masks_arr.shape}"
+            )
+        bad_masks_arr = bad_masks_arr | pos_nan_mask[None, :] | hd_nan_mask[None, :]
+        if return_stats:
+            stored_stats = merged_data.get("cluster_precomputed_bad_mask_stats", [])
+            mask_stats: list[dict[str, Any]] = []
+            for cell_idx in range(n_cells):
+                bad_mask = np.asarray(bad_masks_arr[cell_idx], dtype=bool)
+                source_trace_bad = _source_trace_bad_mask(merged_data, cell_idx, x_neural.size)
+                stored = (
+                    stored_stats[cell_idx]
+                    if isinstance(stored_stats, list)
+                    and cell_idx < len(stored_stats)
+                    and isinstance(stored_stats[cell_idx], dict)
+                    else {}
+                )
+                removed_total = int(np.sum(bad_mask))
+                removed_pos_nan = int(np.sum(bad_mask & pos_nan_mask))
+                removed_hd_nan = int(np.sum(bad_mask & hd_nan_mask))
+                removed_source_trace = int(stored.get(
+                    "n_removed_frames_source_trace_bad",
+                    int(np.sum(bad_mask & source_trace_bad)),
+                ))
+                n_removed_snr_only = int(stored.get(
+                    "n_removed_frames_snr_only",
+                    int(np.sum(bad_mask & (~pos_nan_mask) & (~hd_nan_mask) & (~source_trace_bad))),
+                ))
+                n_good_before = int(stored.get(
+                    "n_good_frames_before_min_minutes",
+                    int(np.sum(~bad_mask)),
+                ))
+                good_minutes = float(stored.get(
+                    "good_minutes_before_min_minutes",
+                    float(n_good_before) / float(frame_rate) / 60.0 if frame_rate > 0 else np.nan,
+                ))
+                mask_stats.append(
+                    {
+                        "cell_idx": int(cell_idx),
+                        "n_frames_total": int(x_neural.size),
+                        "n_good_frames_before_min_minutes": n_good_before,
+                        "good_minutes_before_min_minutes": good_minutes,
+                        "removed_by_min_good_minutes": bool(stored.get("removed_by_min_good_minutes", False)),
+                        "eligible_cell": bool(np.any(~bad_mask)),
+                        "n_removed_frames_total": removed_total,
+                        "n_removed_frames_pos_nan": removed_pos_nan,
+                        "n_removed_frames_head_direction_nan": removed_hd_nan,
+                        "n_removed_frames_source_trace_bad": removed_source_trace,
+                        "n_removed_frames_snr_only": n_removed_snr_only,
+                        "n_removed_frames_snr_threshold_only": int(stored.get("n_removed_frames_snr_threshold_only", 0)),
+                        "n_removed_frames_manual_snr_cutoff": int(stored.get("n_removed_frames_manual_snr_cutoff", 0)),
+                        "pct_removed_frames_total": (100.0 * removed_total / x_neural.size) if x_neural.size > 0 else np.nan,
+                        "pct_removed_frames_head_direction_nan": (100.0 * removed_hd_nan / x_neural.size) if x_neural.size > 0 else np.nan,
+                        "pct_removed_frames_snr_only": (100.0 * n_removed_snr_only / x_neural.size) if x_neural.size > 0 else np.nan,
+                        "pct_removed_frames_source_trace_bad": (100.0 * removed_source_trace / x_neural.size) if x_neural.size > 0 else np.nan,
+                        "head_direction_missing": bool(hd_missing),
+                        "head_direction_size_mismatch": bool(hd_size_mismatch),
+                        "manual_refined_source": bool(merged_data.get("manual_refined_source", False)),
+                        "cluster_precomputed_bad_masks": True,
+                        "snr_threshold": float(snr_threshold),
+                    }
+                )
+            return np.asarray(bad_masks_arr, dtype=bool), mask_stats
+        return np.asarray(bad_masks_arr, dtype=bool)
+
     traces_snr = merged_data.get("traces_SNR_interpolated", merged_data.get("traces", []))
     all_spikes = merged_data.get("all_spikes", merged_data.get("spikes", []))
     complex_bursts_dicts = merged_data.get("complex_bursts_dicts", [])
-    n_cells = len(merged_data["spikes"])
     bad_masks: list[np.ndarray] = []
     mask_stats: list[dict[str, Any]] = []
-
-    if not np.isfinite(frame_rate) or frame_rate <= 0:
-        frame_rate = 1.0
 
     if bool(merged_data.get("manual_refined_source", False)) and "manual_refined_bad_masks" in merged_data:
         stored_masks = np.asarray(merged_data.get("manual_refined_bad_masks"), dtype=bool)
@@ -3178,6 +3266,8 @@ def _normalize_burst_metrics_for_core(value: Any) -> Any:
 def _prepare_native_analysis_context(
     merged: dict[str, Any],
     config: PipelineConfig,
+    *,
+    require_traces: bool = True,
 ) -> dict[str, Any]:
     x_neural = np.asarray(merged["x_neural"], dtype=float)
     y_neural = np.asarray(merged["y_neural"], dtype=float)
@@ -3192,11 +3282,23 @@ def _prepare_native_analysis_context(
 
     traces_raw = merged.get("traces_SNR_interpolated", merged.get("traces"))
     if traces_raw is None:
-        raise KeyError("Missing traces in merged data.")
-    traces = np.asarray(traces_raw, dtype=object)
-    vms = np.asarray(merged.get("Vm_SNR_interpolated", traces_raw), dtype=object)
-    plateau_traces = np.asarray(merged.get("plateau_traces_normalized", traces_raw), dtype=object)
-    plateau_vms = np.asarray(merged.get("plateau_Vm_normalized", plateau_traces), dtype=object)
+        if require_traces:
+            raise KeyError("Missing traces in merged data.")
+        traces = np.empty(n_cells, dtype=object)
+        vms = np.empty(n_cells, dtype=object)
+        plateau_traces = np.empty(n_cells, dtype=object)
+        plateau_vms = np.empty(n_cells, dtype=object)
+        for cell_idx in range(n_cells):
+            empty_trace = np.array([], dtype=np.float32)
+            traces[cell_idx] = empty_trace
+            vms[cell_idx] = empty_trace
+            plateau_traces[cell_idx] = empty_trace
+            plateau_vms[cell_idx] = empty_trace
+    else:
+        traces = np.asarray(traces_raw, dtype=object)
+        vms = np.asarray(merged.get("Vm_SNR_interpolated", traces_raw), dtype=object)
+        plateau_traces = np.asarray(merged.get("plateau_traces_normalized", traces_raw), dtype=object)
+        plateau_vms = np.asarray(merged.get("plateau_Vm_normalized", plateau_traces), dtype=object)
 
     bad_masks = _compute_bad_masks(
         merged,

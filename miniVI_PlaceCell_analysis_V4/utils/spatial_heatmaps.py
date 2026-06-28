@@ -38,13 +38,51 @@ def _load_refined_or_merged_data(data_folder, folder):
         except Exception:
             pass
 
-    for filename in ("merged_aligned_data_CS.pkl", "merged_aligned_data.pkl"):
+    for filename in ("cluster_refined_analysis_data.pkl", "merged_aligned_data_CS.pkl", "merged_aligned_data.pkl"):
         path = os.path.join(animal_dir, filename)
         if os.path.exists(path):
             with open(path, "rb") as f:
                 loaded = pickle.load(f)
             return loaded if isinstance(loaded, dict) else None
     return None
+
+
+def _deleted_cells_from_loaded_data(folder, merged_data, snr_threshold=3.5, bad_frac_threshold=0.9):
+    deleted_set = set()
+    SNR_interpolated = merged_data.get('SNR_interpolated', [])
+    if SNR_interpolated is None:
+        SNR_interpolated = []
+    found_snr = False
+    for cell_idx in range(len(SNR_interpolated)):
+        snr_vals = np.asarray(SNR_interpolated[cell_idx])
+        if snr_vals.ndim == 0:
+            deleted_set.add((folder, cell_idx))
+            found_snr = True
+            continue
+
+        bad_mask = snr_vals < snr_threshold
+        bad_frac = np.mean(bad_mask)
+        found_snr = True
+
+        if bad_frac > bad_frac_threshold:
+            deleted_set.add((folder, cell_idx))
+    if found_snr:
+        return deleted_set
+
+    precomputed_bad_masks = merged_data.get("cluster_precomputed_bad_masks", None)
+    if precomputed_bad_masks is None:
+        return deleted_set
+    try:
+        bad_masks = np.asarray(precomputed_bad_masks, dtype=bool)
+    except Exception:
+        return deleted_set
+    if bad_masks.ndim != 2 or bad_masks.shape[1] == 0:
+        return deleted_set
+    for cell_idx in range(int(bad_masks.shape[0])):
+        bad_frac = float(np.mean(bad_masks[cell_idx]))
+        if bad_frac > bad_frac_threshold:
+            deleted_set.add((folder, cell_idx))
+    return deleted_set
 
 
 def get_deleted_cells(data_folder, folders, snr_threshold=3.5, bad_frac_threshold=0.9):
@@ -59,18 +97,12 @@ def get_deleted_cells(data_folder, folders, snr_threshold=3.5, bad_frac_threshol
         merged_data = _load_refined_or_merged_data(data_folder, folder)
         if not isinstance(merged_data, dict):
             continue
-        SNR_interpolated = merged_data.get('SNR_interpolated', [])
-        for cell_idx in range(len(SNR_interpolated)):
-            snr_vals = np.asarray(SNR_interpolated[cell_idx])
-            if snr_vals.ndim == 0:
-                deleted_set.add((folder, cell_idx))
-                continue
-
-            bad_mask = snr_vals < snr_threshold
-            bad_frac = np.mean(bad_mask)
-
-            if bad_frac > bad_frac_threshold:
-                deleted_set.add((folder, cell_idx))
+        deleted_set.update(_deleted_cells_from_loaded_data(
+            folder,
+            merged_data,
+            snr_threshold=snr_threshold,
+            bad_frac_threshold=bad_frac_threshold,
+        ))
     return deleted_set
 
 
@@ -81,16 +113,12 @@ def get_deleted_cells_with_fallback(data_folder, folders, snr_threshold=3.5, bad
         merged_data = _load_refined_or_merged_data(data_folder, folder)
         if not isinstance(merged_data, dict):
             continue
-        SNR_interpolated = merged_data.get('SNR_interpolated', [])
-        for cell_idx in range(len(SNR_interpolated)):
-            snr_vals = np.asarray(SNR_interpolated[cell_idx])
-            if snr_vals.ndim == 0:
-                deleted_set.add((folder, cell_idx))
-                continue
-            bad_mask = snr_vals < snr_threshold
-            bad_frac = np.mean(bad_mask)
-            if bad_frac > bad_frac_threshold:
-                deleted_set.add((folder, cell_idx))
+        deleted_set.update(_deleted_cells_from_loaded_data(
+            folder,
+            merged_data,
+            snr_threshold=snr_threshold,
+            bad_frac_threshold=bad_frac_threshold,
+        ))
     return deleted_set
 
 
@@ -127,8 +155,10 @@ def compute_removed_frame_stats_with_fallback(
         x = np.asarray(merged_data.get("x_neural", []), dtype=float)
         y = np.asarray(merged_data.get("y_neural", np.full_like(x, np.nan)), dtype=float)
         speed = np.asarray(merged_data.get("speed", np.full_like(x, np.nan)), dtype=float)
+        hd = np.asarray(merged_data.get("hd_angles_neural", np.full_like(x, np.nan)), dtype=float)
         n_frames = int(len(x))
         pos_nan_mask = (~np.isfinite(x)) | (~np.isfinite(y)) | (~np.isfinite(speed))
+        hd_nan_mask = ~np.isfinite(hd) if hd.size == n_frames else np.ones(n_frames, dtype=bool)
 
         if bad_masks.ndim != 2 or bad_masks.shape[1] != n_frames:
             continue
@@ -137,7 +167,8 @@ def compute_removed_frame_stats_with_fallback(
             bad_mask = np.asarray(bad_masks[cell_idx], dtype=bool)
             n_removed_total = int(np.sum(bad_mask))
             n_removed_pos_nan = int(np.sum(bad_mask & pos_nan_mask))
-            n_removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask)))
+            n_removed_hd_nan = int(np.sum(bad_mask & hd_nan_mask))
+            n_removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask) & (~hd_nan_mask)))
             n_kept_total = int(n_frames - n_removed_total)
             pct_removed_total = (100.0 * n_removed_total / n_frames) if n_frames > 0 else np.nan
             pct_removed_snr_only = (100.0 * n_removed_snr_only / n_frames) if n_frames > 0 else np.nan
@@ -148,8 +179,10 @@ def compute_removed_frame_stats_with_fallback(
                 "n_removed_frames_total": n_removed_total,
                 "n_removed_frames_snr_only": n_removed_snr_only,
                 "n_removed_frames_pos_nan": n_removed_pos_nan,
+                "n_removed_frames_head_direction_nan": n_removed_hd_nan,
                 "pct_removed_frames_total": pct_removed_total,
                 "pct_removed_frames_snr_only": pct_removed_snr_only,
+                "pct_removed_frames_head_direction_nan": (100.0 * n_removed_hd_nan / n_frames) if n_frames > 0 else np.nan,
             }
     return out
 
@@ -187,6 +220,12 @@ def compute_cb_in_pf_counts(data_folder, folders):
             spatial_cells = pickle.load(f)
         for cell in spatial_cells:
             cell_idx = cell['cell_idx']
+            if 'n_cb_in_pf' in cell:
+                try:
+                    cb_in_pf_counts[(folder, cell_idx)] = int(cell.get('n_cb_in_pf', 0) or 0)
+                    continue
+                except Exception:
+                    pass
             spike_shapes = cell.get('spike_shapes')
             if spike_shapes and 'complex' in spike_shapes:
                 cb = spike_shapes['complex']['shapes']

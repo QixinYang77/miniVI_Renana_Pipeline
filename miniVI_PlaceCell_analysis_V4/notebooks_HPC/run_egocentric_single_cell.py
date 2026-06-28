@@ -140,7 +140,7 @@ def main():
         print(f'Resolved runtime merged data: {resolved_data_path}')
         print(f'Spatial analysis file:        {animal_dir / "spatial_analysis_full.pkl"}')
         merged = _load_merged_data(animal_dir, config)
-        ctx = _prepare_native_analysis_context(merged, config)
+        ctx = _prepare_native_analysis_context(merged, config, require_traces=False)
         spatial_by_idx = _load_spatial_analysis_by_idx(animal_dir)
     except Exception as exc:
         _save_skip(out_file, category, animal_id, cell_idx, f'data_load_failed({exc})')

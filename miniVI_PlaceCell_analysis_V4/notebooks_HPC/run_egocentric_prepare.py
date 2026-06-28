@@ -88,6 +88,20 @@ def collect_data_source_records(config):
     return records
 
 
+def validate_exported_spatial_analysis_files(config):
+    missing = []
+    for animal_id in config.animals:
+        spatial_path = config.data_root / animal_id / 'spatial_analysis_full.pkl'
+        if not spatial_path.exists():
+            missing.append(spatial_path)
+    if missing:
+        raise FileNotFoundError(
+            'Missing exported spatial classification files. Run Step 0 unpack first, '
+            'or rerun this script with --force-recompute when full trace data are available: '
+            + ', '.join(str(p) for p in missing)
+        )
+
+
 def build_config(data_root, figures_root, force_recompute=False):
     return build_refined_config(
         HERE,
@@ -109,11 +123,17 @@ def main():
 
     config = build_config(args.data_root, args.figures_root, args.force_recompute)
 
-    # Step 1: Ensure cache
-    print('--- Ensuring cache for all animals ---')
-    statuses = ensure_cache_for_all_animals(config, force=args.force_recompute)
-    for st in statuses:
-        print(f'  [{st.action}] {st.animal_id}')
+    # Step 1: Ensure spatial classification inputs.
+    if args.force_recompute:
+        print('--- Ensuring cache for all animals ---')
+        statuses = ensure_cache_for_all_animals(config, force=True)
+        for st in statuses:
+            print(f'  [{st.action}] {st.animal_id}')
+    else:
+        print('--- Reusing exported spatial classification files; cache recomputation skipped ---')
+        validate_exported_spatial_analysis_files(config)
+        for animal_id in config.animals:
+            print(f'  [reused_exported_spatial] {animal_id}')
 
     data_sources = collect_data_source_records(config)
     source_by_animal = {rec['animal_id']: rec for rec in data_sources}

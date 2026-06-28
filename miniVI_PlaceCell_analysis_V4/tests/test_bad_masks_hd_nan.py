@@ -92,3 +92,40 @@ def test_manual_refined_masks_combine_hd_nan_with_existing_bad_sources():
     assert stats[0]["n_removed_frames_source_trace_bad"] == 1
     assert stats[0]["n_removed_frames_manual_snr_cutoff"] == 1
     assert stats[0]["n_removed_frames_snr_threshold_only"] == 1
+
+
+def test_cluster_precomputed_masks_allow_trace_free_payload():
+    n_frames = 6
+    precomputed = np.zeros((2, n_frames), dtype=bool)
+    precomputed[0, 1] = True
+    precomputed[1, 4] = True
+    data = {
+        "manual_refined_source": True,
+        "x_neural": np.arange(n_frames, dtype=float),
+        "y_neural": np.arange(n_frames, dtype=float),
+        "speed": np.full(n_frames, 5.0),
+        "hd_angles_neural": np.array([0.0, np.nan, 0.2, 0.3, 0.4, 0.5]),
+        "frame_rate": 10.0,
+        "spikes": [np.array([1]), np.array([2])],
+        "cluster_precomputed_bad_masks": precomputed,
+        "cluster_precomputed_bad_mask_params": {
+            "snr_threshold": 5.0,
+            "min_good_minutes": 0.0,
+        },
+        "cluster_precomputed_bad_mask_stats": [
+            {"n_removed_frames_snr_only": 1},
+            {"n_removed_frames_snr_only": 1},
+        ],
+    }
+
+    masks, stats = pcp._compute_bad_masks(
+        data,
+        snr_threshold=5.0,
+        min_good_minutes=0.0,
+        return_stats=True,
+    )
+
+    assert set(np.flatnonzero(masks[0])) == {1}
+    assert set(np.flatnonzero(masks[1])) == {1, 4}
+    assert [row["n_removed_frames_head_direction_nan"] for row in stats] == [1, 1]
+    assert all(row["cluster_precomputed_bad_masks"] for row in stats)

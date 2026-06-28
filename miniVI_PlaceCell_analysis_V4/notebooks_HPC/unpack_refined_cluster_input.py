@@ -23,6 +23,8 @@ os.environ["PYTHONPATH"] = str(HERE)
 REFINED_CLUSTER_INPUT_SCHEMA_VERSION = 1
 CLUSTER_REFINED_INPUT_FILENAME = "cluster_refined_analysis_data.pkl"
 CLUSTER_REFINED_METADATA_FILENAME = "cluster_refined_analysis_metadata.json"
+CLUSTER_SPATIAL_ANALYSIS_FILENAME = "spatial_analysis_full.pkl"
+CLUSTER_SPATIAL_METADATA_FILENAME = "spatial_analysis_cluster_metadata.json"
 
 
 def _format_first_bytes(data: bytes) -> str:
@@ -115,6 +117,7 @@ def _metadata_for_animal(bundle: dict[str, Any], bundle_path: Path, animal_id: s
         "parameter_snapshot": bundle.get("parameter_snapshot", {}),
         "source_files": (bundle.get("source_files", {}) or {}).get(animal_id, {}),
         "validation": (bundle.get("validation", {}) or {}).get(animal_id, {}),
+        "spatial_validation": (bundle.get("spatial_validation", {}) or {}).get(animal_id, {}),
     }
 
 
@@ -128,30 +131,43 @@ def unpack_bundle(
 ) -> list[Path]:
     bundle = _load_bundle(bundle_path)
     animal_payloads = bundle["animals"]
+    spatial_payloads = bundle.get("spatial_analysis", {})
+    if not isinstance(spatial_payloads, dict):
+        spatial_payloads = {}
     selected = list(animals) if animals else list(animal_payloads)
     missing = [animal_id for animal_id in selected if animal_id not in animal_payloads]
     if missing:
         raise KeyError(f"Requested animals missing from bundle: {missing}")
+    missing_spatial = [animal_id for animal_id in selected if animal_id not in spatial_payloads]
+    if missing_spatial:
+        raise KeyError(f"Requested animals missing spatial_analysis payload: {missing_spatial}")
 
     written: list[Path] = []
     for animal_id in selected:
         animal_dir = data_root / animal_id
         out_pickle = animal_dir / CLUSTER_REFINED_INPUT_FILENAME
         out_meta = animal_dir / CLUSTER_REFINED_METADATA_FILENAME
+        out_spatial = animal_dir / CLUSTER_SPATIAL_ANALYSIS_FILENAME
+        out_spatial_meta = animal_dir / CLUSTER_SPATIAL_METADATA_FILENAME
         if not validate_only and not force:
-            existing = [p for p in (out_pickle, out_meta) if p.exists()]
+            existing = [p for p in (out_pickle, out_meta, out_spatial, out_spatial_meta) if p.exists()]
             if existing:
                 raise FileExistsError(
                     "Refusing to overwrite existing unpacked files without --force: "
                     + ", ".join(str(p) for p in existing)
                 )
         print(f"{animal_id}: {out_pickle}")
+        print(f"{animal_id}: {out_spatial}")
         if validate_only:
             continue
         animal_dir.mkdir(parents=True, exist_ok=True)
         with out_pickle.open("wb") as f:
             pickle.dump(animal_payloads[animal_id], f, protocol=pickle.HIGHEST_PROTOCOL)
+        with out_spatial.open("wb") as f:
+            pickle.dump(spatial_payloads[animal_id], f, protocol=pickle.HIGHEST_PROTOCOL)
         with out_meta.open("w") as f:
+            json.dump(_metadata_for_animal(bundle, bundle_path, animal_id), f, indent=2, sort_keys=True)
+        with out_spatial_meta.open("w") as f:
             json.dump(_metadata_for_animal(bundle, bundle_path, animal_id), f, indent=2, sort_keys=True)
         written.append(out_pickle)
     return written

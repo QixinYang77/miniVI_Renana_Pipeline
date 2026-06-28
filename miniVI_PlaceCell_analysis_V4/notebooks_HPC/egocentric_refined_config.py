@@ -20,6 +20,8 @@ REFINED_CLUSTER_INPUT_SCHEMA_VERSION = 1
 CLUSTER_REFINED_BUNDLE_FILENAME = "ckii_refined_cluster_input_v1.pkl"
 CLUSTER_REFINED_INPUT_FILENAME = "cluster_refined_analysis_data.pkl"
 CLUSTER_REFINED_METADATA_FILENAME = "cluster_refined_analysis_metadata.json"
+CLUSTER_SPATIAL_ANALYSIS_FILENAME = "spatial_analysis_full.pkl"
+CLUSTER_SPATIAL_METADATA_FILENAME = "spatial_analysis_cluster_metadata.json"
 MANUAL_REFINED_SIDECAR_FILENAME = "manual_spike_detection_results.pkl"
 REFINED_BEHAVIOR_FILENAME = "merged_aligned_data_new.pkl"
 
@@ -254,6 +256,7 @@ def refined_parameter_snapshot() -> dict[str, Any]:
         "animals": list(ANIMALS),
         "notebooks_root": "notebooks_PCs_refined",
         "merged_data_filename": CLUSTER_REFINED_INPUT_FILENAME,
+        "spatial_analysis_filename": CLUSTER_SPATIAL_ANALYSIS_FILENAME,
         "manual_refined_sidecar_filename": MANUAL_REFINED_SIDECAR_FILENAME,
         "hydration_behavior_filename": REFINED_BEHAVIOR_FILENAME,
         "analysis": asdict(refined_analysis_params()),
