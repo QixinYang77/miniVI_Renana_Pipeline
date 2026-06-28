@@ -20,19 +20,24 @@ from pathlib import Path
 HERE = Path(__file__).parent.parent.resolve()
 # Remove any top-level repo paths that would shadow our utils/ with the top-level utils/
 _top_repo = str(HERE.parent)
-sys.path[:] = [p for p in sys.path if os.path.normpath(p) != os.path.normpath(_top_repo)]
+_top_repo_norm = os.path.normpath(_top_repo)
+sys.path[:] = [
+    p for p in sys.path
+    if os.path.normpath(os.path.abspath(p or os.getcwd())) != _top_repo_norm
+]
 sys.path.insert(0, str(HERE))
 os.environ['PYTHONPATH'] = str(HERE)
 
+from notebooks_HPC.egocentric_refined_config import (
+    ANIMALS,
+    DEFAULT_DIRECTION_MODE,
+    DEFAULT_FIRST_N_MINUTES,
+    build_refined_config,
+    build_refined_egocentric_params,
+)
 from utils.placecell_pipeline import (
-    AnalysisParams,
-    PlaceCellParams,
-    PFTraversalParams,
-    PooledParams,
-    CachePolicy,
-    PipelineConfig,
-    EgocentricTuningParams,
     _run_single_cell_egocentric_tuning_frame_sampled,
+    _resolve_merged_data_path,
     _load_merged_data,
     _prepare_native_analysis_context,
     _load_spatial_analysis_by_idx,
@@ -40,57 +45,12 @@ from utils.placecell_pipeline import (
 )
 
 
-ANIMALS = [
-    'CKII_pAce21_PR_20250806',
-    'CKII_pAce38_PX_20251126',
-    'CKII_pAce45_PX_20260118',
-    'CKII_pAce47_PX_20260128',
-    'CKII_pAce46_PR_20260222',
-    'CKII_pAce50_PRL_20260317',
-]
-
-
 def build_config(data_root, figures_root):
-    return PipelineConfig(
-        project_root=HERE,
-        data_root=Path(data_root),
-        figures_root=Path(figures_root),
-        notebooks_root=HERE / 'notebooks_PCs',
-        animals=ANIMALS,
-        analysis=AnalysisParams(
-            speed_threshold=3.0, speed_threshold_quiet=0.5, min_duration_s=0.25,
-            merge_gap_s=0.0, kernel_size=51, snr_threshold=3.0, min_good_minutes=5.0,
-            theta_freqs=(4.0, 8.0), slow_freqs=2.0,
-        ),
-        place_cell=PlaceCellParams(
-            bin_size=1.5, place_field_threshold=0.35, min_component_peak_ratio=0.45,
-            split_multi_peak_fields=True, split_secondary_peak_ratio=0.6,
-            split_secondary_peak_min_separation_cm=6.0, min_peak_rate=0.5,
-            max_field_area_ratio=0.5, min_field_bins=10, min_pf_reliability=0.2,
-            min_pf_traversals=5, pf_reliability_dilation_bins=3,
-            pf_reliability_dilation_shape='disk', smooth_sigma=1.5, min_occupancy_s=0.001,
-            occ_smooth_sigma=1.5, num_shuffles=1000, random_seed=42,
-            ss_shape_min_separation_ms=14.0, trim_sparse_top_row_for_analysis=True,
-            trim_sparse_top_row_for_plotting=True, sparse_top_row_nonocc_frac_threshold=0.8,
-        ),
-        traversal=PFTraversalParams(
-            center_by_pf_position=True, pf_component_selection='peak_rate',
-            min_duration_ms=100.0, min_distance_cm=5.0, traversal_merge_gap_s=2.0,
-            clear_traversal=False, session_indices=(0, 1), pf_center_window_sec=10.0,
-            min_traversals=10, firing_rate_bin_ms=100.0, firing_rate_smooth_ms=50.0,
-            subtract_pre_traversal_baseline=False, mask_non_traversal_pf=True,
-            max_pf_distance_cm=8.0, plateau_min_duration_ms=100.0,
-        ),
-        pooled=PooledParams(
-            cb_num_threshold=5, cs_peak_rate_threshold=0.5, run_psd_sections=True,
-            cs_plc_only=True, psd_speed_threshold=3, psd_chunk_s=2.0, psd_nperseg_s=1.0,
-            psd_noverlap_frac=0.5, simple_event_window_ms=80.0, simple_event_min_gap_ms=50.0,
-            min_chunk_valid_fraction=1.0, max_freq=100.0, normalize_psd=True,
-            norm_freq_range=(20.0, 100.0),
-        ),
-        cache=CachePolicy(
-            force_recompute=False, validate_only=False, save_executed_notebooks=False,
-        ),
+    return build_refined_config(
+        HERE,
+        data_root,
+        figures_root,
+        force_recompute=False,
     )
 
 
@@ -105,13 +65,13 @@ def main():
     parser.add_argument('--figures-root', type=str, default=str(HERE / 'figures'))
     parser.add_argument('--cell-index', type=int, default=None,
                         help='Index into manifest. Defaults to $SLURM_ARRAY_TASK_ID env var.')
-    parser.add_argument('--direction-mode', type=str, default='head', choices=['head', 'travel'])
+    parser.add_argument('--direction-mode', type=str, default=DEFAULT_DIRECTION_MODE, choices=['head', 'travel'])
     parser.add_argument('--spike-type', type=str, default='all_spike',
                         choices=['all_spike', 'simple_spike', 'complex_spike'],
                         help='Which spike type to use for egocentric analysis')
     parser.add_argument('--n-surrogates', type=int, default=1000)
     parser.add_argument('--n-jobs', type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    parser.add_argument('--first-n-minutes', type=float, default=10.0)
+    parser.add_argument('--first-n-minutes', type=float, default=DEFAULT_FIRST_N_MINUTES)
     args = parser.parse_args()
 
     # Resolve cell index: CLI arg > $SLURM_ARRAY_TASK_ID
@@ -152,27 +112,12 @@ def main():
     config = build_config(args.data_root, args.figures_root)
 
     # Build egocentric params
-    params = EgocentricTuningParams(
+    params = build_refined_egocentric_params(
         categories=(category,),
         first_n_minutes=args.first_n_minutes,
         direction_mode=args.direction_mode,
-        time_bin_s=0.1,
-        arena_size_cm=(35.5, 20.0),
-        local_spatial_bin_cm=5.0,
-        coarse_spatial_bin_cm=2.0,
-        n_angle_bins=10,
-        speed_min_cm_s=3.0,
-        speed_max_cm_s=60.0,
-        occupancy_threshold_s=0.2,
-        min_occupied_angle_bins=3,
-        min_mean_rate_hz=0.5,
-        min_valid_spatial_bins_for_fit=5,
-        n_restarts=100,
-        optimizer_method='Nelder-Mead',
         n_surrogates=args.n_surrogates,
         n_jobs=args.n_jobs,
-        surrogate_chunk_size=20,
-        random_seed=42,
         clear_output=False,
         save_null_distributions=False,
         show_progress=False,
@@ -186,8 +131,15 @@ def main():
     # Load animal data
     animal_dir = config.data_root / animal_id
     print(f'Loading data from {animal_dir} ...')
+    if cell_info.get('runtime_merged_data_file'):
+        print(f"Manifest runtime merged data: {cell_info['runtime_merged_data_file']}")
+    if cell_info.get('cache_merged_data_file'):
+        print(f"Manifest cache merged data:   {cell_info['cache_merged_data_file']}")
     try:
-        merged = _load_merged_data(animal_dir)
+        resolved_data_path = _resolve_merged_data_path(animal_dir, config)
+        print(f'Resolved runtime merged data: {resolved_data_path}')
+        print(f'Spatial analysis file:        {animal_dir / "spatial_analysis_full.pkl"}')
+        merged = _load_merged_data(animal_dir, config)
         ctx = _prepare_native_analysis_context(merged, config)
         spatial_by_idx = _load_spatial_analysis_by_idx(animal_dir)
     except Exception as exc:

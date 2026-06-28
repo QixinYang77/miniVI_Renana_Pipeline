@@ -9,6 +9,7 @@ This module provides:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from concurrent.futures import ProcessPoolExecutor
@@ -30,10 +31,16 @@ from nbclient import NotebookClient
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.collections import LineCollection
+from matplotlib.patches import Rectangle
+from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 from scipy import optimize, signal
 from scipy import stats as scipy_stats
+try:
+    from scipy import ndimage as scipy_ndimage
+except Exception:
+    scipy_ndimage = None
 
 from utils import placecell_core as core
 from utils import preprocess_neural as preprocess
@@ -41,8 +48,14 @@ from utils.preprocess_neural import compute_time_varying_snr_from_trace
 from utils.placecell_core import *  # noqa: F401,F403
 
 
-PIPELINE_VERSION = "1.3.2"
+PIPELINE_VERSION = "1.4.2"
 MANIFEST_FILENAME = "ckii_pipeline_manifest_v1.json"
+DEFAULT_MERGED_DATA_FILENAME = "merged_aligned_data.pkl"
+LEGACY_MERGED_DATA_FALLBACK_FILENAME = "merged_aligned_data_CS.pkl"
+MANUAL_SPIKE_RESULTS_FILENAME = "manual_spike_detection_results.pkl"
+REFINED_ANALYSIS_DATA_KEY = "refined_analysis_data"
+REFINED_ANALYSIS_SCHEMA_VERSION = 2
+DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S = 1.0
 # Keep preferred/non-preferred split maps aligned with empirical-only mini-polar
 # zone checks (column 8 in per-cell egocentric summary figures).
 EGOCENTRIC_PREF_HALF_WIDTH_DEG = 50.0
@@ -91,6 +104,8 @@ POOLED_FIGURE_TASKS: dict[str, dict[str, Any]] = {
 class AnalysisParams:
     speed_threshold: float = 3.0
     speed_threshold_quiet: float = 0.5
+    behavior_speed_outlier_threshold_cm_s: float = 80.0
+    behavior_speed_outlier_cleaning: bool = True
     min_duration_s: float = 0.25
     merge_gap_s: float = 0.0
     kernel_size: int = 51
@@ -98,6 +113,9 @@ class AnalysisParams:
     min_good_minutes: float = 5.0
     theta_freqs: tuple[float, float] = (4.0, 8.0)
     slow_freqs: float = 2.0
+    refined_apply_cb_baseline_removal: bool = False
+    refined_cb_baseline_window_s: float = 1.0
+    refined_snr_cb_baseline_window_s: float = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S
 
 
 @dataclass
@@ -110,8 +128,16 @@ class PlaceCellParams:
     min_peak_rate: float = 0.4
     max_field_area_ratio: float = 0.5
     min_field_bins: int = 10
-    min_pf_reliability: float = 0.10
-    min_pf_traversals: int = 5
+    min_pf_firing_traversals: int = 5
+    pf_firing_traversal_distance_window_cm: float = 15.0
+    pf_firing_traversal_detection_window_cm: float = 8.0
+    pf_firing_traversal_distance_bin_cm: float = 1.5
+    pf_firing_traversal_distance_mode: str = "euclidean_to_peak"
+    pf_firing_traversal_center_vicinity_min_cm: int = 1
+    pf_firing_traversal_center_vicinity_max_cm: int = 5
+    pf_firing_traversal_resting_speed_threshold: float = 0.5
+    pf_firing_traversal_merge_gap_s: float = 2.0
+    pf_firing_traversal_exclude_trials_with_bad_frames: bool = True
     pf_reliability_dilation_bins: int = 3
     pf_reliability_dilation_shape: str = "disk"
     bin_size: float = 1.5
@@ -163,6 +189,7 @@ class PFDistanceCenteredParams:
     smooth_window: float = 1.0
     include_long_cb_as_plateau: bool = True
     cb_plateau_min_duration_ms: float = 100.0
+    plateau_trace_window_ms: float = 100.0
 
 
 @dataclass
@@ -196,6 +223,7 @@ class PFDRZParams:
 class PooledParams:
     cb_num_threshold: int = 10
     cs_peak_rate_threshold: float = 0.5
+    cs_plc_definition_mode: str = "legacy"
     run_psd_sections: bool = True
     cs_plc_only: bool = True
     psd_speed_threshold: int = 3
@@ -503,6 +531,7 @@ class PipelineConfig:
     figures_root: Path
     notebooks_root: Path
     animals: list[str]
+    merged_data_filename: str = DEFAULT_MERGED_DATA_FILENAME
     analysis: AnalysisParams = field(default_factory=AnalysisParams)
     place_cell: PlaceCellParams = field(default_factory=PlaceCellParams)
     traversal: PFTraversalParams = field(default_factory=PFTraversalParams)
@@ -556,14 +585,39 @@ def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-def _source_identity(animal_dir: Path) -> dict[str, Any]:
-    primary = animal_dir / "merged_aligned_data.pkl"
-    fallback = animal_dir / "merged_aligned_data_CS.pkl"
+def _resolve_merged_data_path(animal_dir: Path, config: PipelineConfig | None = None) -> Path:
+    """Resolve the merged-data pickle used as the source for cache building."""
+    if config is not None:
+        filename = str(getattr(config, "merged_data_filename", DEFAULT_MERGED_DATA_FILENAME))
+        if Path(filename).name != filename:
+            raise ValueError(
+                "PipelineConfig.merged_data_filename must be a filename inside each animal folder, "
+                f"got {filename!r}"
+            )
+        src = animal_dir / filename
+        if not src.exists():
+            raise FileNotFoundError(
+                f"Missing configured merged data for {animal_dir.name}: expected {src}"
+            )
+        return src
+
+    primary = animal_dir / DEFAULT_MERGED_DATA_FILENAME
+    fallback = animal_dir / LEGACY_MERGED_DATA_FALLBACK_FILENAME
+    manual = animal_dir / MANUAL_SPIKE_RESULTS_FILENAME
     src = primary if primary.exists() else fallback
+    if not src.exists() and manual.exists():
+        src = manual
     if not src.exists():
         raise FileNotFoundError(
-            f"Missing source file for {animal_dir.name}: expected merged_aligned_data.pkl or merged_aligned_data_CS.pkl"
+            f"Missing source file for {animal_dir.name}: expected "
+            f"{DEFAULT_MERGED_DATA_FILENAME}, {LEGACY_MERGED_DATA_FALLBACK_FILENAME}, "
+            f"or {MANUAL_SPIKE_RESULTS_FILENAME}"
         )
+    return src
+
+
+def _source_identity(animal_dir: Path, config: PipelineConfig | None = None) -> dict[str, Any]:
+    src = _resolve_merged_data_path(animal_dir, config)
     stat = src.stat()
     return {
         "path": str(src),
@@ -599,7 +653,8 @@ def _config_fingerprint(config: PipelineConfig, animal_id: str) -> str:
         "place_cell": asdict(config.place_cell),
         "traversal": asdict(config.traversal),
         "pooled": asdict(config.pooled),
-        "source_identity": _source_identity(config.data_root / animal_id),
+        "merged_data_filename": config.merged_data_filename,
+        "source_identity": _source_identity(config.data_root / animal_id, config),
         "code_identity": _code_identity(),
     }
     return _hash_payload(payload)
@@ -610,6 +665,7 @@ def _required_artifacts(config: PipelineConfig) -> list[ArtifactSpec]:
     psd_spd = int(config.pooled.psd_speed_threshold)
     return [
         ArtifactSpec("pooled_stats", "pooled_stats.pkl"),
+        ArtifactSpec("animal_movement_summary", "animal_movement_summary.pkl"),
         ArtifactSpec("spatial_analysis", "spatial_analysis_full.pkl"),
         ArtifactSpec("theta_amp_state", f"theta_amp_state_speed{spd}.npz"),
         ArtifactSpec("psd_burst_type_state", f"psd_burstType_state_speed{psd_spd}.npz"),
@@ -633,6 +689,7 @@ def _purge_animal_cache_artifacts(animal_dir: Path) -> list[Path]:
     patterns = [
         "pooled_stats.pkl",
         "pooled_stats.csv",
+        "animal_movement_summary.pkl",
         "spatial_analysis_full.pkl",
         "theta_amp_state_speed*.npz",
         "psd_burstType_state_speed*.npz",
@@ -773,8 +830,16 @@ def _patch_figures_notebook_for_animal(
             f"min_peak_rate = {float(pcfg.min_peak_rate)!r}\n"
             f"max_field_area_ratio = {float(pcfg.max_field_area_ratio)!r}\n"
             f"min_field_bins = {int(pcfg.min_field_bins)!r}\n"
-            f"min_pf_reliability = {float(pcfg.min_pf_reliability)!r}\n"
-            f"min_pf_traversals = {int(pcfg.min_pf_traversals)!r}\n"
+            f"min_pf_firing_traversals = {int(pcfg.min_pf_firing_traversals)!r}\n"
+            f"pf_firing_traversal_distance_window_cm = {float(pcfg.pf_firing_traversal_distance_window_cm)!r}\n"
+            f"pf_firing_traversal_detection_window_cm = {float(pcfg.pf_firing_traversal_detection_window_cm)!r}\n"
+            f"pf_firing_traversal_distance_bin_cm = {float(pcfg.pf_firing_traversal_distance_bin_cm)!r}\n"
+            f"pf_firing_traversal_distance_mode = {str(pcfg.pf_firing_traversal_distance_mode)!r}\n"
+            f"pf_firing_traversal_center_vicinity_min_cm = {int(pcfg.pf_firing_traversal_center_vicinity_min_cm)!r}\n"
+            f"pf_firing_traversal_center_vicinity_max_cm = {int(pcfg.pf_firing_traversal_center_vicinity_max_cm)!r}\n"
+            f"pf_firing_traversal_resting_speed_threshold = {float(pcfg.pf_firing_traversal_resting_speed_threshold)!r}\n"
+            f"pf_firing_traversal_merge_gap_s = {float(pcfg.pf_firing_traversal_merge_gap_s)!r}\n"
+            f"pf_firing_traversal_exclude_trials_with_bad_frames = {bool(pcfg.pf_firing_traversal_exclude_trials_with_bad_frames)!r}\n"
             f"pf_reliability_dilation_bins = {int(pcfg.pf_reliability_dilation_bins)!r}\n"
             f"pf_reliability_dilation_shape = {str(pcfg.pf_reliability_dilation_shape)!r}\n"
             f"smooth_sigma = {float(pcfg.smooth_sigma)!r}\n"
@@ -854,8 +919,16 @@ def _patch_figures_notebook_for_animal(
             "        occ_smooth_sigma=occ_smooth_sigma,\n"
             "        display_PF_SS_CS=True,\n"
             "        min_peak_rate=min_peak_rate,\n"
-            "        min_pf_reliability=min_pf_reliability,\n"
-            "        min_pf_traversals=min_pf_traversals,\n"
+            "        min_pf_firing_traversals=min_pf_firing_traversals,\n"
+            "        pf_firing_traversal_distance_window_cm=pf_firing_traversal_distance_window_cm,\n"
+            "        pf_firing_traversal_detection_window_cm=pf_firing_traversal_detection_window_cm,\n"
+            "        pf_firing_traversal_distance_bin_cm=pf_firing_traversal_distance_bin_cm,\n"
+            "        pf_firing_traversal_distance_mode=pf_firing_traversal_distance_mode,\n"
+            "        pf_firing_traversal_center_vicinity_min_cm=pf_firing_traversal_center_vicinity_min_cm,\n"
+            "        pf_firing_traversal_center_vicinity_max_cm=pf_firing_traversal_center_vicinity_max_cm,\n"
+            "        pf_firing_traversal_resting_speed_threshold=pf_firing_traversal_resting_speed_threshold,\n"
+            "        pf_firing_traversal_merge_gap_s=pf_firing_traversal_merge_gap_s,\n"
+            "        pf_firing_traversal_exclude_trials_with_bad_frames=pf_firing_traversal_exclude_trials_with_bad_frames,\n"
             "        pf_reliability_dilation_bins=pf_reliability_dilation_bins,\n"
             "        pf_reliability_dilation_shape=pf_reliability_dilation_shape,\n"
             "        ss_shape_min_separation_ms=14.0,\n"
@@ -1014,16 +1087,1298 @@ def _patch_figures_notebook_for_animal(
     return patched
 
 
-def _load_merged_data(animal_dir: Path) -> dict[str, Any]:
-    primary = animal_dir / "merged_aligned_data.pkl"
-    fallback = animal_dir / "merged_aligned_data_CS.pkl"
-    src = primary if primary.exists() else fallback
-    if not src.exists():
-        raise FileNotFoundError(f"Missing merged data for {animal_dir.name}")
-    import pickle
+def _manual_sidecar_cells(sidecar: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    cells = sidecar.get("cells", {}) if isinstance(sidecar, dict) else {}
+    out: dict[int, dict[str, Any]] = {}
+    if not isinstance(cells, dict):
+        return out
+    for key, value in cells.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            cell_idx = int(value.get("cell_idx", key))
+        except Exception:
+            continue
+        out[int(cell_idx)] = value
+    return out
+
+
+def _load_manual_sidecar(animal_dir: Path, sidecar_filename: str = MANUAL_SPIKE_RESULTS_FILENAME) -> dict[str, Any]:
+    path = Path(animal_dir) / str(sidecar_filename)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing manual spike sidecar for {Path(animal_dir).name}: {path}")
+    with path.open("rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Manual spike sidecar is not a dict: {path}")
+    return payload
+
+
+def load_manual_refined_analysis_data(
+    animal_dir: str | Path,
+    sidecar_filename: str = MANUAL_SPIKE_RESULTS_FILENAME,
+) -> dict[str, Any]:
+    """Load the self-contained refined-analysis payload from a manual sidecar."""
+    sidecar = _load_manual_sidecar(Path(animal_dir), sidecar_filename=sidecar_filename)
+    refined = sidecar.get(REFINED_ANALYSIS_DATA_KEY)
+    if not isinstance(refined, dict):
+        raise KeyError(
+            f"{Path(animal_dir).name}/{sidecar_filename} does not contain "
+            f"{REFINED_ANALYSIS_DATA_KEY!r}. Run hydrate_manual_spike_sidecar first."
+        )
+    out = dict(refined)
+    out.setdefault("manual_refined_source", True)
+    out.setdefault("source_sidecar_file", str(Path(animal_dir) / sidecar_filename))
+    return out
+
+
+def _manual_interpolate_nonfinite(trace: np.ndarray) -> np.ndarray:
+    trace = np.asarray(trace, dtype=float).reshape(-1)
+    out = trace.copy()
+    finite = np.isfinite(out)
+    if out.size == 0 or np.all(finite):
+        return out
+    if not np.any(finite):
+        return out
+    idx = np.arange(out.size, dtype=float)
+    out[~finite] = np.interp(idx[~finite], idx[finite], out[finite])
+    return out
+
+
+def _manual_baseline_subtract(trace: np.ndarray, frame_rate: float, baseline_window_s: float) -> np.ndarray:
+    trace = np.asarray(trace, dtype=float).reshape(-1)
+    if trace.size == 0:
+        return trace.copy()
+    baseline_window = max(1, int(round(float(frame_rate) * float(baseline_window_s))))
+    bad = ~np.isfinite(trace)
+    interp = _manual_interpolate_nonfinite(trace)
+    if scipy_ndimage is not None:
+        baseline = scipy_ndimage.median_filter(interp, size=int(baseline_window))
+    else:
+        baseline = signal.medfilt(interp, kernel_size=max(1, int(baseline_window) | 1))
+    out = trace - baseline
+    out[bad] = np.nan
+    return out
+
+
+def _manual_median_window_frames(window_ms: float, frame_rate: float) -> int:
+    frames = max(1, int(round(float(window_ms) * float(frame_rate) / 1000.0)))
+    if frames % 2 == 0:
+        frames += 1
+    return frames
+
+
+def _manual_subthreshold_vm_segment(
+    trace_seg: np.ndarray,
+    local_spikes: np.ndarray,
+    median_window_frames: int,
+    *,
+    remove_spikes: bool = False,
+) -> np.ndarray:
+    vm = np.asarray(trace_seg, dtype=float).copy()
+    n = int(vm.size)
+    if remove_spikes:
+        for spk in np.asarray(local_spikes, dtype=np.int64).reshape(-1):
+            spk_i = int(spk)
+            if 0 <= spk_i < n:
+                vm[max(0, spk_i - 1): min(n, spk_i + 2)] = np.nan
+    vm = _manual_interpolate_nonfinite(vm)
+    if int(median_window_frames) > 1 and vm.size > 0:
+        if scipy_ndimage is not None:
+            vm = scipy_ndimage.median_filter(vm, size=int(median_window_frames))
+        else:
+            vm = signal.medfilt(vm, kernel_size=max(1, int(median_window_frames) | 1))
+    return vm
+
+
+def _manual_period_mask(n_frames: int, periods: Any) -> np.ndarray:
+    mask = np.zeros(int(n_frames), dtype=bool)
+    if not isinstance(periods, list):
+        return mask
+    for period in periods:
+        if not isinstance(period, dict):
+            continue
+        try:
+            start = int(period.get("start_frame", period.get("start")))
+            end = int(period.get("end_frame", period.get("end")))
+        except Exception:
+            continue
+        s = max(0, min(int(start), int(end)))
+        e = min(int(n_frames), max(int(start), int(end)))
+        if e > s:
+            mask[s:e] = True
+    return mask
+
+
+def _manual_segment_bounds(cell: dict[str, Any], n_frames: int) -> list[tuple[int, int]]:
+    raw = cell.get("segment_bounds", [])
+    out: list[tuple[int, int]] = []
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            try:
+                s = max(0, min(int(item[0]), int(n_frames)))
+                e = max(0, min(int(item[1]), int(n_frames)))
+            except Exception:
+                continue
+            if e > s:
+                out.append((s, e))
+    if not out:
+        out = [(0, int(n_frames))]
+    return out
+
+
+def _manual_spike_array(value: Any, n_frames: int) -> np.ndarray:
+    arr = np.asarray(value if value is not None else [], dtype=np.int64).reshape(-1)
+    arr = arr[(arr >= 0) & (arr < int(n_frames))]
+    return np.sort(np.unique(arr.astype(np.int64)))
+
+
+def _manual_trace_for_cell(source: Any, cell_idx: int, n_frames: int) -> np.ndarray:
+    if isinstance(source, (list, tuple)):
+        if 0 <= int(cell_idx) < len(source):
+            arr = np.asarray(source[int(cell_idx)], dtype=float).reshape(-1)
+        else:
+            arr = np.full(int(n_frames), np.nan, dtype=float)
+    else:
+        data = np.asarray(source, dtype=float)
+        if data.ndim == 1:
+            arr = data.reshape(-1)
+        elif data.ndim == 2 and data.shape[0] > int(cell_idx) and data.shape[1] == int(n_frames):
+            arr = data[int(cell_idx), :].reshape(-1)
+        elif data.ndim == 2 and data.shape[1] > int(cell_idx) and data.shape[0] == int(n_frames):
+            arr = data[:, int(cell_idx)].reshape(-1)
+        else:
+            arr = np.full(int(n_frames), np.nan, dtype=float)
+    if arr.size < int(n_frames):
+        arr = np.concatenate([arr, np.full(int(n_frames) - arr.size, np.nan, dtype=float)])
+    elif arr.size > int(n_frames):
+        arr = arr[: int(n_frames)]
+    return arr.astype(float, copy=False)
+
+
+def _manual_segment_values(values: Any, bounds: list[tuple[int, int]], fallback: float = 1.0) -> np.ndarray:
+    arr = np.asarray(values if values is not None else [], dtype=float).reshape(-1)
+    out = np.full(len(bounds), float(fallback), dtype=float)
+    n = min(out.size, arr.size)
+    if n > 0:
+        out[:n] = arr[:n]
+    finite = out[np.isfinite(out) & (out > 0)]
+    replacement = float(np.nanmedian(finite)) if finite.size else float(fallback)
+    if not np.isfinite(replacement) or replacement <= 0:
+        replacement = float(fallback)
+    out[~np.isfinite(out) | (out <= 0)] = replacement
+    return out
+
+
+def _manual_spikes_for_cb_vm(cell: dict[str, Any], n_frames: int) -> np.ndarray:
+    second_round = cell.get("second_round")
+    if isinstance(second_round, dict) and "cb_input_spikes" in second_round:
+        return _manual_spike_array(second_round.get("cb_input_spikes"), n_frames)
+    return _manual_spike_array(cell.get("spikes", []), n_frames)
+
+
+def _manual_normalize_trace_and_vm(
+    trace: np.ndarray,
+    frame_rate: float,
+    bounds: list[tuple[int, int]],
+    segment_heights: np.ndarray,
+    spikes_for_vm: np.ndarray,
+    *,
+    vm_median_window_ms: float,
+    remove_spikes_for_vm: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    trace = np.asarray(trace, dtype=float).reshape(-1)
+    vm_frames = _manual_median_window_frames(float(vm_median_window_ms), float(frame_rate))
+    trace_norm = np.full(trace.shape, np.nan, dtype=np.float32)
+    vm_norm = np.full(trace.shape, np.nan, dtype=np.float32)
+    vm_full = np.full(trace.shape, np.nan, dtype=float)
+    for seg_idx, (start, end) in enumerate(bounds):
+        seg = trace[int(start): int(end)]
+        local_spikes = spikes_for_vm[(spikes_for_vm >= int(start)) & (spikes_for_vm < int(end))] - int(start)
+        vm = _manual_subthreshold_vm_segment(
+            seg,
+            local_spikes,
+            vm_frames,
+            remove_spikes=bool(remove_spikes_for_vm),
+        )
+        vm[~np.isfinite(seg)] = np.nan
+        vm_full[int(start): int(end)] = vm
+        finite_vm = vm[np.isfinite(vm)]
+        if finite_vm.size:
+            center = float(np.nanmedian(finite_vm))
+        else:
+            finite_seg = seg[np.isfinite(seg)]
+            center = float(np.nanmedian(finite_seg)) if finite_seg.size else 0.0
+        height = float(segment_heights[seg_idx]) if seg_idx < segment_heights.size else 1.0
+        if not np.isfinite(height) or height <= 0:
+            height = 1.0
+        trace_norm[int(start): int(end)] = ((seg - center) / height).astype(np.float32)
+        vm_norm[int(start): int(end)] = ((vm - center) / height).astype(np.float32)
+    return trace_norm, vm_norm, vm_full
+
+
+def _manual_event_array(source: dict[str, Any], key: str, dtype: Any = float) -> np.ndarray:
+    return np.asarray(source.get(key, []), dtype=dtype).reshape(-1)
+
+
+def _manual_complex_burst_dict(cell: dict[str, Any], trace_norm: np.ndarray, vm_norm: np.ndarray) -> dict[str, Any]:
+    source = cell.get("complex_bursts", {})
+    if not isinstance(source, dict):
+        source = {}
+    starts = _manual_event_array(source, "starts", np.int64)
+    ends = _manual_event_array(source, "ends", np.int64)
+    locs = _manual_event_array(source, "locs", np.int64)
+    n = min(starts.size, ends.size, locs.size if locs.size else starts.size)
+    starts = starts[:n]
+    ends = ends[:n]
+    if locs.size < n:
+        locs = starts.copy()
+    else:
+        locs = locs[:n]
+    out = {
+        "starts": starts.astype(np.int64),
+        "ends": ends.astype(np.int64),
+        "locs": locs.astype(np.int64),
+        "complex_bursts": locs.astype(np.int64),
+        "peaks": _manual_event_array(source, "peaks", float)[:n],
+        "amplitudes": _manual_event_array(source, "amplitudes", float)[:n],
+        "durations_ms": _manual_event_array(source, "durations_ms", float)[:n],
+        "n_spikes": _manual_event_array(source, "n_spikes", np.int64)[:n],
+        "min_isi_ms": _manual_event_array(source, "min_isi_ms", float)[:n],
+        "segment_indices": _manual_event_array(source, "segment_indices", np.int64)[:n],
+        "baselines": np.zeros(n, dtype=float),
+        "fitted_baseline": np.zeros(trace_norm.shape, dtype=np.float32),
+        "trace": np.asarray(trace_norm, dtype=np.float32),
+        "trace_bl_subtracted": np.asarray(trace_norm, dtype=np.float32),
+        "trace_mf": np.asarray(vm_norm, dtype=np.float32),
+        "trace_lp": np.asarray(vm_norm, dtype=np.float32),
+    }
+    for key in ("peaks", "amplitudes", "durations_ms", "n_spikes", "min_isi_ms", "segment_indices"):
+        if np.asarray(out[key]).size < n:
+            fill_dtype = np.int64 if key in {"n_spikes", "segment_indices"} else float
+            fill = np.full(n, 0 if fill_dtype is np.int64 else np.nan, dtype=fill_dtype)
+            fill[: np.asarray(out[key]).size] = out[key]
+            out[key] = fill
+    return out
+
+
+def _manual_complex_burst_metrics(
+    cell: dict[str, Any],
+    trace_norm: np.ndarray,
+    vm_norm: np.ndarray,
+    frame_rate: float,
+    n_frames: int,
+) -> list[dict[str, Any]]:
+    """Convert saved manual complex-burst windows into core burst metric records."""
+    source = cell.get("complex_bursts", {})
+    if not isinstance(source, dict):
+        source = {}
+    starts = _manual_event_array(source, "starts", np.int64)
+    ends = _manual_event_array(source, "ends", np.int64)
+    amplitudes = _manual_event_array(source, "amplitudes", float)
+    durations_ms = _manual_event_array(source, "durations_ms", float)
+    n_spikes_saved = _manual_event_array(source, "n_spikes", np.int64)
+    peaks = _manual_event_array(source, "peaks", np.int64)
+    segments = _manual_event_array(source, "segment_indices", np.int64)
+    cs_spikes = _manual_spike_array(cell.get("complex_spikes", []), int(n_frames))
+
+    n = int(min(starts.size, ends.size))
+    metrics: list[dict[str, Any]] = []
+    trace_for_auc = np.asarray(vm_norm, dtype=float).reshape(-1)
+    for i in range(n):
+        start = int(starts[i])
+        end = int(ends[i])
+        if start < 0 or end < start or start >= int(n_frames):
+            continue
+        end = min(end, int(n_frames) - 1)
+
+        if i < amplitudes.size and np.isfinite(amplitudes[i]):
+            peak_amp = float(amplitudes[i])
+        else:
+            window = np.asarray(trace_norm[start : end + 1], dtype=float)
+            peak_amp = float(np.nanmax(window)) if np.any(np.isfinite(window)) else np.nan
+
+        if i < durations_ms.size and np.isfinite(durations_ms[i]):
+            duration_ms = float(durations_ms[i])
+        else:
+            duration_ms = float((end - start + 1) * 1000.0 / float(frame_rate))
+
+        if i < n_spikes_saved.size and np.isfinite(n_spikes_saved[i]):
+            n_spikes = int(n_spikes_saved[i])
+        else:
+            n_spikes = int(np.sum((cs_spikes >= start) & (cs_spikes <= end)))
+
+        window_auc = trace_for_auc[start : end + 1]
+        if window_auc.size and np.any(np.isfinite(window_auc)):
+            auc = float(np.trapz(np.clip(np.where(np.isfinite(window_auc), window_auc, 0.0), 0, None), dx=1.0 / float(frame_rate)))
+        else:
+            auc = np.nan
+
+        entry = {
+            "start": int(start),
+            "end": int(end),
+            "n_spikes": int(n_spikes),
+            "peak_amp": float(peak_amp),
+            "baseline": 0.0,
+            "duration_ms": float(duration_ms),
+            "auc": float(auc) if np.isfinite(auc) else np.nan,
+            "is_complex": True,
+            "is_single": False,
+        }
+        if i < peaks.size:
+            entry["peak"] = int(peaks[i])
+        if i < segments.size:
+            entry["segment_idx"] = int(segments[i])
+        metrics.append(entry)
+    return metrics
+
+
+def _manual_plateau_dict(
+    cell: dict[str, Any],
+    all_spikes: np.ndarray,
+    plateau_trace_norm: np.ndarray,
+    plateau_vm_norm: np.ndarray,
+) -> dict[str, Any]:
+    source = cell.get("plateaus", {})
+    if not isinstance(source, dict):
+        source = {}
+    starts = _manual_event_array(source, "starts", np.int64)
+    ends = _manual_event_array(source, "ends", np.int64)
+    locs = _manual_event_array(source, "locs", np.int64)
+    n = min(starts.size, ends.size, locs.size if locs.size else starts.size)
+    starts = starts[:n]
+    ends = ends[:n]
+    if locs.size < n:
+        locs = starts.copy()
+    else:
+        locs = locs[:n]
+    spike_indices = [
+        np.asarray(all_spikes[(all_spikes >= int(s)) & (all_spikes <= int(e))], dtype=np.int64)
+        for s, e in zip(starts, ends)
+    ]
+    out = {
+        "starts": starts.astype(np.int64),
+        "ends": ends.astype(np.int64),
+        "locs": locs.astype(np.int64),
+        "peaks": _manual_event_array(source, "peaks", float)[:n],
+        "amplitudes": _manual_event_array(source, "amplitudes", float)[:n],
+        "durations_ms": _manual_event_array(source, "durations_ms", float)[:n],
+        "n_spikes": _manual_event_array(source, "n_spikes", np.int64)[:n],
+        "min_isi_ms": _manual_event_array(source, "min_isi_ms", float)[:n],
+        "segment_indices": _manual_event_array(source, "segment_indices", np.int64)[:n],
+        "baselines": np.zeros(n, dtype=float),
+        "spike_indices": spike_indices,
+        "trace": np.asarray(plateau_trace_norm, dtype=np.float32),
+        "trace_mf": np.asarray(plateau_vm_norm, dtype=np.float32),
+        "trace_lp": np.asarray(plateau_vm_norm, dtype=np.float32),
+        "fitted_baseline": np.zeros(plateau_trace_norm.shape, dtype=np.float32),
+    }
+    for key in ("peaks", "amplitudes", "durations_ms", "n_spikes", "min_isi_ms", "segment_indices"):
+        if np.asarray(out[key]).size < n:
+            fill_dtype = np.int64 if key in {"n_spikes", "segment_indices"} else float
+            fill = np.full(n, 0 if fill_dtype is np.int64 else np.nan, dtype=fill_dtype)
+            fill[: np.asarray(out[key]).size] = out[key]
+            out[key] = fill
+    return out
+
+
+def _manual_expand_segment_values(
+    values: Any,
+    bounds: list[tuple[int, int]],
+    n_frames: int,
+    *,
+    fallback: float = np.nan,
+) -> np.ndarray:
+    out = np.full(int(n_frames), float(fallback), dtype=np.float32)
+    arr = np.asarray(values if values is not None else [], dtype=float).reshape(-1)
+    for idx, (start, end) in enumerate(bounds):
+        value = arr[idx] if idx < arr.size else fallback
+        out[int(start): int(end)] = float(value) if np.isfinite(value) else float(fallback)
+    return out
+
+
+def _manual_interpolate_segment_values(
+    values: Any,
+    bounds: list[tuple[int, int]],
+    n_frames: int,
+) -> np.ndarray:
+    """Linearly interpolate finite segment values from segment centers to frames."""
+    out = np.full(int(n_frames), np.nan, dtype=np.float32)
+    if int(n_frames) <= 0:
+        return out
+    vals = np.asarray(values if values is not None else [], dtype=float).reshape(-1)
+    padded = np.full(len(bounds), np.nan, dtype=float)
+    n = min(padded.size, vals.size)
+    if n > 0:
+        padded[:n] = vals[:n]
+    centers = np.asarray(
+        [(float(start) + float(end) - 1.0) / 2.0 for start, end in bounds],
+        dtype=float,
+    )
+    finite = np.isfinite(padded) & np.isfinite(centers)
+    if not np.any(finite):
+        return out
+    frame_idx = np.arange(int(n_frames), dtype=float)
+    if int(np.sum(finite)) == 1:
+        out[:] = float(padded[finite][0])
+    else:
+        out[:] = np.interp(
+            frame_idx,
+            centers[finite],
+            padded[finite],
+            left=float(padded[finite][0]),
+            right=float(padded[finite][-1]),
+        ).astype(np.float32)
+    return out
+
+
+def _manual_event_window_mask(n_frames: int, windows: Any) -> np.ndarray:
+    mask = np.zeros(int(n_frames), dtype=bool)
+    if not isinstance(windows, dict):
+        return mask
+    try:
+        starts = np.asarray(windows.get("starts", []), dtype=np.int64).reshape(-1)
+        ends = np.asarray(windows.get("ends", []), dtype=np.int64).reshape(-1)
+    except Exception:
+        return mask
+    n = min(starts.size, ends.size)
+    for start, end in zip(starts[:n], ends[:n]):
+        s = max(0, int(min(start, end)))
+        e = min(int(n_frames), int(max(start, end)) + 1)
+        if e > s:
+            mask[s:e] = True
+    return mask
+
+
+def _manual_calculate_step4_segment_snr(
+    normalized_noise_trace: np.ndarray,
+    bounds: list[tuple[int, int]],
+    spikes: Any,
+    frame_rate: float,
+    *,
+    complex_bursts: Any = None,
+    failed_min_spikes_windows: Any = None,
+    manual_exclusion_periods: Any = None,
+    spike_mask_ms: float = 3.0,
+) -> dict[str, Any]:
+    """Step4 segment SNR: one spike-height unit divided by residual-noise std."""
+    trace = np.asarray(normalized_noise_trace, dtype=float).reshape(-1)
+    n_frames = int(trace.size)
+    mask = ~np.isfinite(trace)
+    mask |= _manual_event_window_mask(n_frames, complex_bursts)
+    mask |= _manual_event_window_mask(n_frames, failed_min_spikes_windows)
+    mask |= _manual_period_mask(n_frames, manual_exclusion_periods)
+
+    try:
+        spike_radius = max(0, int(round(float(spike_mask_ms) * float(frame_rate) / 1000.0)))
+    except Exception:
+        spike_radius = 0
+    spike_arr = np.asarray(spikes if spikes is not None else [], dtype=np.int64).reshape(-1)
+    spike_arr = spike_arr[(spike_arr >= 0) & (spike_arr < n_frames)]
+    for spike in np.unique(spike_arr):
+        start = max(0, int(spike) - spike_radius)
+        end = min(n_frames, int(spike) + spike_radius + 1)
+        mask[start:end] = True
+
+    segment_snr = np.full(len(bounds), np.nan, dtype=float)
+    segment_noise = np.full(len(bounds), np.nan, dtype=float)
+    segment_baseline_counts = np.zeros(len(bounds), dtype=np.int64)
+    for seg_idx, (start, end) in enumerate(bounds):
+        start_i = max(0, int(start))
+        end_i = min(n_frames, int(end))
+        if end_i <= start_i:
+            continue
+        values = trace[start_i:end_i][~mask[start_i:end_i]]
+        values = values[np.isfinite(values)]
+        segment_baseline_counts[seg_idx] = int(values.size)
+        if values.size < 2:
+            continue
+        noise = float(np.nanstd(values, ddof=0))
+        segment_noise[seg_idx] = noise
+        if np.isfinite(noise) and noise > 1e-12:
+            segment_snr[seg_idx] = 1.0 / noise
+    finite_snr = segment_snr[np.isfinite(segment_snr)]
+    overall_snr = float(np.nanmean(finite_snr)) if finite_snr.size else float("nan")
+    return {
+        "segment_snr": segment_snr,
+        "segment_noise": segment_noise,
+        "segment_baseline_counts": segment_baseline_counts,
+        "overall_snr": overall_snr,
+    }
+
+
+def _manual_step4_snr_interpolated(
+    raw_trace: np.ndarray,
+    cell: dict[str, Any],
+    frame_rate: float,
+    n_frames: int,
+    *,
+    snr_cb_baseline_window_s: float = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S,
+) -> dict[str, Any]:
+    """Recompute framewise SNR from the manual step4 residual-noise formula."""
+    try:
+        snr_window_s = float(snr_cb_baseline_window_s)
+    except Exception:
+        snr_window_s = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S
+    if not np.isfinite(snr_window_s) or snr_window_s <= 0:
+        snr_window_s = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S
+
+    normalized = _manual_cell_normalized_traces(
+        raw_trace,
+        cell,
+        frame_rate,
+        n_frames,
+        apply_cb_baseline_removal=True,
+        cb_baseline_window_s=snr_window_s,
+    )
+    trace_norm = np.asarray(normalized["trace_spike_height_normalized"], dtype=float)
+    vm_norm = np.asarray(normalized["vm_spike_height_normalized"], dtype=float)
+    bounds = normalized["segment_bounds"]
+    noise_trace = trace_norm - vm_norm
+    try:
+        spike_mask_ms = float(cell.get("snr_spike_mask_ms", 3.0))
+    except Exception:
+        spike_mask_ms = 3.0
+    segment_result = _manual_calculate_step4_segment_snr(
+        noise_trace,
+        bounds,
+        _manual_spike_array(cell.get("spikes", []), n_frames),
+        frame_rate,
+        complex_bursts=_manual_complex_burst_dict(cell, trace_norm, vm_norm),
+        failed_min_spikes_windows=cell.get("failed_min_spikes_after_amp_duration_windows"),
+        manual_exclusion_periods=cell.get("manual_exclusion_periods", []),
+        spike_mask_ms=spike_mask_ms,
+    )
+    snr_interpolated = _manual_interpolate_segment_values(
+        segment_result["segment_snr"],
+        bounds,
+        n_frames,
+    )
+    segment_result.update(
+        {
+            "SNR_interpolated": snr_interpolated,
+            "trace_spike_height_normalized": trace_norm.astype(np.float32, copy=False),
+            "vm_spike_height_normalized": vm_norm.astype(np.float32, copy=False),
+            "manual_exclusion_mask": np.asarray(normalized["manual_exclusion_mask"], dtype=bool),
+            "segment_bounds": bounds,
+            "snr_cb_baseline_window_s": float(snr_window_s),
+            "snr_interpolation_method": "step4_segment_snr_linear_segment_centers",
+        }
+    )
+    return segment_result
+
+
+def _manual_cell_normalized_traces(
+    raw_trace: np.ndarray,
+    cell: dict[str, Any],
+    frame_rate: float,
+    n_frames: int,
+    *,
+    apply_cb_baseline_removal: bool = False,
+    cb_baseline_window_s: float | None = None,
+) -> dict[str, Any]:
+    params = cell.get("params", {}) if isinstance(cell.get("params"), dict) else {}
+    cb_params = cell.get("cb_params", {}) if isinstance(cell.get("cb_params"), dict) else {}
+    plateau_params = cell.get("plateau_params", {}) if isinstance(cell.get("plateau_params"), dict) else {}
+    bounds = _manual_segment_bounds(cell, n_frames)
+    primary = _manual_baseline_subtract(
+        raw_trace,
+        frame_rate,
+        float(params.get("baseline_window_s", 10.0)),
+    )
+    exclusion_mask = _manual_period_mask(n_frames, cell.get("manual_exclusion_periods", []))
+    primary[exclusion_mask] = np.nan
+
+    if bool(apply_cb_baseline_removal):
+        window_s = float(cb_params.get("cb_baseline_window_s", 1.0))
+        if cb_baseline_window_s is not None and np.isfinite(float(cb_baseline_window_s)):
+            window_s = float(cb_baseline_window_s)
+        cb_trace = _manual_baseline_subtract(
+            primary,
+            frame_rate,
+            window_s,
+        )
+    else:
+        cb_trace = primary.copy()
+    cb_heights = _manual_segment_values(cell.get("segment_spike_heights", []), bounds, fallback=1.0)
+    cb_spikes_for_vm = _manual_spikes_for_cb_vm(cell, n_frames)
+    trace_norm, vm_norm, _vm_full = _manual_normalize_trace_and_vm(
+        cb_trace,
+        frame_rate,
+        bounds,
+        cb_heights,
+        cb_spikes_for_vm,
+        vm_median_window_ms=float(cb_params.get("vm_median_window_ms", 21.0)),
+        remove_spikes_for_vm=bool(cb_params.get("remove_spikes_for_vm", False)),
+    )
+
+    plateau_trace = _manual_baseline_subtract(
+        primary,
+        frame_rate,
+        float(plateau_params.get("plateau_baseline_window_s", 10.0)),
+    )
+    plateau_result = cell.get("plateau_result", {}) if isinstance(cell.get("plateau_result"), dict) else {}
+    plateau_heights = _manual_segment_values(
+        plateau_result.get("segment_spike_heights", cell.get("plateau_segment_spike_heights", [])),
+        bounds,
+        fallback=1.0,
+    )
+    plateau_trace_norm, plateau_vm_norm, _plateau_vm_full = _manual_normalize_trace_and_vm(
+        plateau_trace,
+        frame_rate,
+        bounds,
+        plateau_heights,
+        _manual_spike_array(cell.get("spikes", []), n_frames),
+        vm_median_window_ms=float(plateau_params.get("plateau_vm_median_window_ms", 21.0)),
+        remove_spikes_for_vm=False,
+    )
+    return {
+        "trace_spike_height_normalized": trace_norm,
+        "vm_spike_height_normalized": vm_norm,
+        "plateau_trace_spike_height_normalized": plateau_trace_norm,
+        "plateau_vm_spike_height_normalized": plateau_vm_norm,
+        "manual_exclusion_mask": exclusion_mask,
+        "segment_bounds": bounds,
+    }
+
+
+def build_refined_analysis_data_from_manual_sidecar(
+    animal_dir: str | Path,
+    *,
+    merged_data_filename: str = DEFAULT_MERGED_DATA_FILENAME,
+    sidecar_filename: str = MANUAL_SPIKE_RESULTS_FILENAME,
+    apply_cb_baseline_removal: bool = False,
+    cb_baseline_window_s: float | None = None,
+    snr_cb_baseline_window_s: float = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S,
+) -> dict[str, Any]:
+    """Build a merged-like, self-contained analysis payload from manual GUI results."""
+    animal_dir = Path(animal_dir)
+    sidecar = _load_manual_sidecar(animal_dir, sidecar_filename=sidecar_filename)
+    cells_by_idx = _manual_sidecar_cells(sidecar)
+    if not cells_by_idx:
+        raise ValueError(f"No saved manual cells found in {animal_dir / sidecar_filename}")
+
+    merged_path = animal_dir / str(merged_data_filename)
+    if not merged_path.exists():
+        fallback = animal_dir / LEGACY_MERGED_DATA_FALLBACK_FILENAME
+        merged_path = fallback if fallback.exists() else merged_path
+    if not merged_path.exists():
+        raise FileNotFoundError(f"Missing hydration source for {animal_dir.name}: {merged_path}")
+    with merged_path.open("rb") as f:
+        merged = pickle.load(f)
+    if not isinstance(merged, dict):
+        raise ValueError(f"Hydration source is not a dict: {merged_path}")
+
+    x = np.asarray(merged.get("x_neural", []), dtype=float).reshape(-1)
+    y = np.asarray(merged.get("y_neural", np.full_like(x, np.nan)), dtype=float).reshape(-1)
+    speed = np.asarray(merged.get("speed", np.full_like(x, np.nan)), dtype=float).reshape(-1)
+    n_frames = int(min(x.size, y.size, speed.size))
+    if n_frames <= 0:
+        raise ValueError(f"Cannot hydrate {animal_dir.name}: missing behavior frame arrays.")
+    x = x[:n_frames]
+    y = y[:n_frames]
+    speed = speed[:n_frames]
+    frame_rate = float(sidecar.get("frame_rate", merged.get("frame_rate", np.nan)))
+    if not np.isfinite(frame_rate) or frame_rate <= 0:
+        raise ValueError(f"Cannot hydrate {animal_dir.name}: invalid frame_rate={frame_rate!r}.")
+    try:
+        snr_cb_baseline_window_s = float(snr_cb_baseline_window_s)
+    except Exception:
+        snr_cb_baseline_window_s = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S
+    if not np.isfinite(snr_cb_baseline_window_s) or snr_cb_baseline_window_s <= 0:
+        snr_cb_baseline_window_s = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S
+    n_cells = max(max(cells_by_idx) + 1, len(cells_by_idx))
+
+    traces_norm: list[np.ndarray] = []
+    vms_norm: list[np.ndarray] = []
+    plateau_traces_norm: list[np.ndarray] = []
+    plateau_vms_norm: list[np.ndarray] = []
+    spike_heights_interpolated: list[np.ndarray] = []
+    snr_interpolated: list[np.ndarray] = []
+    snr_segment_values: list[np.ndarray] = []
+    snr_segment_noise_values: list[np.ndarray] = []
+    snr_segment_baseline_counts_values: list[np.ndarray] = []
+    manual_bad_masks: list[np.ndarray] = []
+    manual_exclusion_masks: list[np.ndarray] = []
+    manual_snr_cutoff_masks: list[np.ndarray] = []
+    manual_bad_mask_stats: list[dict[str, Any]] = []
+    all_spikes: list[np.ndarray] = []
+    refined_ss: list[np.ndarray] = []
+    all_cs_spikes: list[np.ndarray] = []
+    complex_bursts_dicts: list[dict[str, Any]] = []
+    burst_metrics: list[list[dict[str, Any]]] = []
+    plateaus_dicts: list[dict[str, Any]] = []
+
+    raw_hd = np.asarray(merged.get("hd_angles_neural", np.full(n_frames, np.nan)), dtype=float).reshape(-1)
+    hd = np.full(n_frames, np.nan, dtype=float)
+    if raw_hd.size > 0:
+        n_hd = min(n_frames, raw_hd.size)
+        hd[:n_hd] = raw_hd[:n_hd]
+    pos_nan_mask = (~np.isfinite(x)) | (~np.isfinite(y)) | (~np.isfinite(speed))
+    hd_nan_mask = ~np.isfinite(hd)
+    max_time_s = float(n_frames) / float(frame_rate)
+    raw_trace_source = merged.get("traces", [])
+
+    for cell_idx in range(n_cells):
+        cell = cells_by_idx.get(cell_idx, {"cell_idx": int(cell_idx)})
+        raw_trace = _manual_trace_for_cell(raw_trace_source, cell_idx, n_frames)
+        normalized = _manual_cell_normalized_traces(
+            raw_trace,
+            cell,
+            frame_rate,
+            n_frames,
+            apply_cb_baseline_removal=bool(apply_cb_baseline_removal),
+            cb_baseline_window_s=cb_baseline_window_s,
+        )
+        snr_result = _manual_step4_snr_interpolated(
+            raw_trace,
+            cell,
+            frame_rate,
+            n_frames,
+            snr_cb_baseline_window_s=snr_cb_baseline_window_s,
+        )
+        trace_norm = np.asarray(normalized["trace_spike_height_normalized"], dtype=np.float32)
+        vm_norm = np.asarray(normalized["vm_spike_height_normalized"], dtype=np.float32)
+        plateau_trace_norm = np.asarray(normalized["plateau_trace_spike_height_normalized"], dtype=np.float32)
+        plateau_vm_norm = np.asarray(normalized["plateau_vm_spike_height_normalized"], dtype=np.float32)
+        traces_norm.append(trace_norm)
+        vms_norm.append(vm_norm)
+        plateau_traces_norm.append(plateau_trace_norm)
+        plateau_vms_norm.append(plateau_vm_norm)
+        spike_heights_interpolated.append(np.ones(n_frames, dtype=np.float32))
+
+        bounds = normalized["segment_bounds"]
+        snr_values = np.asarray(snr_result["SNR_interpolated"], dtype=np.float32)
+        snr_segment_values.append(np.asarray(snr_result["segment_snr"], dtype=float))
+        snr_segment_noise_values.append(np.asarray(snr_result["segment_noise"], dtype=float))
+        snr_segment_baseline_counts_values.append(
+            np.asarray(snr_result["segment_baseline_counts"], dtype=np.int64)
+        )
+        all_spk = _manual_spike_array(cell.get("spikes", []), n_frames)
+        ss_spk = _manual_spike_array(cell.get("simple_spikes", []), n_frames)
+        cs_spk = _manual_spike_array(cell.get("complex_spikes", []), n_frames)
+        all_spikes.append(all_spk)
+        refined_ss.append(ss_spk)
+        all_cs_spikes.append(cs_spk)
+        complex_bursts_dicts.append(_manual_complex_burst_dict(cell, trace_norm, vm_norm))
+        burst_metrics.append(
+            _manual_complex_burst_metrics(cell, trace_norm, vm_norm, frame_rate, n_frames)
+        )
+        plateaus_dicts.append(_manual_plateau_dict(cell, all_spk, plateau_trace_norm, plateau_vm_norm))
+
+        try:
+            snr_until_s = float(cell.get("snr_acceptable_until_s", max_time_s))
+        except Exception:
+            snr_until_s = max_time_s
+        if not np.isfinite(snr_until_s):
+            snr_until_s = max_time_s
+        snr_until_s = float(np.clip(snr_until_s, 0.0, max_time_s))
+        cutoff = int(np.floor(snr_until_s * float(frame_rate)))
+        cutoff = int(np.clip(cutoff, 0, n_frames))
+        snr_cutoff_mask = np.zeros(n_frames, dtype=bool)
+        if cutoff < n_frames:
+            snr_cutoff_mask[cutoff:] = True
+        trace_bad = ~np.isfinite(trace_norm)
+        exclusion_mask = np.asarray(normalized["manual_exclusion_mask"], dtype=bool)
+        manual_exclusion_masks.append(exclusion_mask)
+        manual_snr_cutoff_masks.append(snr_cutoff_mask)
+        bad_mask = pos_nan_mask | hd_nan_mask | trace_bad | exclusion_mask | snr_cutoff_mask
+        manual_bad_masks.append(bad_mask)
+        snr_interpolated.append(snr_values)
+        n_good = int(np.sum(~bad_mask))
+        n_manual_snr_cutoff = int(
+            np.sum(snr_cutoff_mask & (~pos_nan_mask) & (~hd_nan_mask) & (~trace_bad) & (~exclusion_mask))
+        )
+        manual_bad_mask_stats.append(
+            {
+                "cell_idx": int(cell_idx),
+                "n_frames_total": int(n_frames),
+                "n_good_frames_before_min_minutes": n_good,
+                "good_minutes_before_min_minutes": float(n_good) / float(frame_rate) / 60.0,
+                "removed_by_min_good_minutes": False,
+                "eligible_cell": bool(n_good > 0),
+                "n_removed_frames_total": int(np.sum(bad_mask)),
+                "n_removed_frames_pos_nan": int(np.sum(bad_mask & pos_nan_mask)),
+                "n_removed_frames_head_direction_nan": int(np.sum(bad_mask & hd_nan_mask)),
+                "n_removed_frames_source_trace_bad": int(np.sum(bad_mask & trace_bad)),
+                "n_removed_frames_snr_only": n_manual_snr_cutoff,
+                "n_removed_frames_manual_snr_cutoff": n_manual_snr_cutoff,
+                "n_removed_frames_snr_threshold_only": 0,
+                "pct_removed_frames_total": float(100.0 * np.sum(bad_mask) / n_frames),
+                "pct_removed_frames_head_direction_nan": float(100.0 * np.sum(hd_nan_mask) / n_frames),
+                "pct_removed_frames_snr_only": float(100.0 * n_manual_snr_cutoff / n_frames),
+                "pct_removed_frames_manual_snr_cutoff": float(100.0 * n_manual_snr_cutoff / n_frames),
+                "pct_removed_frames_snr_threshold_only": 0.0,
+                "pct_removed_frames_source_trace_bad": float(100.0 * np.sum(trace_bad) / n_frames),
+                "manual_snr_acceptable_until_s": float(snr_until_s),
+                "n_manual_exclusion_frames": int(np.sum(exclusion_mask)),
+                "manual_snr_overall_step4_recomputed": float(snr_result.get("overall_snr", np.nan)),
+            }
+        )
+
+    stat = merged_path.stat()
+    refined = {
+        "schema_version": REFINED_ANALYSIS_SCHEMA_VERSION,
+        "manual_refined_source": True,
+        "refined_apply_cb_baseline_removal": bool(apply_cb_baseline_removal),
+        "refined_cb_baseline_window_s": (
+            None if cb_baseline_window_s is None else float(cb_baseline_window_s)
+        ),
+        "refined_snr_cb_baseline_window_s": float(snr_cb_baseline_window_s),
+        "refined_snr_interpolation_method": "step4_segment_snr_linear_segment_centers",
+        "generated_at": _utcnow_iso(),
+        "animal_id": str(sidecar.get("animal_id", animal_dir.name)),
+        "hydration_source_file": str(merged_path),
+        "hydration_source_filename": str(merged_path.name),
+        "hydration_source_mtime_ns": int(stat.st_mtime_ns),
+        "source_sidecar_file": str(animal_dir / sidecar_filename),
+        "frame_rate": float(frame_rate),
+        "n_frames": int(n_frames),
+        "n_cells": int(n_cells),
+        "x_neural": x.astype(float),
+        "y_neural": y.astype(float),
+        "speed": speed.astype(float),
+        "hd_angles_neural": hd.astype(float),
+        "ts_neural": np.asarray(
+            merged.get("ts_neural", np.arange(n_frames, dtype=float) / float(frame_rate)),
+            dtype=float,
+        ).reshape(-1)[:n_frames],
+        "session_start_frames": list(merged.get("session_start_frames", [0])),
+        "traces": traces_norm,
+        "traces_SNR_interpolated": traces_norm,
+        "Vm_SNR_interpolated": vms_norm,
+        "plateau_traces_normalized": plateau_traces_norm,
+        "plateau_Vm_normalized": plateau_vms_norm,
+        "spike_heights_interpolated": spike_heights_interpolated,
+        "SNR_interpolated": snr_interpolated,
+        "SNR_segment_snr": snr_segment_values,
+        "SNR_segment_noise": snr_segment_noise_values,
+        "SNR_segment_baseline_counts": snr_segment_baseline_counts_values,
+        "spikes": all_spikes,
+        "all_spikes": all_spikes,
+        "refined_SS": refined_ss,
+        "all_CS_spikes": all_cs_spikes,
+        "complex_bursts_dicts": complex_bursts_dicts,
+        "plateaus_dicts": plateaus_dicts,
+        "burst_metrics": burst_metrics,
+        "manual_refined_bad_masks": np.asarray(manual_bad_masks, dtype=bool),
+        "manual_refined_manual_exclusion_masks": np.asarray(manual_exclusion_masks, dtype=bool),
+        "manual_refined_snr_cutoff_masks": np.asarray(manual_snr_cutoff_masks, dtype=bool),
+        "manual_refined_bad_mask_stats": manual_bad_mask_stats,
+        "removed_cells": [],
+        "refined_trace_units": "spike_height_normalized",
+        "plateau_trace_units": "plateau_spike_height_normalized",
+    }
+    for key in ("frame_width", "frame_height", "subfolders"):
+        if key in merged:
+            refined[key] = merged[key]
+    return refined
+
+
+def hydrate_manual_spike_sidecar(
+    animal_dir: str | Path,
+    *,
+    merged_data_filename: str = DEFAULT_MERGED_DATA_FILENAME,
+    sidecar_filename: str = MANUAL_SPIKE_RESULTS_FILENAME,
+    apply_cb_baseline_removal: bool = False,
+    cb_baseline_window_s: float | None = None,
+    snr_cb_baseline_window_s: float = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Augment one manual sidecar with a self-contained refined-analysis payload."""
+    animal_dir = Path(animal_dir)
+    sidecar_path = animal_dir / sidecar_filename
+    sidecar = _load_manual_sidecar(animal_dir, sidecar_filename=sidecar_filename)
+    refined_existing = sidecar.get(REFINED_ANALYSIS_DATA_KEY)
+    requested_cb_window = None if cb_baseline_window_s is None else float(cb_baseline_window_s)
+    existing_cb_window = None
+    if isinstance(refined_existing, dict) and "refined_cb_baseline_window_s" in refined_existing:
+        existing_value = refined_existing.get("refined_cb_baseline_window_s")
+        existing_cb_window = None if existing_value is None else float(existing_value)
+    try:
+        requested_snr_window = float(snr_cb_baseline_window_s)
+    except Exception:
+        requested_snr_window = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S
+    if not np.isfinite(requested_snr_window) or requested_snr_window <= 0:
+        requested_snr_window = DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S
+    existing_snr_window = None
+    if isinstance(refined_existing, dict) and "refined_snr_cb_baseline_window_s" in refined_existing:
+        try:
+            existing_snr_window = float(refined_existing.get("refined_snr_cb_baseline_window_s"))
+        except Exception:
+            existing_snr_window = None
+    if (
+        (not force)
+        and isinstance(refined_existing, dict)
+        and int(refined_existing.get("schema_version", 0)) >= int(REFINED_ANALYSIS_SCHEMA_VERSION)
+        and ("refined_apply_cb_baseline_removal" in refined_existing)
+        and ("refined_cb_baseline_window_s" in refined_existing)
+        and ("refined_snr_cb_baseline_window_s" in refined_existing)
+        and bool(refined_existing.get("refined_apply_cb_baseline_removal", False))
+        == bool(apply_cb_baseline_removal)
+        and existing_cb_window == requested_cb_window
+        and existing_snr_window == requested_snr_window
+    ):
+        return {
+            "animal_id": animal_dir.name,
+            "path": str(sidecar_path),
+            "action": "kept",
+            "n_cells": int(refined_existing.get("n_cells", 0)),
+            "n_frames": int(refined_existing.get("n_frames", 0)),
+        }
+    refined = build_refined_analysis_data_from_manual_sidecar(
+        animal_dir,
+        merged_data_filename=merged_data_filename,
+        sidecar_filename=sidecar_filename,
+        apply_cb_baseline_removal=bool(apply_cb_baseline_removal),
+        cb_baseline_window_s=cb_baseline_window_s,
+        snr_cb_baseline_window_s=requested_snr_window,
+    )
+    sidecar[REFINED_ANALYSIS_DATA_KEY] = refined
+    tmp_path = sidecar_path.with_name(f".{sidecar_path.name}.tmp")
+    with tmp_path.open("wb") as f:
+        pickle.dump(sidecar, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path.replace(sidecar_path)
+    return {
+        "animal_id": animal_dir.name,
+        "path": str(sidecar_path),
+        "action": "hydrated",
+        "n_cells": int(refined.get("n_cells", 0)),
+        "n_frames": int(refined.get("n_frames", 0)),
+    }
+
+
+def hydrate_manual_spike_sidecars_for_animals(
+    config: PipelineConfig,
+    animals: list[str] | tuple[str, ...] | None = None,
+    *,
+    merged_data_filename: str = DEFAULT_MERGED_DATA_FILENAME,
+    sidecar_filename: str = MANUAL_SPIKE_RESULTS_FILENAME,
+    apply_cb_baseline_removal: bool | None = None,
+    cb_baseline_window_s: float | None = None,
+    snr_cb_baseline_window_s: float | None = None,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    """Hydrate manual sidecars for a set of animals under config.data_root."""
+    animal_ids = list(animals if animals is not None else config.animals)
+    if apply_cb_baseline_removal is None:
+        apply_cb_baseline_removal = bool(
+            getattr(config.analysis, "refined_apply_cb_baseline_removal", False)
+        )
+    if cb_baseline_window_s is None:
+        cb_baseline_window_s = float(
+            getattr(config.analysis, "refined_cb_baseline_window_s", 1.0)
+        )
+    if snr_cb_baseline_window_s is None:
+        snr_cb_baseline_window_s = float(
+            getattr(config.analysis, "refined_snr_cb_baseline_window_s", DEFAULT_REFINED_SNR_CB_BASELINE_WINDOW_S)
+        )
+    out: list[dict[str, Any]] = []
+    for animal_id in animal_ids:
+        out.append(
+            hydrate_manual_spike_sidecar(
+                Path(config.data_root) / str(animal_id),
+                merged_data_filename=merged_data_filename,
+                sidecar_filename=sidecar_filename,
+                apply_cb_baseline_removal=bool(apply_cb_baseline_removal),
+                cb_baseline_window_s=cb_baseline_window_s,
+                snr_cb_baseline_window_s=float(snr_cb_baseline_window_s),
+                force=force,
+            )
+        )
+    return out
+
+
+def _load_merged_data(animal_dir: Path, config: PipelineConfig | None = None) -> dict[str, Any]:
+    src = _resolve_merged_data_path(animal_dir, config)
+    if src.name == MANUAL_SPIKE_RESULTS_FILENAME:
+        return load_manual_refined_analysis_data(animal_dir, sidecar_filename=src.name)
 
     with src.open("rb") as f:
         return pickle.load(f)
+
+
+def _interpolate_behavior_nan_1d(arr: np.ndarray) -> np.ndarray:
+    """Linearly interpolate NaNs and fill edge NaNs with nearest finite values."""
+    arr = np.asarray(arr, dtype=float).reshape(-1)
+    out = arr.copy()
+    if out.size == 0:
+        return out
+    idx = np.arange(out.size, dtype=float)
+    finite = np.isfinite(out)
+    if not np.any(finite):
+        return out
+    if np.all(finite):
+        return out
+    out[~finite] = np.interp(idx[~finite], idx[finite], out[finite])
+    return out
+
+
+def _clean_behavior_speed_outliers_for_cache(
+    merged_data: dict[str, Any],
+    config: PipelineConfig,
+    *,
+    animal_id: str = "",
+) -> dict[str, Any]:
+    """Return a merged-data copy with impossible-speed behavior frames interpolated."""
+    cleaned = dict(merged_data)
+    enabled = bool(getattr(config.analysis, "behavior_speed_outlier_cleaning", True))
+    threshold = float(getattr(config.analysis, "behavior_speed_outlier_threshold_cm_s", 80.0))
+    stats_payload: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "threshold_cm_s": float(threshold) if np.isfinite(threshold) else np.nan,
+        "animal_id": str(animal_id),
+        "n_frames_checked": 0,
+        "n_frames_cleaned": 0,
+        "pct_frames_cleaned": 0.0,
+        "max_raw_speed_cm_s": np.nan,
+        "position_interpolation": "linear_fill_edges",
+        "speed_recomputed_from_clean_position": False,
+        "speed_smoothed_recomputed": False,
+        "source_files_unchanged": True,
+    }
+
+    if not enabled:
+        stats_payload["skipped_reason"] = "disabled"
+        cleaned["behavior_speed_outlier_cleaning_stats"] = stats_payload
+        return cleaned
+    if (not np.isfinite(threshold)) or threshold <= 0:
+        raise ValueError("analysis.behavior_speed_outlier_threshold_cm_s must be a finite number > 0.")
+
+    x_src = np.asarray(cleaned.get("x_neural", []), dtype=float).reshape(-1)
+    y_src = np.asarray(cleaned.get("y_neural", np.full_like(x_src, np.nan)), dtype=float).reshape(-1)
+    speed_src = np.asarray(cleaned.get("speed", np.full_like(x_src, np.nan)), dtype=float).reshape(-1)
+    frame_rate = float(cleaned.get("frame_rate", np.nan))
+    if (not np.isfinite(frame_rate)) or frame_rate <= 0:
+        raise ValueError(f"{animal_id}: merged_data frame_rate must be a finite number > 0 for behavior cleaning.")
+
+    n_frames = int(min(x_src.size, y_src.size, speed_src.size))
+    stats_payload["n_frames_checked"] = int(n_frames)
+    finite_speed = speed_src[np.isfinite(speed_src)]
+    if finite_speed.size > 0:
+        stats_payload["max_raw_speed_cm_s"] = float(np.nanmax(finite_speed))
+    if n_frames <= 0:
+        stats_payload["skipped_reason"] = "missing_behavior_arrays"
+        cleaned["behavior_speed_outlier_cleaning_stats"] = stats_payload
+        return cleaned
+
+    bad_speed_mask = np.zeros(n_frames, dtype=bool)
+    raw_speed_check = np.asarray(speed_src[:n_frames], dtype=float)
+    bad_speed_mask[:] = np.isfinite(raw_speed_check) & (raw_speed_check > threshold)
+    n_cleaned = int(np.sum(bad_speed_mask))
+    stats_payload["n_frames_cleaned"] = int(n_cleaned)
+    stats_payload["pct_frames_cleaned"] = float(100.0 * n_cleaned / n_frames) if n_frames > 0 else np.nan
+
+    x_clean = x_src.copy()
+    y_clean = y_src.copy()
+    if n_cleaned <= 0:
+        cleaned["x_neural"] = x_clean
+        cleaned["y_neural"] = y_clean
+        cleaned["speed"] = speed_src.copy()
+        if "speed_smoothed" in cleaned:
+            cleaned["speed_smoothed"] = np.asarray(cleaned["speed_smoothed"], dtype=float).copy()
+        cleaned["behavior_speed_outlier_cleaning_stats"] = stats_payload
+        return cleaned
+
+    bad_idx = np.flatnonzero(bad_speed_mask)
+    x_clean[bad_idx] = np.nan
+    y_clean[bad_idx] = np.nan
+    x_clean = _interpolate_behavior_nan_1d(x_clean)
+    y_clean = _interpolate_behavior_nan_1d(y_clean)
+
+    speed_clean = np.full(x_clean.shape, np.nan, dtype=float)
+    valid_step = np.isfinite(x_clean) & np.isfinite(y_clean)
+    if x_clean.size > 0 and np.any(valid_step):
+        dx = np.diff(x_clean, prepend=x_clean[0])
+        dy = np.diff(y_clean, prepend=y_clean[0])
+        speed_clean = np.hypot(dx, dy) * frame_rate
+        speed_clean[~valid_step] = np.nan
+        speed_clean[0] = 0.0 if valid_step[0] else np.nan
+
+    cleaned["x_neural"] = x_clean
+    cleaned["y_neural"] = y_clean
+    cleaned["speed"] = speed_clean
+    stats_payload["speed_recomputed_from_clean_position"] = True
+
+    if "speed_smoothed" in cleaned:
+        try:
+            window_size = min(100, int(speed_clean.size)) if speed_clean.size > 0 else 1
+            if window_size > 1 and np.all(np.isfinite(speed_clean)):
+                cleaned["speed_smoothed"] = preprocess.apply_boxcar_filter(speed_clean, window_size)
+                stats_payload["speed_smoothed_recomputed"] = True
+            else:
+                cleaned["speed_smoothed"] = speed_clean.copy()
+                stats_payload["speed_smoothed_recomputed"] = True
+        except Exception as exc:
+            cleaned["speed_smoothed"] = speed_clean.copy()
+            stats_payload["speed_smoothed_recomputed"] = False
+            stats_payload["speed_smoothed_recompute_error"] = str(exc)
+
+    cleaned["behavior_speed_outlier_cleaning_stats"] = stats_payload
+    return cleaned
+
+
+def _prepare_animal_movement_summary_inputs(
+    animal_id: str,
+    merged_data: dict[str, Any],
+    config: PipelineConfig,
+) -> dict[str, Any]:
+    x_neural = np.asarray(merged_data.get("x_neural", []), dtype=float).reshape(-1)
+    y_neural = np.asarray(merged_data.get("y_neural", np.full_like(x_neural, np.nan)), dtype=float).reshape(-1)
+    speed = np.asarray(merged_data.get("speed", np.full_like(x_neural, np.nan)), dtype=float).reshape(-1)
+    frame_rate = float(merged_data.get("frame_rate", np.nan))
+    if (not np.isfinite(frame_rate)) or frame_rate <= 0:
+        raise ValueError(f"{animal_id}: merged_data frame_rate must be a finite number > 0.")
+
+    n_frames = int(min(x_neural.size, y_neural.size, speed.size))
+    if n_frames <= 0:
+        raise ValueError(f"{animal_id}: merged_data is missing behavior frames for movement summary.")
+    x_neural = x_neural[:n_frames]
+    y_neural = y_neural[:n_frames]
+    speed = speed[:n_frames]
+
+    speed_clean = np.asarray(speed, dtype=float).copy()
+    speed_clean[speed_clean > 60.0] = np.nan
+    valid_frames = np.isfinite(x_neural) & np.isfinite(y_neural) & np.isfinite(speed_clean)
+
+    speed_for_epochs = speed_clean.copy()
+    speed_for_epochs[~valid_frames] = np.nan
+    _, _, moving_idx = core._compute_moving_epochs(
+        speed_for_epochs,
+        frame_rate,
+        kernel_size=int(config.analysis.kernel_size),
+        filter_type="boxcar",
+        speed_threshold=float(config.analysis.speed_threshold),
+        min_duration_s=float(config.analysis.min_duration_s),
+        merge_gap_s=float(config.analysis.merge_gap_s),
+    )
+
+    moving_mask = np.zeros(n_frames, dtype=bool)
+    if len(moving_idx) > 0:
+        moving_mask[np.asarray(moving_idx, dtype=int)] = True
+    moving_mask &= valid_frames
+
+    return {
+        "x_neural": x_neural,
+        "y_neural": y_neural,
+        "speed_clean": speed_clean,
+        "valid_frames": valid_frames,
+        "moving_mask": moving_mask,
+        "frame_rate": float(frame_rate),
+        "n_frames": int(n_frames),
+    }
+
+
+def _compute_animal_movement_window_metrics(
+    movement_inputs: dict[str, Any],
+    start_frame: int,
+    end_frame: int,
+) -> dict[str, Any]:
+    x_neural = np.asarray(movement_inputs["x_neural"], dtype=float)
+    y_neural = np.asarray(movement_inputs["y_neural"], dtype=float)
+    speed_clean = np.asarray(movement_inputs["speed_clean"], dtype=float)
+    valid_frames = np.asarray(movement_inputs["valid_frames"], dtype=bool)
+    moving_mask = np.asarray(movement_inputs["moving_mask"], dtype=bool)
+    n_frames = int(movement_inputs["n_frames"])
+
+    start_frame = max(0, min(n_frames, int(start_frame)))
+    end_frame = max(start_frame, min(n_frames, int(end_frame)))
+    window_slice = slice(start_frame, end_frame)
+    valid_window = valid_frames[window_slice]
+    moving_window = moving_mask[window_slice]
+    speed_window = speed_clean[window_slice]
+
+    n_valid_frames = int(np.sum(valid_window))
+    n_moving_frames = int(np.sum(moving_window))
+    moving_fraction = (float(n_moving_frames) / float(n_valid_frames)) if n_valid_frames > 0 else np.nan
+    moving_percent = (100.0 * moving_fraction) if np.isfinite(moving_fraction) else np.nan
+    mean_speed_cm_s = float(np.nanmean(speed_window[moving_window])) if n_moving_frames > 0 else np.nan
+
+    if end_frame - start_frame >= 2:
+        x_window = x_neural[window_slice]
+        y_window = y_neural[window_slice]
+        step_valid = valid_window[:-1] & valid_window[1:]
+        step_dist_cm = np.hypot(np.diff(x_window), np.diff(y_window))
+        distance_cm = float(np.nansum(step_dist_cm[step_valid])) if np.any(step_valid) else 0.0
+    else:
+        distance_cm = 0.0
+
+    return {
+        "start_frame": int(start_frame),
+        "end_frame": int(end_frame),
+        "n_frames": int(end_frame - start_frame),
+        "n_valid_frames": int(n_valid_frames),
+        "n_moving_frames": int(n_moving_frames),
+        "moving_fraction": float(moving_fraction) if np.isfinite(moving_fraction) else np.nan,
+        "moving_percent": float(moving_percent) if np.isfinite(moving_percent) else np.nan,
+        "mean_speed_cm_s": float(mean_speed_cm_s) if np.isfinite(mean_speed_cm_s) else np.nan,
+        "distance_cm": float(distance_cm),
+        "distance_m": float(distance_cm / 100.0),
+    }
+
+
+def _compute_animal_movement_summary_payload(
+    animal_id: str,
+    merged_data: dict[str, Any],
+    config: PipelineConfig,
+    *,
+    first_n_minutes: float = 10.0,
+) -> dict[str, Any]:
+    movement_inputs = _prepare_animal_movement_summary_inputs(animal_id, merged_data, config)
+    frame_rate = float(movement_inputs["frame_rate"])
+    n_frames = int(movement_inputs["n_frames"])
+    cutoff_frame = int(np.floor(float(first_n_minutes) * 60.0 * frame_rate))
+    cutoff_frame = max(1, min(n_frames, cutoff_frame))
+    all_metrics = _compute_animal_movement_window_metrics(movement_inputs, 0, n_frames)
+    first_metrics = _compute_animal_movement_window_metrics(movement_inputs, 0, cutoff_frame)
+
+    payload = {
+        "animal_id": str(animal_id),
+        "frame_rate": float(frame_rate),
+        "analysis_params": {
+            "speed_threshold": float(config.analysis.speed_threshold),
+            "kernel_size": int(config.analysis.kernel_size),
+            "filter_type": "boxcar",
+            "min_duration_s": float(config.analysis.min_duration_s),
+            "merge_gap_s": float(config.analysis.merge_gap_s),
+        },
+        "n_frames_total": int(n_frames),
+        "n_valid_frames": int(all_metrics["n_valid_frames"]),
+        "n_moving_frames": int(all_metrics["n_moving_frames"]),
+        "moving_fraction": float(all_metrics["moving_fraction"]),
+        "moving_percent": float(all_metrics["moving_percent"]),
+        "mean_speed_cm_s": float(all_metrics["mean_speed_cm_s"]),
+        "first_10_min_cutoff_frame": int(cutoff_frame),
+        "distance_first_10_min_cm": float(first_metrics["distance_cm"]),
+        "distance_first_10_min_m": float(first_metrics["distance_m"]),
+    }
+    if isinstance(merged_data.get("behavior_speed_outlier_cleaning_stats"), dict):
+        payload["behavior_speed_outlier_cleaning_stats"] = dict(
+            merged_data["behavior_speed_outlier_cleaning_stats"]
+        )
+    return payload
+
+
+def _save_animal_movement_summary_artifact(
+    animal_dir: Path,
+    animal_id: str,
+    merged_data: dict[str, Any],
+    config: PipelineConfig,
+    *,
+    first_n_minutes: float = 10.0,
+) -> Path:
+    payload = _compute_animal_movement_summary_payload(
+        animal_id,
+        merged_data,
+        config,
+        first_n_minutes=first_n_minutes,
+    )
+    out_path = animal_dir / "animal_movement_summary.pkl"
+    with out_path.open("wb") as f:
+        pickle.dump(payload, f)
+    return out_path
 
 
 def _compute_bad_masks(
@@ -1033,11 +2388,23 @@ def _compute_bad_masks(
     *,
     return_stats: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, list[dict[str, Any]]]:
-    x_neural = np.asarray(merged_data["x_neural"], dtype=float)
-    y_neural = np.asarray(merged_data.get("y_neural", np.full_like(x_neural, np.nan)), dtype=float)
-    speed = np.asarray(merged_data.get("speed", np.full_like(x_neural, np.nan)), dtype=float)
+    x_neural = np.asarray(merged_data["x_neural"], dtype=float).reshape(-1)
+    y_neural = np.asarray(merged_data.get("y_neural", np.full_like(x_neural, np.nan)), dtype=float).reshape(-1)
+    speed = np.asarray(merged_data.get("speed", np.full_like(x_neural, np.nan)), dtype=float).reshape(-1)
     frame_rate = float(merged_data.get("frame_rate", np.nan))
     pos_nan_mask = (~np.isfinite(x_neural)) | (~np.isfinite(y_neural)) | (~np.isfinite(speed))
+    raw_hd = merged_data.get("hd_angles_neural", None)
+    hd_missing = raw_hd is None
+    hd_size_mismatch = False
+    if hd_missing:
+        hd_nan_mask = np.zeros(x_neural.size, dtype=bool)
+    else:
+        hd = np.asarray(raw_hd, dtype=float).reshape(-1)
+        hd_size_mismatch = bool(hd.size != x_neural.size)
+        hd_nan_mask = np.ones(x_neural.size, dtype=bool)
+        n_hd = min(x_neural.size, hd.size)
+        if n_hd > 0:
+            hd_nan_mask[:n_hd] = ~np.isfinite(hd[:n_hd])
     traces_snr = merged_data.get("traces_SNR_interpolated", merged_data.get("traces", []))
     all_spikes = merged_data.get("all_spikes", merged_data.get("spikes", []))
     complex_bursts_dicts = merged_data.get("complex_bursts_dicts", [])
@@ -1048,10 +2415,142 @@ def _compute_bad_masks(
     if not np.isfinite(frame_rate) or frame_rate <= 0:
         frame_rate = 1.0
 
+    if bool(merged_data.get("manual_refined_source", False)) and "manual_refined_bad_masks" in merged_data:
+        stored_masks = np.asarray(merged_data.get("manual_refined_bad_masks"), dtype=bool)
+        if stored_masks.ndim != 2 or stored_masks.shape[0] != n_cells or stored_masks.shape[1] != x_neural.size:
+            raise RuntimeError(
+                "Invalid manual_refined_bad_masks shape: expected "
+                f"{(n_cells, x_neural.size)}, got {stored_masks.shape}"
+            )
+        manual_exclusion_masks = np.zeros_like(stored_masks, dtype=bool)
+        raw_manual_exclusion_masks = merged_data.get("manual_refined_manual_exclusion_masks", None)
+        if raw_manual_exclusion_masks is not None:
+            try:
+                candidate = np.asarray(raw_manual_exclusion_masks, dtype=bool)
+                if candidate.shape == stored_masks.shape:
+                    manual_exclusion_masks = candidate
+            except Exception:
+                manual_exclusion_masks = np.zeros_like(stored_masks, dtype=bool)
+        manual_snr_cutoff_masks = np.zeros_like(stored_masks, dtype=bool)
+        raw_manual_snr_cutoff_masks = merged_data.get("manual_refined_snr_cutoff_masks", None)
+        if raw_manual_snr_cutoff_masks is not None:
+            try:
+                candidate = np.asarray(raw_manual_snr_cutoff_masks, dtype=bool)
+                if candidate.shape == stored_masks.shape:
+                    manual_snr_cutoff_masks = candidate
+            except Exception:
+                manual_snr_cutoff_masks = np.zeros_like(stored_masks, dtype=bool)
+        stored_stats = merged_data.get("manual_refined_bad_mask_stats", [])
+        for cell_idx in range(n_cells):
+            source_trace_bad = _source_trace_bad_mask(merged_data, cell_idx, x_neural.size)
+            manual_exclusion_mask = np.asarray(manual_exclusion_masks[cell_idx], dtype=bool)
+            manual_snr_cutoff_mask = np.asarray(manual_snr_cutoff_masks[cell_idx], dtype=bool)
+            manual_base_bad = (
+                np.asarray(stored_masks[cell_idx], dtype=bool)
+                | manual_exclusion_mask
+                | manual_snr_cutoff_mask
+                | pos_nan_mask
+                | hd_nan_mask
+                | source_trace_bad
+            )
+
+            snr_vals = np.array([], dtype=float)
+            snr_source = merged_data.get("SNR_interpolated", [])
+            try:
+                if isinstance(snr_source, (list, tuple)):
+                    if int(cell_idx) < len(snr_source):
+                        snr_vals = np.asarray(snr_source[int(cell_idx)], dtype=float).reshape(-1)
+                else:
+                    snr_data = np.asarray(snr_source, dtype=float)
+                    if snr_data.ndim == 2 and snr_data.shape[0] > int(cell_idx) and snr_data.shape[1] == x_neural.size:
+                        snr_vals = snr_data[int(cell_idx), :].reshape(-1)
+                    elif snr_data.ndim == 2 and snr_data.shape[1] > int(cell_idx) and snr_data.shape[0] == x_neural.size:
+                        snr_vals = snr_data[:, int(cell_idx)].reshape(-1)
+            except Exception:
+                snr_vals = np.array([], dtype=float)
+            if snr_vals.ndim != 1 or snr_vals.size != x_neural.size:
+                snr_threshold_bad = np.ones(x_neural.size, dtype=bool)
+            else:
+                snr_threshold_bad = (~np.isfinite(snr_vals)) | (snr_vals < float(snr_threshold))
+
+            bad_before_min_good = manual_base_bad | snr_threshold_bad
+            n_good_before = int(np.sum(~bad_before_min_good))
+            good_minutes = float(n_good_before) / float(frame_rate) / 60.0
+            removed_by_min_minutes = bool(good_minutes < float(min_good_minutes))
+            if removed_by_min_minutes:
+                bad_mask = np.ones(x_neural.size, dtype=bool)
+            else:
+                bad_mask = bad_before_min_good
+            bad_masks.append(bad_mask)
+
+            removed_total = int(np.sum(bad_mask))
+            removed_pos_nan = int(np.sum(bad_mask & pos_nan_mask))
+            removed_hd_nan = int(np.sum(bad_mask & hd_nan_mask))
+            removed_source_trace = int(np.sum(bad_mask & source_trace_bad))
+            stored = stored_stats[cell_idx] if isinstance(stored_stats, list) and cell_idx < len(stored_stats) and isinstance(stored_stats[cell_idx], dict) else {}
+            non_snr_manual_or_source = pos_nan_mask | hd_nan_mask | source_trace_bad | manual_exclusion_mask
+            snr_only_mask = bad_mask & (~non_snr_manual_or_source)
+            snr_threshold_only_mask = snr_threshold_bad & (~manual_base_bad)
+            manual_snr_cutoff_only_mask = (
+                manual_snr_cutoff_mask
+                & (~pos_nan_mask)
+                & (~hd_nan_mask)
+                & (~source_trace_bad)
+                & (~manual_exclusion_mask)
+            )
+            n_removed_snr_only = int(np.sum(snr_only_mask))
+            n_removed_snr_threshold_only = int(np.sum(snr_threshold_only_mask))
+            n_removed_manual_snr_cutoff = int(np.sum(manual_snr_cutoff_only_mask))
+            pct_removed_snr_only = (100.0 * n_removed_snr_only / x_neural.size) if x_neural.size > 0 else np.nan
+            pct_removed_snr_threshold_only = (
+                100.0 * n_removed_snr_threshold_only / x_neural.size
+                if x_neural.size > 0
+                else np.nan
+            )
+            pct_removed_manual_snr_cutoff = (
+                100.0 * n_removed_manual_snr_cutoff / x_neural.size
+                if x_neural.size > 0
+                else np.nan
+            )
+            mask_stats.append(
+                {
+                    "cell_idx": int(cell_idx),
+                    "n_frames_total": int(x_neural.size),
+                    "n_good_frames_before_min_minutes": n_good_before,
+                    "good_minutes_before_min_minutes": good_minutes,
+                    "removed_by_min_good_minutes": removed_by_min_minutes,
+                    "eligible_cell": bool(np.any(~bad_mask)),
+                    "n_removed_frames_total": removed_total,
+                    "n_removed_frames_pos_nan": removed_pos_nan,
+                    "n_removed_frames_head_direction_nan": removed_hd_nan,
+                    "n_removed_frames_source_trace_bad": removed_source_trace,
+                    "n_removed_frames_snr_only": n_removed_snr_only,
+                    "n_removed_frames_snr_threshold_only": n_removed_snr_threshold_only,
+                    "n_removed_frames_manual_snr_cutoff": n_removed_manual_snr_cutoff,
+                    "pct_removed_frames_total": (100.0 * removed_total / x_neural.size) if x_neural.size > 0 else np.nan,
+                    "pct_removed_frames_head_direction_nan": (100.0 * removed_hd_nan / x_neural.size) if x_neural.size > 0 else np.nan,
+                    "pct_removed_frames_snr_only": pct_removed_snr_only,
+                    "pct_removed_frames_snr_threshold_only": pct_removed_snr_threshold_only,
+                    "pct_removed_frames_manual_snr_cutoff": pct_removed_manual_snr_cutoff,
+                    "pct_removed_frames_source_trace_bad": (100.0 * removed_source_trace / x_neural.size) if x_neural.size > 0 else np.nan,
+                    "head_direction_missing": bool(hd_missing),
+                    "head_direction_size_mismatch": bool(hd_size_mismatch),
+                    "manual_refined_source": True,
+                    "manual_snr_acceptable_until_s": stored.get("manual_snr_acceptable_until_s", np.nan),
+                    "n_manual_exclusion_frames": int(stored.get("n_manual_exclusion_frames", 0)),
+                    "snr_threshold": float(snr_threshold),
+                }
+            )
+        bad_masks_arr = np.asarray(bad_masks, dtype=bool)
+        if return_stats:
+            return bad_masks_arr, mask_stats
+        return bad_masks_arr
+
     for cell_idx in range(n_cells):
         trace = np.asarray(traces_snr[cell_idx], dtype=float) if cell_idx < len(traces_snr) else np.array([])
         spks = np.asarray(all_spikes[cell_idx], dtype=int) if cell_idx < len(all_spikes) else np.array([], dtype=int)
         cb = complex_bursts_dicts[cell_idx] if cell_idx < len(complex_bursts_dicts) else None
+        source_trace_bad = _source_trace_bad_mask(merged_data, cell_idx, x_neural.size)
 
         if trace.ndim != 1 or trace.size != x_neural.size:
             # Exclude malformed traces from downstream analysis.
@@ -1059,7 +2558,9 @@ def _compute_bad_masks(
             bad_masks.append(bad_mask)
             removed_total = int(np.sum(bad_mask))
             removed_pos_nan = int(np.sum(bad_mask & pos_nan_mask))
-            removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask)))
+            removed_hd_nan = int(np.sum(bad_mask & hd_nan_mask))
+            removed_source_trace = int(np.sum(bad_mask & source_trace_bad))
+            removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask) & (~hd_nan_mask) & (~source_trace_bad)))
             mask_stats.append(
                 {
                     "cell_idx": int(cell_idx),
@@ -1070,9 +2571,15 @@ def _compute_bad_masks(
                     "eligible_cell": False,
                     "n_removed_frames_total": removed_total,
                     "n_removed_frames_pos_nan": removed_pos_nan,
+                    "n_removed_frames_head_direction_nan": removed_hd_nan,
+                    "n_removed_frames_source_trace_bad": removed_source_trace,
                     "n_removed_frames_snr_only": removed_snr_only,
                     "pct_removed_frames_total": (100.0 * removed_total / x_neural.size) if x_neural.size > 0 else np.nan,
+                    "pct_removed_frames_head_direction_nan": (100.0 * removed_hd_nan / x_neural.size) if x_neural.size > 0 else np.nan,
                     "pct_removed_frames_snr_only": (100.0 * removed_snr_only / x_neural.size) if x_neural.size > 0 else np.nan,
+                    "pct_removed_frames_source_trace_bad": (100.0 * removed_source_trace / x_neural.size) if x_neural.size > 0 else np.nan,
+                    "head_direction_missing": bool(hd_missing),
+                    "head_direction_size_mismatch": bool(hd_size_mismatch),
                 }
             )
             continue
@@ -1103,18 +2610,22 @@ def _compute_bad_masks(
             )
         else:
             good_snr = np.isfinite(snr_vals) & (snr_vals >= snr_threshold)
-            n_good_before = int(np.sum(good_snr))
+            bad_before_min_good = (~good_snr) | pos_nan_mask | hd_nan_mask | source_trace_bad
+            n_good_before = int(np.sum(~bad_before_min_good))
             good_minutes = float(n_good_before) / float(frame_rate) / 60.0
             removed_by_min_minutes = bool(good_minutes < float(min_good_minutes))
             if removed_by_min_minutes:
-                good_snr[:] = False
-            bad_mask = (~good_snr) | pos_nan_mask
+                bad_mask = np.ones(x_neural.size, dtype=bool)
+            else:
+                bad_mask = bad_before_min_good
         bad_mask = np.asarray(bad_mask, dtype=bool)
         bad_masks.append(bad_mask)
 
         removed_total = int(np.sum(bad_mask))
         removed_pos_nan = int(np.sum(bad_mask & pos_nan_mask))
-        removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask)))
+        removed_hd_nan = int(np.sum(bad_mask & hd_nan_mask))
+        removed_source_trace = int(np.sum(bad_mask & source_trace_bad))
+        removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask) & (~hd_nan_mask) & (~source_trace_bad)))
         eligible_cell = bool(np.any(~bad_mask))
         mask_stats.append(
             {
@@ -1126,9 +2637,15 @@ def _compute_bad_masks(
                 "eligible_cell": eligible_cell,
                 "n_removed_frames_total": removed_total,
                 "n_removed_frames_pos_nan": removed_pos_nan,
+                "n_removed_frames_head_direction_nan": removed_hd_nan,
+                "n_removed_frames_source_trace_bad": removed_source_trace,
                 "n_removed_frames_snr_only": removed_snr_only,
                 "pct_removed_frames_total": (100.0 * removed_total / x_neural.size) if x_neural.size > 0 else np.nan,
+                "pct_removed_frames_head_direction_nan": (100.0 * removed_hd_nan / x_neural.size) if x_neural.size > 0 else np.nan,
                 "pct_removed_frames_snr_only": (100.0 * removed_snr_only / x_neural.size) if x_neural.size > 0 else np.nan,
+                "pct_removed_frames_source_trace_bad": (100.0 * removed_source_trace / x_neural.size) if x_neural.size > 0 else np.nan,
+                "head_direction_missing": bool(hd_missing),
+                "head_direction_size_mismatch": bool(hd_size_mismatch),
             }
         )
 
@@ -1136,6 +2653,35 @@ def _compute_bad_masks(
     if return_stats:
         return bad_masks_arr, mask_stats
     return bad_masks_arr
+
+
+def _source_trace_bad_mask(merged_data: dict[str, Any], cell_idx: int, n_frames: int) -> np.ndarray:
+    """Recover manually excluded/interpolated frames from non-interpolated trace sources."""
+    out = np.zeros(int(n_frames), dtype=bool)
+    for key in ("traces", "SNR_interpolated", "spike_heights_interpolated"):
+        source = merged_data.get(key, None)
+        if source is None:
+            continue
+        arr = None
+        try:
+            if isinstance(source, (list, tuple)):
+                if int(cell_idx) < len(source):
+                    arr = np.asarray(source[int(cell_idx)], dtype=float).reshape(-1)
+            else:
+                data = np.asarray(source, dtype=float)
+                if data.ndim == 1:
+                    arr = data
+                elif data.ndim == 2:
+                    if data.shape[0] > int(cell_idx) and data.shape[1] == int(n_frames):
+                        arr = data[int(cell_idx), :]
+                    elif data.shape[1] > int(cell_idx) and data.shape[0] == int(n_frames):
+                        arr = data[:, int(cell_idx)]
+        except Exception:
+            arr = None
+        if arr is None or arr.size != int(n_frames):
+            continue
+        out |= ~np.isfinite(arr)
+    return out
 
 
 def _build_complex_mask(n_frames: int, cb_dict: dict[str, Any] | None) -> np.ndarray:
@@ -1261,7 +2807,7 @@ def generate_psd_burst_type_state_npz(animal_id: str, config: PipelineConfig) ->
     animal_dir = config.data_root / animal_id
     out_path = animal_dir / f"psd_burstType_state_speed{int(config.pooled.psd_speed_threshold)}.npz"
 
-    merged = _load_merged_data(animal_dir)
+    merged = _load_merged_data(animal_dir, config)
     frame_rate = float(merged["frame_rate"])
     speed = np.asarray(merged["speed"], dtype=float)
     x_neural = np.asarray(merged["x_neural"], dtype=float)
@@ -1474,6 +3020,8 @@ def _build_and_save_animal_bundle(animal_id: str, config: PipelineConfig, finger
         spatial_cells = pickle.load(f)
     with artifacts["pf_centered_trial_data"].open("rb") as f:
         pf_centered_data = pickle.load(f)
+    with artifacts["animal_movement_summary"].open("rb") as f:
+        animal_movement_summary = pickle.load(f)
 
     theta_npz = np.load(artifacts["theta_amp_state"], allow_pickle=True)
     theta_run = np.asarray(theta_npz.get("theta_run", np.array([])), dtype=float)
@@ -1531,6 +3079,7 @@ def _build_and_save_animal_bundle(animal_id: str, config: PipelineConfig, finger
         fingerprint=fingerprint,
         generated_at=_utcnow_iso(),
         config={
+            "merged_data_filename": config.merged_data_filename,
             "analysis": asdict(config.analysis),
             "place_cell": asdict(config.place_cell),
             "traversal": asdict(config.traversal),
@@ -1540,6 +3089,12 @@ def _build_and_save_animal_bundle(animal_id: str, config: PipelineConfig, finger
         artifact_paths={k: str(v) for k, v in artifacts.items()},
         notes={
             "n_cells": len(cell_records),
+            "animal_movement_summary": animal_movement_summary,
+            "behavior_speed_outlier_cleaning_stats": (
+                animal_movement_summary.get("behavior_speed_outlier_cleaning_stats")
+                if isinstance(animal_movement_summary, dict)
+                else None
+            ),
             "legacy_artifacts_kept_for_compatibility": True,
         },
     )
@@ -1564,6 +3119,21 @@ def load_animal_cache_bundle(animal_id: str, config: PipelineConfig) -> AnimalCa
             "Rebuild cache to regenerate bundle."
         )
     return bundle
+
+
+def load_animal_movement_summary(animal_id: str, config: PipelineConfig) -> dict[str, Any]:
+    path = config.data_root / animal_id / "animal_movement_summary.pkl"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Movement summary not found for {animal_id}: {path}. Run ensure_animal_cache first."
+        )
+    with path.open("rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"Unexpected movement summary payload for {animal_id}: {type(payload).__name__}."
+        )
+    return payload
 
 
 def get_cell_cache(animal_id: str, cell_idx: int, config: PipelineConfig) -> CellCacheRecord | None:
@@ -1593,6 +3163,18 @@ def _filter_spike_list_with_bad_masks(
     return out
 
 
+def _normalize_burst_metrics_for_core(value: Any) -> Any:
+    """Return None for placeholder burst metrics so core can use saved CB dicts."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        if all(v is None for v in value):
+            return None
+    return value
+
+
 def _prepare_native_analysis_context(
     merged: dict[str, Any],
     config: PipelineConfig,
@@ -1613,6 +3195,8 @@ def _prepare_native_analysis_context(
         raise KeyError("Missing traces in merged data.")
     traces = np.asarray(traces_raw, dtype=object)
     vms = np.asarray(merged.get("Vm_SNR_interpolated", traces_raw), dtype=object)
+    plateau_traces = np.asarray(merged.get("plateau_traces_normalized", traces_raw), dtype=object)
+    plateau_vms = np.asarray(merged.get("plateau_Vm_normalized", plateau_traces), dtype=object)
 
     bad_masks = _compute_bad_masks(
         merged,
@@ -1637,7 +3221,7 @@ def _prepare_native_analysis_context(
     spikes_for_analysis = list(all_spikes)
 
     complex_bursts_dicts = merged.get("complex_bursts_dicts", [dict() for _ in range(n_cells)])
-    burst_metrics = merged.get("burst_metrics", [None for _ in range(n_cells)])
+    burst_metrics = _normalize_burst_metrics_for_core(merged.get("burst_metrics"))
     plateaus_dicts = merged.get("plateaus_dicts", None)
     session_start_frames = merged.get("session_start_frames", [0])
 
@@ -1651,6 +3235,8 @@ def _prepare_native_analysis_context(
         "n_cells": n_cells,
         "traces": traces,
         "vms": vms,
+        "plateau_traces": plateau_traces,
+        "plateau_vms": plateau_vms,
         "bad_masks": bad_masks,
         "good_minutes_by_cell": good_minutes_by_cell,
         "eligible_cells": np.asarray(eligible_cells, dtype=bool),
@@ -1736,8 +3322,16 @@ def _run_place_cell_analysis_native(
             occ_smooth_sigma=float(p.occ_smooth_sigma),
             display_PF_SS_CS=True,
             min_peak_rate=float(p.min_peak_rate),
-            min_pf_reliability=float(p.min_pf_reliability),
-            min_pf_traversals=int(p.min_pf_traversals),
+            min_pf_firing_traversals=int(p.min_pf_firing_traversals),
+            pf_firing_traversal_distance_window_cm=float(p.pf_firing_traversal_distance_window_cm),
+            pf_firing_traversal_detection_window_cm=float(p.pf_firing_traversal_detection_window_cm),
+            pf_firing_traversal_distance_bin_cm=float(p.pf_firing_traversal_distance_bin_cm),
+            pf_firing_traversal_distance_mode=str(p.pf_firing_traversal_distance_mode),
+            pf_firing_traversal_center_vicinity_min_cm=int(p.pf_firing_traversal_center_vicinity_min_cm),
+            pf_firing_traversal_center_vicinity_max_cm=int(p.pf_firing_traversal_center_vicinity_max_cm),
+            pf_firing_traversal_resting_speed_threshold=float(p.pf_firing_traversal_resting_speed_threshold),
+            pf_firing_traversal_merge_gap_s=float(p.pf_firing_traversal_merge_gap_s),
+            pf_firing_traversal_exclude_trials_with_bad_frames=bool(p.pf_firing_traversal_exclude_trials_with_bad_frames),
             pf_reliability_dilation_bins=int(p.pf_reliability_dilation_bins),
             pf_reliability_dilation_shape=str(p.pf_reliability_dilation_shape),
             ss_shape_min_separation_ms=float(p.ss_shape_min_separation_ms),
@@ -2260,6 +3854,14 @@ def _save_spatial_analysis_artifact(
         | (~np.isfinite(np.asarray(ctx["y_neural"], dtype=float)))
         | (~np.isfinite(np.asarray(ctx["speed"], dtype=float)))
     )
+    if "hd_angles_neural" in ctx:
+        hd_nan_mask_global = ~np.isfinite(
+            np.asarray(ctx["hd_angles_neural"], dtype=float).reshape(-1)
+        )
+        if hd_nan_mask_global.shape[0] != n_frames_total:
+            hd_nan_mask_global = np.ones(n_frames_total, dtype=bool)
+    else:
+        hd_nan_mask_global = np.zeros(n_frames_total, dtype=bool)
 
     for cell_idx, analysis in enumerate(pc_output_all):
         if not bool(ctx["eligible_cells"][cell_idx]):
@@ -2290,10 +3892,12 @@ def _save_spatial_analysis_artifact(
             bad_mask = np.zeros(n_frames_total, dtype=bool)
         removed_total = int(np.sum(bad_mask))
         removed_pos_nan = int(np.sum(bad_mask & pos_nan_mask_global))
-        removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask_global)))
+        removed_hd_nan = int(np.sum(bad_mask & hd_nan_mask_global))
+        removed_snr_only = int(np.sum(bad_mask & (~pos_nan_mask_global) & (~hd_nan_mask_global)))
         kept_total = int(n_frames_total - removed_total)
         pct_removed_total = (100.0 * removed_total / n_frames_total) if n_frames_total > 0 else np.nan
         pct_removed_snr_only = (100.0 * removed_snr_only / n_frames_total) if n_frames_total > 0 else np.nan
+        pct_removed_hd_nan = (100.0 * removed_hd_nan / n_frames_total) if n_frames_total > 0 else np.nan
 
         cell_result = {
             "animal_id": animal_id,
@@ -2363,8 +3967,10 @@ def _save_spatial_analysis_artifact(
             "n_removed_frames_total": removed_total,
             "n_removed_frames_snr_only": removed_snr_only,
             "n_removed_frames_pos_nan": removed_pos_nan,
+            "n_removed_frames_head_direction_nan": removed_hd_nan,
             "pct_removed_frames_total": pct_removed_total,
             "pct_removed_frames_snr_only": pct_removed_snr_only,
+            "pct_removed_frames_head_direction_nan": pct_removed_hd_nan,
         }
         spatial_results_for_pooling.append(cell_result)
 
@@ -2448,7 +4054,19 @@ def _save_pf_centered_trial_data_artifact(
 def _recompute_animal_cache(animal_id: str, config: PipelineConfig) -> None:
     animal_dir = config.data_root / animal_id
     animal_dir.mkdir(parents=True, exist_ok=True)
-    merged = _load_merged_data(animal_dir)
+    merged = _load_merged_data(animal_dir, config)
+    merged = _clean_behavior_speed_outliers_for_cache(merged, config, animal_id=animal_id)
+    clean_stats = merged.get("behavior_speed_outlier_cleaning_stats", {})
+    if isinstance(clean_stats, dict) and clean_stats.get("enabled", False):
+        print(
+            f"{animal_id}: behavior speed outlier cleaning "
+            f"threshold={float(clean_stats.get('threshold_cm_s', np.nan)):.1f} cm/s, "
+            f"frames={int(clean_stats.get('n_frames_cleaned', 0))}/"
+            f"{int(clean_stats.get('n_frames_checked', 0))} "
+            f"({float(clean_stats.get('pct_frames_cleaned', 0.0)):.3f}%), "
+            f"max_raw_speed={float(clean_stats.get('max_raw_speed_cm_s', np.nan)):.2f} cm/s"
+        )
+    _save_animal_movement_summary_artifact(animal_dir, animal_id, merged, config, first_n_minutes=10.0)
     ctx = _prepare_native_analysis_context(merged, config)
     pc_output_all = _run_place_cell_analysis_native(animal_id, config, ctx)
 
@@ -2516,7 +4134,7 @@ def ensure_animal_cache(animal_id: str, config: PipelineConfig, force: bool = Fa
 
         manifest.setdefault("animals", {})[animal_id] = {
             "fingerprint": fingerprint,
-            "source_identity": _source_identity(animal_dir),
+            "source_identity": _source_identity(animal_dir, config),
             "updated_at": _utcnow_iso(),
             "artifact_mtime_ns": {
                 key: int(path.stat().st_mtime_ns) for key, path in artifact_paths.items()
@@ -2537,7 +4155,7 @@ def ensure_animal_cache(animal_id: str, config: PipelineConfig, force: bool = Fa
     bundle_path = _build_and_save_animal_bundle(animal_id, config, fingerprint)
     manifest.setdefault("animals", {})[animal_id] = {
         "fingerprint": fingerprint,
-        "source_identity": _source_identity(animal_dir),
+        "source_identity": _source_identity(animal_dir, config),
         "updated_at": _utcnow_iso(),
         "artifact_mtime_ns": {
             key: int(path.stat().st_mtime_ns) for key, path in artifact_paths.items()
@@ -2595,6 +4213,20 @@ def _patch_pooled_notebook(
         src,
         count=1,
     )
+    if re.search(r"CS_PLC_DEFINITION_MODE\s*=", src):
+        src = re.sub(
+            r"CS_PLC_DEFINITION_MODE\s*=\s*['\"].*?['\"]",
+            f"CS_PLC_DEFINITION_MODE = {str(config.pooled.cs_plc_definition_mode)!r}",
+            src,
+            count=1,
+        )
+    else:
+        src = re.sub(
+            r"(CS_PEAK_RATE_THRESHOLD\s*=\s*[^\n]+\n)",
+            r"\1" + f"CS_PLC_DEFINITION_MODE = {str(config.pooled.cs_plc_definition_mode)!r}\n",
+            src,
+            count=1,
+        )
     src = _replace_list_assignment(src, "ckii_folders", list(config.animals))
 
     src = src.replace(
@@ -2827,9 +4459,12 @@ def summarize_snr_removed_frames(
     bins: int = 10,
 ) -> dict[str, Any]:
     """
-    Summarize percentage of frames removed due to bad SNR from merged data.
+    Summarize percentage of frames removed by the analysis bad-frame mask.
 
-    Includes cells removed by the min-good-minutes rule (e.g., <5 min good SNR).
+    The total bad-frame mask includes low/non-finite time-varying SNR,
+    invalid behavior samples, and recovered source-trace bad epochs that were
+    later interpolated in ``traces_SNR_interpolated``. Cells removed by the
+    min-good-minutes rule are included.
     """
     import pandas as pd
 
@@ -2837,13 +4472,13 @@ def summarize_snr_removed_frames(
     missing_animals: list[str] = []
     for animal_id in config.animals:
         animal_dir = config.data_root / animal_id
-        merged_primary = animal_dir / "merged_aligned_data.pkl"
-        merged_fallback = animal_dir / "merged_aligned_data_CS.pkl"
-        if not merged_primary.exists() and not merged_fallback.exists():
+        try:
+            _resolve_merged_data_path(animal_dir, config)
+        except FileNotFoundError:
             missing_animals.append(animal_id)
             continue
 
-        merged = _load_merged_data(animal_dir)
+        merged = _load_merged_data(animal_dir, config)
         bad_masks, mask_stats = _compute_bad_masks(
             merged,
             snr_threshold=float(config.analysis.snr_threshold),
@@ -2876,8 +4511,22 @@ def summarize_snr_removed_frames(
                     "removed_by_min_good_minutes": bool(st.get("removed_by_min_good_minutes", False)),
                     "good_minutes_before_min_minutes": float(st.get("good_minutes_before_min_minutes", np.nan)),
                     "pct_removed_frames_snr_only": float(st.get("pct_removed_frames_snr_only", np.nan)),
+                    "pct_removed_frames_snr_threshold_only": float(st.get("pct_removed_frames_snr_threshold_only", np.nan)),
+                    "pct_removed_frames_manual_snr_cutoff": float(st.get("pct_removed_frames_manual_snr_cutoff", np.nan)),
+                    "pct_removed_frames_source_trace_bad": float(st.get("pct_removed_frames_source_trace_bad", np.nan)),
+                    "pct_removed_frames_pos_nan": (
+                        100.0
+                        * float(st.get("n_removed_frames_pos_nan", 0))
+                        / float(st.get("n_frames_total", bad_masks.shape[1] if bad_masks.ndim == 2 else 0))
+                        if float(st.get("n_frames_total", bad_masks.shape[1] if bad_masks.ndim == 2 else 0)) > 0
+                        else np.nan
+                    ),
                     "pct_removed_frames_total": float(st.get("pct_removed_frames_total", np.nan)),
                     "n_removed_frames_snr_only": int(st.get("n_removed_frames_snr_only", 0)),
+                    "n_removed_frames_snr_threshold_only": int(st.get("n_removed_frames_snr_threshold_only", 0)),
+                    "n_removed_frames_manual_snr_cutoff": int(st.get("n_removed_frames_manual_snr_cutoff", 0)),
+                    "n_removed_frames_source_trace_bad": int(st.get("n_removed_frames_source_trace_bad", 0)),
+                    "n_removed_frames_pos_nan": int(st.get("n_removed_frames_pos_nan", 0)),
                     "n_removed_frames_total": int(st.get("n_removed_frames_total", 0)),
                     "n_frames_total": int(st.get("n_frames_total", bad_masks.shape[1] if bad_masks.ndim == 2 else 0)),
                 }
@@ -2897,49 +4546,101 @@ def summarize_snr_removed_frames(
         }
 
     df["is_place_cell"] = pd.Series(df["is_place_cell"], dtype="object")
-    valid_pct = df["pct_removed_frames_snr_only"].to_numpy(dtype=float)
+    valid_pct = df["pct_removed_frames_total"].to_numpy(dtype=float)
     valid_pct = valid_pct[np.isfinite(valid_pct)]
     removed_mask = np.asarray(df["removed_by_min_good_minutes"], dtype=bool)
     n_removed_min_good = int(np.sum(removed_mask))
     n_kept = int(len(df) - n_removed_min_good)
+
+    def _finite_stats(values: Any, suffix: str) -> dict[str, float]:
+        vals = np.asarray(values, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        return {
+            f"mean_{suffix}": float(np.nanmean(vals)) if vals.size else np.nan,
+            f"median_{suffix}": float(np.nanmedian(vals)) if vals.size else np.nan,
+            f"std_{suffix}": float(np.nanstd(vals)) if vals.size else np.nan,
+            f"min_{suffix}": float(np.nanmin(vals)) if vals.size else np.nan,
+            f"max_{suffix}": float(np.nanmax(vals)) if vals.size else np.nan,
+        }
+
+    def _sum_pct(group: Any, count_col: str) -> float:
+        denom = float(np.sum(group["n_frames_total"].to_numpy(dtype=float)))
+        if denom <= 0:
+            return np.nan
+        return float(100.0 * np.sum(group[count_col].to_numpy(dtype=float)) / denom)
+
     overall = {
         "scope": "place_cells_only" if by_place_cells_only else "all_cells_including_removed",
         "n_cells": int(len(df)),
         "n_kept_cells": n_kept,
         "n_removed_min_good_minutes": n_removed_min_good,
-        "mean_pct_removed_snr_only": float(np.nanmean(valid_pct)) if valid_pct.size else np.nan,
-        "median_pct_removed_snr_only": float(np.nanmedian(valid_pct)) if valid_pct.size else np.nan,
-        "std_pct_removed_snr_only": float(np.nanstd(valid_pct)) if valid_pct.size else np.nan,
-        "min_pct_removed_snr_only": float(np.nanmin(valid_pct)) if valid_pct.size else np.nan,
-        "max_pct_removed_snr_only": float(np.nanmax(valid_pct)) if valid_pct.size else np.nan,
+        "n_frames_total_cellwise": int(np.sum(df["n_frames_total"].to_numpy(dtype=float))),
+        "n_removed_frames_total": int(np.sum(df["n_removed_frames_total"].to_numpy(dtype=float))),
+        "n_removed_frames_snr_only": int(np.sum(df["n_removed_frames_snr_only"].to_numpy(dtype=float))),
+        "n_removed_frames_snr_threshold_only": int(np.sum(df["n_removed_frames_snr_threshold_only"].to_numpy(dtype=float))),
+        "n_removed_frames_manual_snr_cutoff": int(np.sum(df["n_removed_frames_manual_snr_cutoff"].to_numpy(dtype=float))),
+        "n_removed_frames_source_trace_bad": int(np.sum(df["n_removed_frames_source_trace_bad"].to_numpy(dtype=float))),
+        "n_removed_frames_pos_nan": int(np.sum(df["n_removed_frames_pos_nan"].to_numpy(dtype=float))),
+        "pct_removed_total_cellwise": _sum_pct(df, "n_removed_frames_total"),
+        "pct_removed_snr_only_cellwise": _sum_pct(df, "n_removed_frames_snr_only"),
+        "pct_removed_snr_threshold_only_cellwise": _sum_pct(df, "n_removed_frames_snr_threshold_only"),
+        "pct_removed_manual_snr_cutoff_cellwise": _sum_pct(df, "n_removed_frames_manual_snr_cutoff"),
+        "pct_removed_source_trace_bad_cellwise": _sum_pct(df, "n_removed_frames_source_trace_bad"),
+        "pct_removed_pos_nan_cellwise": _sum_pct(df, "n_removed_frames_pos_nan"),
+        **_finite_stats(df["pct_removed_frames_total"], "pct_removed_total"),
+        **_finite_stats(df["pct_removed_frames_snr_only"], "pct_removed_snr_only"),
+        **_finite_stats(df["pct_removed_frames_snr_threshold_only"], "pct_removed_snr_threshold_only"),
+        **_finite_stats(df["pct_removed_frames_manual_snr_cutoff"], "pct_removed_manual_snr_cutoff"),
+        **_finite_stats(df["pct_removed_frames_source_trace_bad"], "pct_removed_source_trace_bad"),
+        **_finite_stats(df["pct_removed_frames_pos_nan"], "pct_removed_pos_nan"),
     }
     overall_df = pd.DataFrame([overall])
 
     def _agg_per_animal(group: Any) -> Any:
-        vals = group["pct_removed_frames_snr_only"].to_numpy(dtype=float)
-        vals = vals[np.isfinite(vals)]
-        return pd.Series(
-            {
-                "n_cells": int(len(group)),
-                "n_kept_cells": int(np.sum(~group["removed_by_min_good_minutes"].to_numpy(dtype=bool))),
-                "n_removed_min_good_minutes": int(np.sum(group["removed_by_min_good_minutes"].to_numpy(dtype=bool))),
-                "mean_pct_removed_snr_only": float(np.nanmean(vals)) if vals.size else np.nan,
-                "median_pct_removed_snr_only": float(np.nanmedian(vals)) if vals.size else np.nan,
-                "std_pct_removed_snr_only": float(np.nanstd(vals)) if vals.size else np.nan,
-                "min_pct_removed_snr_only": float(np.nanmin(vals)) if vals.size else np.nan,
-                "max_pct_removed_snr_only": float(np.nanmax(vals)) if vals.size else np.nan,
-            }
-        )
+        payload = {
+            "n_cells": int(len(group)),
+            "n_kept_cells": int(np.sum(~group["removed_by_min_good_minutes"].to_numpy(dtype=bool))),
+            "n_removed_min_good_minutes": int(np.sum(group["removed_by_min_good_minutes"].to_numpy(dtype=bool))),
+            "n_frames_total_cellwise": int(np.sum(group["n_frames_total"].to_numpy(dtype=float))),
+            "n_removed_frames_total": int(np.sum(group["n_removed_frames_total"].to_numpy(dtype=float))),
+            "n_removed_frames_snr_only": int(np.sum(group["n_removed_frames_snr_only"].to_numpy(dtype=float))),
+            "n_removed_frames_snr_threshold_only": int(np.sum(group["n_removed_frames_snr_threshold_only"].to_numpy(dtype=float))),
+            "n_removed_frames_manual_snr_cutoff": int(np.sum(group["n_removed_frames_manual_snr_cutoff"].to_numpy(dtype=float))),
+            "n_removed_frames_source_trace_bad": int(np.sum(group["n_removed_frames_source_trace_bad"].to_numpy(dtype=float))),
+            "n_removed_frames_pos_nan": int(np.sum(group["n_removed_frames_pos_nan"].to_numpy(dtype=float))),
+            "pct_removed_total_cellwise": _sum_pct(group, "n_removed_frames_total"),
+            "pct_removed_snr_only_cellwise": _sum_pct(group, "n_removed_frames_snr_only"),
+            "pct_removed_snr_threshold_only_cellwise": _sum_pct(group, "n_removed_frames_snr_threshold_only"),
+            "pct_removed_manual_snr_cutoff_cellwise": _sum_pct(group, "n_removed_frames_manual_snr_cutoff"),
+            "pct_removed_source_trace_bad_cellwise": _sum_pct(group, "n_removed_frames_source_trace_bad"),
+            "pct_removed_pos_nan_cellwise": _sum_pct(group, "n_removed_frames_pos_nan"),
+        }
+        payload.update(_finite_stats(group["pct_removed_frames_total"], "pct_removed_total"))
+        payload.update(_finite_stats(group["pct_removed_frames_snr_only"], "pct_removed_snr_only"))
+        payload.update(_finite_stats(group["pct_removed_frames_snr_threshold_only"], "pct_removed_snr_threshold_only"))
+        payload.update(_finite_stats(group["pct_removed_frames_manual_snr_cutoff"], "pct_removed_manual_snr_cutoff"))
+        payload.update(_finite_stats(group["pct_removed_frames_source_trace_bad"], "pct_removed_source_trace_bad"))
+        payload.update(_finite_stats(group["pct_removed_frames_pos_nan"], "pct_removed_pos_nan"))
+        return pd.Series(payload)
 
-    per_animal = df.groupby("animal_id", as_index=False).apply(_agg_per_animal).reset_index(drop=True)
+    per_animal_rows: list[dict[str, Any]] = []
+    for animal_id, group in df.groupby("animal_id", sort=True):
+        payload = dict(_agg_per_animal(group))
+        payload["animal_id"] = animal_id
+        per_animal_rows.append(payload)
+    per_animal = pd.DataFrame(per_animal_rows)
+    if not per_animal.empty:
+        per_animal = per_animal[["animal_id"] + [col for col in per_animal.columns if col != "animal_id"]]
 
     print(
         "SNR removed-frame summary "
         f"({'place cells only' if by_place_cells_only else 'all cells'}): "
         f"n_cells={overall['n_cells']}, "
         f"removed(<{config.analysis.min_good_minutes} min good)={overall['n_removed_min_good_minutes']}, "
-        f"mean={overall['mean_pct_removed_snr_only']:.2f}%, "
-        f"median={overall['median_pct_removed_snr_only']:.2f}%"
+        f"mean_total={overall['mean_pct_removed_total']:.2f}%, "
+        f"median_total={overall['median_pct_removed_total']:.2f}%, "
+        f"source_bad={overall['pct_removed_source_trace_bad_cellwise']:.2f}%, "
+        f"snr_only={overall['pct_removed_snr_only_cellwise']:.2f}%"
     )
     if missing_animals:
         print(f"Missing merged data for: {', '.join(missing_animals)}")
@@ -2947,9 +4648,9 @@ def summarize_snr_removed_frames(
     fig = None
     if show_plot and valid_pct.size > 0:
         fig, ax = plt.subplots(figsize=(1.4, 1.2))
-        kept_pct = df.loc[~df["removed_by_min_good_minutes"], "pct_removed_frames_snr_only"].to_numpy(dtype=float)
+        kept_pct = df.loc[~df["removed_by_min_good_minutes"], "pct_removed_frames_total"].to_numpy(dtype=float)
         kept_pct = kept_pct[np.isfinite(kept_pct)]
-        removed_pct = df.loc[df["removed_by_min_good_minutes"], "pct_removed_frames_snr_only"].to_numpy(dtype=float)
+        removed_pct = df.loc[df["removed_by_min_good_minutes"], "pct_removed_frames_total"].to_numpy(dtype=float)
         removed_pct = removed_pct[np.isfinite(removed_pct)]
 
         plot_series = []
@@ -2963,7 +4664,7 @@ def summarize_snr_removed_frames(
             plot_series.append(removed_pct)
             plot_labels.append(f"Removed (<{config.analysis.min_good_minutes} min good)")
             plot_colors.append("#9E9E9E")
-        ax.hist(
+        counts, bin_edges, _patches = ax.hist(
             plot_series,
             bins=int(bins),
             stacked=True,
@@ -2972,10 +4673,26 @@ def summarize_snr_removed_frames(
             linewidth=0.4,
             label=plot_labels,
         )
+        total_counts, _ = np.histogram(np.concatenate(plot_series), bins=bin_edges)
+        if total_counts.size > 0 and np.nanmax(total_counts) > 0:
+            y_offset = max(0.2, float(np.nanmax(total_counts)) * 0.03)
+            for left, right, count in zip(bin_edges[:-1], bin_edges[1:], total_counts):
+                if int(count) <= 0:
+                    continue
+                ax.text(
+                    (float(left) + float(right)) / 2.0,
+                    float(count) + y_offset,
+                    str(int(count)),
+                    ha="center",
+                    va="bottom",
+                    fontsize=5,
+                    fontname="Arial",
+                )
+            ax.set_ylim(top=float(np.nanmax(total_counts)) + y_offset * 5.0)
         #ax.axvline(float(np.nanmedian(valid_pct)), color="#A11D33", linestyle="--", linewidth=0.8)
-        ax.set_xlabel("% frames removed")
+        ax.set_xlabel("% frames removed (total)")
         ax.set_ylabel("Cell count")
-        ax.set_title("SNR Frame Removal Distribution")
+        ax.set_title("Bad Frame Removal Distribution")
         # if len(plot_labels) > 1:
         #     ax.legend(frameon=False, fontsize=5)
         ax.spines["top"].set_visible(False)
@@ -2988,6 +4705,2084 @@ def summarize_snr_removed_frames(
         "overall": overall_df,
         "missing_animals": missing_animals,
         "figure": fig,
+    }
+
+
+def summarize_snr_effective_max_time(
+    config: PipelineConfig,
+    *,
+    snr_removed_summary: dict[str, Any] | None = None,
+    by_place_cells_only: bool = False,
+    show_plot: bool = True,
+    bin_width_minutes: float = 1.0,
+    figure_save_folder: str | Path | None = None,
+    save_name: str | None = None,
+    show_legend: bool = False,
+    figsize: tuple[float, float] = (1.4, 1.2),
+) -> dict[str, Any]:
+    """
+    Summarize effective analyzable minutes after all frame-level bad masks.
+
+    ``effective_max_minutes_all_bad_frames`` is the number of good frames after
+    manual GUI exclusions, low/non-finite SNR, source-trace bad samples, and
+    behavior NaNs, divided by frame rate. It is measured before the
+    ``min_good_minutes`` rule converts an under-threshold cell to all-bad.
+    Cells removed by that rule are plotted as gray bars.
+    """
+    import pandas as pd
+
+    if snr_removed_summary is None:
+        snr_removed_summary = summarize_snr_removed_frames(
+            config=config,
+            by_place_cells_only=by_place_cells_only,
+            show_plot=False,
+        )
+
+    df = snr_removed_summary.get("per_cell", pd.DataFrame()).copy()
+    missing_animals = list(snr_removed_summary.get("missing_animals", []))
+    if df.empty:
+        print("No rows found for SNR effective max-time summary.")
+        return {
+            "per_cell": df,
+            "overall": pd.DataFrame(),
+            "per_animal": pd.DataFrame(),
+            "missing_animals": missing_animals,
+            "figure": None,
+            "figure_path": None,
+        }
+
+    df["effective_max_minutes_all_bad_frames"] = pd.to_numeric(
+        df.get("good_minutes_before_min_minutes", np.nan),
+        errors="coerce",
+    )
+    if "removed_by_min_good_minutes" in df:
+        df["excluded_by_min_good_minutes"] = df["removed_by_min_good_minutes"].astype(bool)
+    else:
+        df["excluded_by_min_good_minutes"] = False
+    finite_mask = np.isfinite(df["effective_max_minutes_all_bad_frames"].to_numpy(dtype=float))
+    valid_df = df.loc[finite_mask].copy()
+
+    n_kept = int(np.sum(~valid_df["excluded_by_min_good_minutes"].to_numpy(dtype=bool)))
+    n_excluded = int(np.sum(valid_df["excluded_by_min_good_minutes"].to_numpy(dtype=bool)))
+    overall_df = pd.DataFrame(
+        [
+            {
+                "scope": "place_cells_only" if by_place_cells_only else "all_cells_including_excluded",
+                "n_cells": int(len(valid_df)),
+                "n_kept_cells": n_kept,
+                "n_excluded_min_good_minutes": n_excluded,
+                "mean_effective_max_minutes": (
+                    float(np.nanmean(valid_df["effective_max_minutes_all_bad_frames"]))
+                    if len(valid_df)
+                    else np.nan
+                ),
+                "median_effective_max_minutes": (
+                    float(np.nanmedian(valid_df["effective_max_minutes_all_bad_frames"]))
+                    if len(valid_df)
+                    else np.nan
+                ),
+                "min_effective_max_minutes": (
+                    float(np.nanmin(valid_df["effective_max_minutes_all_bad_frames"]))
+                    if len(valid_df)
+                    else np.nan
+                ),
+                "max_effective_max_minutes": (
+                    float(np.nanmax(valid_df["effective_max_minutes_all_bad_frames"]))
+                    if len(valid_df)
+                    else np.nan
+                ),
+            }
+        ]
+    )
+
+    if len(valid_df):
+        per_animal = (
+            valid_df.groupby("animal_id", sort=True)
+            .agg(
+                n_cells=("effective_max_minutes_all_bad_frames", "size"),
+                n_kept_cells=(
+                    "excluded_by_min_good_minutes",
+                    lambda s: int(np.sum(~s.to_numpy(dtype=bool))),
+                ),
+                n_excluded_min_good_minutes=(
+                    "excluded_by_min_good_minutes",
+                    lambda s: int(np.sum(s.to_numpy(dtype=bool))),
+                ),
+                mean_effective_max_minutes=("effective_max_minutes_all_bad_frames", "mean"),
+                median_effective_max_minutes=("effective_max_minutes_all_bad_frames", "median"),
+                min_effective_max_minutes=("effective_max_minutes_all_bad_frames", "min"),
+                max_effective_max_minutes=("effective_max_minutes_all_bad_frames", "max"),
+            )
+            .reset_index()
+        )
+    else:
+        per_animal = pd.DataFrame()
+
+    print(
+        "SNR effective max-time summary "
+        f"({'place cells only' if by_place_cells_only else 'all cells'}): "
+        f"n_cells={int(overall_df.loc[0, 'n_cells'])}, "
+        f"excluded(<{config.analysis.min_good_minutes} min good)={n_excluded}, "
+        f"mean={float(overall_df.loc[0, 'mean_effective_max_minutes']):.2f} min, "
+        f"median={float(overall_df.loc[0, 'median_effective_max_minutes']):.2f} min"
+    )
+    if missing_animals:
+        print(f"Missing merged data for: {', '.join(missing_animals)}")
+
+    fig = None
+    if show_plot and len(valid_df) > 0:
+        kept_minutes = valid_df.loc[
+            ~valid_df["excluded_by_min_good_minutes"],
+            "effective_max_minutes_all_bad_frames",
+        ].to_numpy(dtype=float)
+        excluded_minutes = valid_df.loc[
+            valid_df["excluded_by_min_good_minutes"],
+            "effective_max_minutes_all_bad_frames",
+        ].to_numpy(dtype=float)
+
+        plot_series: list[np.ndarray] = []
+        plot_labels: list[str] = []
+        plot_colors: list[str] = []
+        if kept_minutes.size > 0:
+            plot_series.append(kept_minutes)
+            plot_labels.append("Kept cells")
+            plot_colors.append("#6C9A8B")
+        if excluded_minutes.size > 0:
+            plot_series.append(excluded_minutes)
+            plot_labels.append(f"Excluded (<{config.analysis.min_good_minutes:g} min good)")
+            plot_colors.append("#9E9E9E")
+
+        max_effective_min = float(
+            np.nanmax(valid_df["effective_max_minutes_all_bad_frames"].to_numpy(dtype=float))
+        )
+        bin_width = float(bin_width_minutes)
+        if not np.isfinite(bin_width) or bin_width <= 0:
+            raise ValueError(f"bin_width_minutes must be positive, got {bin_width_minutes!r}")
+        bin_stop = max(bin_width, np.ceil(max_effective_min / bin_width) * bin_width + bin_width)
+        minute_bins = np.arange(0.0, bin_stop + 0.5 * bin_width, bin_width)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        _counts, bin_edges, _patches = ax.hist(
+            plot_series,
+            bins=minute_bins,
+            stacked=True,
+            color=plot_colors,
+            edgecolor="white",
+            linewidth=0.4,
+            label=plot_labels,
+        )
+        total_counts, _ = np.histogram(np.concatenate(plot_series), bins=bin_edges)
+        if total_counts.size > 0 and np.nanmax(total_counts) > 0:
+            y_offset = max(0.2, float(np.nanmax(total_counts)) * 0.03)
+            for left, right, count in zip(bin_edges[:-1], bin_edges[1:], total_counts):
+                if int(count) <= 0:
+                    continue
+                ax.text(
+                    (float(left) + float(right)) / 2.0,
+                    float(count) + y_offset,
+                    str(int(count)),
+                    ha="center",
+                    va="bottom",
+                    fontsize=5,
+                    fontname="Arial",
+                )
+            ax.set_ylim(top=float(np.nanmax(total_counts)) + y_offset * 5.0)
+
+        ax.axvline(float(config.analysis.min_good_minutes), color="#A11D33", linestyle="--", linewidth=0.7)
+        ax.set_xlabel("Effective max time (min)")
+        ax.set_ylabel("Cell count")
+        ax.set_title("Effective Time After Bad Frames")
+        if show_legend and len(plot_labels) > 1:
+            ax.legend(frameon=False, fontsize=5, handlelength=1.0)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+
+    figure_path = None
+    if fig is not None and figure_save_folder is not None:
+        folder = Path(figure_save_folder)
+        if save_name is None:
+            save_name = (
+                "SNR_EffectiveMaxTimeDistribution_place_cells_only.svg"
+                if by_place_cells_only
+                else "SNR_EffectiveMaxTimeDistribution_all_cells.svg"
+            )
+        figure_path = folder / save_name
+        figure_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(figure_path, dpi=300)
+        print(f"SNR effective max-time figure saved: {figure_path}")
+    elif fig is None:
+        print("SNR effective max-time figure was not generated.")
+
+    return {
+        "per_cell": df,
+        "overall": overall_df,
+        "per_animal": per_animal,
+        "missing_animals": missing_animals,
+        "figure": fig,
+        "figure_path": str(figure_path) if figure_path is not None else None,
+    }
+
+
+def plot_missing_frame_seconds_by_animal(
+    config: PipelineConfig,
+    *,
+    variable_key: str = "x_neural",
+    variable_label: str | None = None,
+    variable_aliases: tuple[str, ...] | list[str] | None = None,
+    figure_save_folder: str | Path | None = None,
+    save_name: str | None = None,
+    csv_name: str | None = None,
+    show_plot: bool = True,
+    figsize: tuple[float, float] = (6.6, 2.9),
+    n_cols: int = 4,
+) -> dict[str, Any]:
+    """Plot per-animal finite vs non-finite seconds for a frame-wise variable."""
+    import pandas as pd
+
+    requested_key = str(variable_key)
+    aliases = [requested_key]
+    if variable_aliases is not None:
+        aliases.extend([str(k) for k in variable_aliases])
+    seen: set[str] = set()
+    aliases = [k for k in aliases if not (k in seen or seen.add(k))]
+    label = variable_label if variable_label is not None else requested_key
+
+    rows: list[dict[str, Any]] = []
+    for animal_id in config.animals:
+        animal_dir = Path(config.data_root) / str(animal_id)
+        row = {
+            "animal_id": str(animal_id),
+            "requested_variable": requested_key,
+            "resolved_variable": "",
+            "n_frames": np.nan,
+            "frame_rate": np.nan,
+            "duration_s": np.nan,
+            "missing_frames": np.nan,
+            "missing_seconds": np.nan,
+            "missing_percent": np.nan,
+            "finite_seconds": np.nan,
+            "load_error": "",
+        }
+        try:
+            merged = _load_merged_data(animal_dir, config)
+        except Exception as exc:
+            row["load_error"] = str(exc)
+            rows.append(row)
+            continue
+
+        resolved_key = next((key for key in aliases if key in merged), None)
+        if resolved_key is None:
+            row["load_error"] = f"Missing variable; tried {aliases}"
+            rows.append(row)
+            continue
+
+        values = np.asarray(merged.get(resolved_key, []), dtype=float).reshape(-1)
+        try:
+            frame_rate = float(merged.get("frame_rate", np.nan))
+        except Exception:
+            frame_rate = np.nan
+        n_frames = int(values.size)
+        missing_mask = ~np.isfinite(values)
+        n_missing = int(np.sum(missing_mask))
+        duration_s = float(n_frames / frame_rate) if np.isfinite(frame_rate) and frame_rate > 0 else np.nan
+        missing_s = float(n_missing / frame_rate) if np.isfinite(frame_rate) and frame_rate > 0 else np.nan
+        finite_s = float((n_frames - n_missing) / frame_rate) if np.isfinite(frame_rate) and frame_rate > 0 else np.nan
+        missing_pct = float(100.0 * n_missing / n_frames) if n_frames > 0 else np.nan
+
+        row.update(
+            {
+                "resolved_variable": str(resolved_key),
+                "n_frames": n_frames,
+                "frame_rate": frame_rate,
+                "duration_s": duration_s,
+                "missing_frames": n_missing,
+                "missing_seconds": missing_s,
+                "missing_percent": missing_pct,
+                "finite_seconds": finite_s,
+            }
+        )
+        rows.append(row)
+
+    summary_df = pd.DataFrame(rows)
+
+    fig = None
+    if show_plot and len(summary_df) > 0:
+        n_cols = max(1, int(n_cols))
+        n_rows = int(np.ceil(len(summary_df) / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+        axes = np.asarray(axes).reshape(-1)
+        colors = ["#D9D9D9", "#D55E00"]
+
+        def _fmt_seconds(value: Any) -> str:
+            try:
+                value_f = float(value)
+            except Exception:
+                return "NaN"
+            if not np.isfinite(value_f):
+                return "NaN"
+            return f"{value_f:.1f} s"
+
+        for ax_idx, ax in enumerate(axes):
+            if ax_idx >= len(summary_df):
+                ax.axis("off")
+                continue
+            row = summary_df.iloc[ax_idx]
+            finite_s = float(row.get("finite_seconds", np.nan))
+            missing_s = float(row.get("missing_seconds", np.nan))
+            if not np.isfinite(finite_s):
+                finite_s = 0.0
+            if not np.isfinite(missing_s):
+                missing_s = 0.0
+            vals = np.asarray([finite_s, missing_s], dtype=float)
+            if np.nansum(vals) <= 0:
+                vals = np.asarray([1.0, 0.0], dtype=float)
+            ax.pie(
+                vals,
+                colors=colors,
+                startangle=90,
+                counterclock=False,
+                wedgeprops={"linewidth": 0.35, "edgecolor": "white"},
+            )
+            animal_short = str(row.get("animal_id", "")).replace("CKII_", "")
+            try:
+                missing_pct = float(row.get("missing_percent", np.nan))
+            except Exception:
+                missing_pct = np.nan
+            title_pct = f"{missing_pct:.2f}%" if np.isfinite(missing_pct) else "NaN%"
+            ax.set_title(
+                f"{animal_short}\nNaN {_fmt_seconds(row.get('missing_seconds', np.nan))} ({title_pct})",
+                fontsize=5,
+                fontname="Arial",
+                pad=1.5,
+            )
+            ax.set_aspect("equal")
+
+        fig.legend(
+            [f"Finite {label}", f"NaN {label}"],
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.01),
+            ncol=2,
+            frameon=False,
+            fontsize=5,
+        )
+        fig.tight_layout(rect=[0, 0.05, 1, 1])
+
+    figure_path = None
+    csv_path = None
+    if figure_save_folder is not None:
+        folder = Path(figure_save_folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        if save_name is None:
+            safe_key = re.sub(r"[^A-Za-z0-9_]+", "_", requested_key).strip("_") or "variable"
+            save_name = f"{safe_key}_NaN_RemovedSeconds_ByAnimal_Pies.svg"
+        if csv_name is None:
+            safe_key = re.sub(r"[^A-Za-z0-9_]+", "_", requested_key).strip("_") or "variable"
+            csv_name = f"{safe_key}_NaN_RemovedSeconds_ByAnimal.csv"
+        csv_path = folder / csv_name
+        summary_df.to_csv(csv_path, index=False)
+        if fig is not None:
+            figure_path = folder / save_name
+            fig.savefig(figure_path, dpi=300)
+            print(f"{label} missing-frame pie figure saved: {figure_path}")
+        print(f"{label} missing-frame summary CSV saved: {csv_path}")
+
+    return {
+        "summary_df": summary_df,
+        "figure": fig,
+        "figure_path": str(figure_path) if figure_path is not None else None,
+        "csv_path": str(csv_path) if csv_path is not None else None,
+        "variable_key": requested_key,
+        "variable_aliases": aliases,
+    }
+
+
+def summarize_first_last_minute_snr_change(
+    config: PipelineConfig,
+    *,
+    spatial_data: Any | None = None,
+    window_seconds: float = 60.0,
+    figure_save_folder: str | Path | None = None,
+    save_name: str = "SNR_FirstLast1min_SignedChange.svg",
+    show_plot: bool = True,
+    figsize: tuple[float, float] = (3.4, 1.35),
+) -> dict[str, Any]:
+    """Summarize signed saved-SNR change from the first to last recording minute.
+
+    The refined pipeline first uses the saved ``SNR_interpolated`` trace because
+    that is the trace thresholded by ``_compute_bad_masks``. The signed percent
+    change is ``100 * (last - first) / first``; negative values indicate a drop.
+    """
+    import pandas as pd
+
+    def _finite_stats(values: Any, prefix: str) -> dict[str, float]:
+        vals = np.asarray(values, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        return {
+            f"{prefix}_mean": float(np.nanmean(vals)) if vals.size else np.nan,
+            f"{prefix}_median": float(np.nanmedian(vals)) if vals.size else np.nan,
+            f"{prefix}_std": float(np.nanstd(vals, ddof=1)) if vals.size > 1 else np.nan,
+            f"{prefix}_sem": (
+                float(np.nanstd(vals, ddof=1) / np.sqrt(vals.size)) if vals.size > 1 else np.nan
+            ),
+            f"{prefix}_min": float(np.nanmin(vals)) if vals.size else np.nan,
+            f"{prefix}_max": float(np.nanmax(vals)) if vals.size else np.nan,
+        }
+
+    def _sig_label(p_value: float) -> str:
+        if not np.isfinite(p_value):
+            return "n/a"
+        if p_value < 0.001:
+            return "***"
+        if p_value < 0.01:
+            return "**"
+        if p_value < 0.05:
+            return "*"
+        return "n.s."
+
+    def _holm_adjust(p_values: list[float]) -> list[float]:
+        p_arr = np.asarray(p_values, dtype=float)
+        out = np.full(p_arr.shape, np.nan, dtype=float)
+        finite_idx = np.flatnonzero(np.isfinite(p_arr))
+        m = int(finite_idx.size)
+        if m == 0:
+            return out.tolist()
+        order = finite_idx[np.argsort(p_arr[finite_idx])]
+        running = 0.0
+        for rank, idx in enumerate(order):
+            adjusted = float((m - rank) * p_arr[idx])
+            running = max(running, adjusted)
+            out[idx] = min(1.0, running)
+        return out.tolist()
+
+    def _add_bracket(ax: Any, pos1: float, pos2: float, y: float, h: float, sig_text: str, color: str = "black") -> None:
+        ax.plot([pos1, pos1], [y, y + h], color=color, linewidth=0.8)
+        ax.plot([pos2, pos2], [y, y + h], color=color, linewidth=0.8)
+        ax.plot([pos1, pos2], [y + h, y + h], color=color, linewidth=0.8)
+        ax.text(
+            (pos1 + pos2) / 2.0,
+            y + h + 0.02,
+            sig_text,
+            ha="center",
+            va="bottom",
+            fontsize=5,
+            fontname="Arial",
+            color=color,
+        )
+
+    def _add_comparison_brackets(
+        ax: Any,
+        comparisons_df: Any,
+        specs: list[dict[str, Any]],
+        *,
+        p_column: str = "p_value",
+    ) -> None:
+        if comparisons_df is None or len(comparisons_df) == 0:
+            return
+
+        y_min, y_max = ax.get_ylim()
+        y_range = float(y_max - y_min)
+        if not np.isfinite(y_range) or y_range <= 0:
+            y_range = 1.0
+        h = y_range * 0.03
+        text_h = y_range * 0.08
+        gap = y_range * 0.05
+        y = y_max + y_range * 0.05
+        y_top = y_max
+
+        for spec in specs:
+            hit = comparisons_df.loc[comparisons_df["comparison"] == spec["comparison"]]
+            if hit.empty:
+                continue
+            p_val = float(hit.iloc[0].get(p_column, np.nan))
+            if not np.isfinite(p_val):
+                continue
+            _add_bracket(
+                ax,
+                float(spec["pos1"]),
+                float(spec["pos2"]),
+                y,
+                h,
+                _sig_label(p_val),
+                color=str(spec.get("color", "black")),
+            )
+            y_top = max(y_top, y + h + text_h)
+            y += h + text_h + gap
+
+        if y_top > y_max:
+            ax.set_ylim(y_min, y_top + y_range * 0.05)
+
+    def _category_maps(spatial_data_obj: Any | None) -> dict[tuple[str, int], dict[str, Any]]:
+        if spatial_data_obj is None:
+            from utils.spatial_heatmaps import classify_spatial_cells
+
+            spatial_data_obj = classify_spatial_cells(
+                data_folder=str(config.data_root),
+                folders=config.animals,
+                cb_num_threshold=config.pooled.cb_num_threshold,
+                cs_peak_rate_threshold=config.pooled.cs_peak_rate_threshold,
+                cs_plc_definition_mode=config.pooled.cs_plc_definition_mode,
+                snr_threshold=config.analysis.snr_threshold,
+                min_good_minutes=config.analysis.min_good_minutes,
+            )
+
+        mapping: dict[tuple[str, int], dict[str, Any]] = {}
+
+        def _add(cells: Any, place_nonplace: str, cs_group: str, is_place_cell: bool, is_cs_plc: bool) -> None:
+            for cell in cells or []:
+                if not isinstance(cell, dict):
+                    continue
+                session = cell.get("session", cell.get("animal_id", None))
+                if session is None or "cell_idx" not in cell:
+                    continue
+                mapping[(str(session), int(cell["cell_idx"]))] = {
+                    "is_place_cell": bool(is_place_cell),
+                    "is_cs_plc": bool(is_cs_plc),
+                    "place_nonplace_group": str(place_nonplace),
+                    "cs_group": str(cs_group),
+                }
+
+        _add(getattr(spatial_data_obj, "plcs_csplus", []), "Place cell", "CS+ place cell", True, True)
+        _add(getattr(spatial_data_obj, "plcs_csminus", []), "Place cell", "CS- place cell", True, False)
+        _add(getattr(spatial_data_obj, "non_plcs", []), "Non-place cell", "Non-place cell", False, False)
+        return mapping
+
+    def _extract_per_cell_vector(source: Any, cell_idx: int, n_frames: int) -> np.ndarray:
+        try:
+            if source is None:
+                return np.array([], dtype=float)
+            if isinstance(source, (list, tuple)):
+                if int(cell_idx) >= len(source) or source[int(cell_idx)] is None:
+                    return np.array([], dtype=float)
+                arr = np.asarray(source[int(cell_idx)], dtype=float).reshape(-1)
+            else:
+                data = np.asarray(source, dtype=float)
+                if data.ndim == 1 and int(cell_idx) == 0:
+                    arr = data.reshape(-1)
+                elif data.ndim == 2 and data.shape[0] > int(cell_idx) and data.shape[1] == int(n_frames):
+                    arr = data[int(cell_idx), :].reshape(-1)
+                elif data.ndim == 2 and data.shape[1] > int(cell_idx) and data.shape[0] == int(n_frames):
+                    arr = data[:, int(cell_idx)].reshape(-1)
+                else:
+                    return np.array([], dtype=float)
+        except Exception:
+            return np.array([], dtype=float)
+        if arr.size != int(n_frames):
+            return np.array([], dtype=float)
+        return arr.astype(float, copy=False)
+
+    def _plot_box_with_points(
+        ax: Any,
+        df: Any,
+        group_col: str,
+        groups: list[str],
+        colors: list[str],
+        *,
+        value_col: str = "pct_snr_change_last_vs_first",
+        title: str,
+        ylabel: str | None = None,
+        zero_line: bool = True,
+    ) -> None:
+        rng = np.random.default_rng(42)
+        plot_vals: list[np.ndarray] = []
+        positions: list[float] = []
+        labels: list[str] = []
+        used_colors: list[str] = []
+        for pos, (group, color) in enumerate(zip(groups, colors), start=1):
+            vals = df.loc[df[group_col] == group, value_col].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            plot_vals.append(vals)
+            positions.append(float(pos))
+            labels.append(str(group))
+            used_colors.append(str(color))
+        if not plot_vals:
+            ax.text(0.5, 0.5, "No valid cells", ha="center", va="center", transform=ax.transAxes, fontsize=6)
+            ax.set_xticks([])
+        else:
+            bp = ax.boxplot(
+                plot_vals,
+                positions=positions,
+                widths=0.42,
+                patch_artist=True,
+                showfliers=False,
+                medianprops={"color": "black", "linewidth": 0.7},
+                boxprops={"linewidth": 0.6},
+                whiskerprops={"linewidth": 0.6},
+                capprops={"linewidth": 0.6},
+            )
+            for patch, color in zip(bp["boxes"], used_colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.45)
+            for pos, vals, color in zip(positions, plot_vals, used_colors):
+                jitter = rng.normal(0.0, 0.035, size=vals.size)
+                ax.scatter(np.full(vals.size, pos) + jitter, vals, s=7, color=color, alpha=0.75, linewidths=0)
+            ax.set_xticks(positions)
+            ax.set_xticklabels(labels, rotation=25, ha="right")
+        if zero_line:
+            ax.axhline(0.0, color="#666666", linewidth=0.6, linestyle="--", zorder=0)
+        ax.set_title(title)
+        if ylabel:
+            ax.set_ylabel(ylabel)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(labelsize=5, direction="in", length=1.75)
+
+    window_seconds = float(window_seconds)
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be > 0.")
+
+    if spatial_data is None:
+        from utils.spatial_heatmaps import classify_spatial_cells
+
+        spatial_data = classify_spatial_cells(
+            data_folder=str(config.data_root),
+            folders=config.animals,
+            cb_num_threshold=config.pooled.cb_num_threshold,
+            cs_peak_rate_threshold=config.pooled.cs_peak_rate_threshold,
+            cs_plc_definition_mode=config.pooled.cs_plc_definition_mode,
+            snr_threshold=config.analysis.snr_threshold,
+            min_good_minutes=config.analysis.min_good_minutes,
+        )
+    category_by_key = _category_maps(spatial_data)
+
+    rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
+    for animal_id in config.animals:
+        animal_dir = config.data_root / animal_id
+        try:
+            _resolve_merged_data_path(animal_dir, config)
+        except FileNotFoundError:
+            skipped_rows.append(
+                {
+                    "animal_id": str(animal_id),
+                    "cell_idx": np.nan,
+                    "cell_num": np.nan,
+                    "reason": "missing merged data",
+                }
+            )
+            continue
+
+        merged = _load_merged_data(animal_dir, config)
+        x_neural = np.asarray(merged.get("x_neural", []), dtype=float)
+        frame_rate = float(merged.get("frame_rate", np.nan))
+        if not np.isfinite(frame_rate) or frame_rate <= 0:
+            frame_rate = 1.0
+        n_frames = int(x_neural.size)
+        window_frames = int(round(window_seconds * frame_rate))
+        window_frames = max(1, window_frames)
+        if n_frames < 2 * window_frames:
+            skipped_rows.append(
+                {
+                    "animal_id": str(animal_id),
+                    "cell_idx": np.nan,
+                    "cell_num": np.nan,
+                    "reason": f"recording shorter than {2 * window_seconds:g} seconds",
+                }
+            )
+            continue
+
+        snr_source = merged.get("SNR_interpolated", [])
+        traces_snr_fallback = merged.get("traces_SNR_interpolated", merged.get("traces", []))
+        all_spikes = merged.get("all_spikes", merged.get("spikes", []))
+        complex_bursts_dicts = merged.get("complex_bursts_dicts", [])
+        n_cells = len(merged.get("spikes", traces_snr_fallback))
+        try:
+            final_bad_masks = np.asarray(
+                _compute_bad_masks(
+                    merged,
+                    float(config.analysis.snr_threshold),
+                    float(config.analysis.min_good_minutes),
+                ),
+                dtype=bool,
+            )
+            if final_bad_masks.ndim != 2 or final_bad_masks.shape != (n_cells, n_frames):
+                final_bad_masks = np.empty((0, 0), dtype=bool)
+        except Exception:
+            final_bad_masks = np.empty((0, 0), dtype=bool)
+
+        for cell_idx in range(n_cells):
+            base_row = {
+                "animal_id": str(animal_id),
+                "cell_idx": int(cell_idx),
+                "cell_num": int(cell_idx) + 1,
+            }
+            category = category_by_key.get((str(animal_id), int(cell_idx)))
+            if category is None:
+                skipped_rows.append(
+                    {
+                        **base_row,
+                        "reason": "not in spatial classification output; excluded by SNR/eligibility filtering",
+                    }
+                )
+                continue
+            snr_vals = _extract_per_cell_vector(snr_source, cell_idx, n_frames)
+            snr_value_source = "saved_SNR_interpolated"
+            if snr_vals.size != n_frames:
+                trace = _extract_per_cell_vector(traces_snr_fallback, cell_idx, n_frames)
+                if trace.size != n_frames:
+                    skipped_rows.append({**base_row, "reason": "missing saved or fallback SNR trace"})
+                    continue
+                spks = np.asarray(all_spikes[cell_idx], dtype=int) if cell_idx < len(all_spikes) else np.array([], dtype=int)
+                cb = complex_bursts_dicts[cell_idx] if cell_idx < len(complex_bursts_dicts) else None
+                try:
+                    snr_res = compute_time_varying_snr_from_trace(
+                        trace=trace,
+                        spks=spks,
+                        complex_burst_dict=cb,
+                        sampling_rate_hz=frame_rate,
+                        isi_threshold_ms=20,
+                        spike_baseline_points=3,
+                        spike_remove_points=3,
+                        baseline_window_seconds=10,
+                        plot_single_cell=False,
+                    )
+                    snr_vals = np.asarray(snr_res.get("snr_time_varying", []), dtype=float).reshape(-1)
+                    snr_value_source = "recomputed_from_fallback_trace"
+                except Exception as exc:
+                    skipped_rows.append({**base_row, "reason": f"fallback time-varying SNR failed: {exc}"})
+                    continue
+                if snr_vals.size != n_frames:
+                    skipped_rows.append(
+                        {
+                            **base_row,
+                            "reason": f"fallback time-varying SNR length mismatch: expected {n_frames}, got {snr_vals.size}",
+                        }
+                    )
+                    continue
+
+            has_final_bad_mask = bool(final_bad_masks.shape == (n_cells, n_frames))
+            if has_final_bad_mask:
+                good_frame_mask = (~final_bad_masks[cell_idx]) & np.isfinite(snr_vals)
+            else:
+                good_frame_mask = np.isfinite(snr_vals)
+            good_frame_snr = snr_vals[good_frame_mask]
+            n_good_snr_frames = int(good_frame_snr.size)
+            good_snr_minutes = float(n_good_snr_frames) / float(frame_rate) / 60.0
+            overall_good_frame_mean_snr = (
+                float(np.nanmean(good_frame_snr)) if n_good_snr_frames > 0 else np.nan
+            )
+            min_good_frame_snr = float(np.nanmin(good_frame_snr)) if n_good_snr_frames > 0 else np.nan
+            n_good_snr_frames_below_threshold = int(
+                np.sum(good_frame_snr < (float(config.analysis.snr_threshold) - 1e-9))
+            )
+
+            first_vals = snr_vals[:window_frames]
+            last_vals = snr_vals[-window_frames:]
+            first_mean = float(np.nanmean(first_vals)) if np.any(np.isfinite(first_vals)) else np.nan
+            last_mean = float(np.nanmean(last_vals)) if np.any(np.isfinite(last_vals)) else np.nan
+            if not np.isfinite(first_mean) or np.isclose(first_mean, 0.0) or not np.isfinite(last_mean):
+                pct_change = np.nan
+                valid_change = False
+            else:
+                pct_change = float(100.0 * (last_mean - first_mean) / first_mean)
+                valid_change = True
+
+            rows.append(
+                {
+                    **base_row,
+                    "recording_duration_min": float(n_frames / frame_rate / 60.0),
+                    "window_seconds": window_seconds,
+                    "first_1min_mean_snr": first_mean,
+                    "last_1min_mean_snr": last_mean,
+                    "pct_snr_change_last_vs_first": pct_change,
+                    "overall_good_frame_mean_snr": overall_good_frame_mean_snr,
+                    "min_good_frame_snr": min_good_frame_snr,
+                    "n_good_snr_frames": n_good_snr_frames,
+                    "n_good_snr_frames_below_threshold": n_good_snr_frames_below_threshold,
+                    "good_snr_minutes": good_snr_minutes,
+                    "used_final_bad_mask_for_good_snr": has_final_bad_mask,
+                    "snr_value_source": snr_value_source,
+                    "valid_change": bool(valid_change),
+                    "is_place_cell": category.get("is_place_cell", np.nan),
+                    "is_cs_plc": category.get("is_cs_plc", np.nan),
+                    "place_nonplace_group": category.get("place_nonplace_group", "Unclassified"),
+                    "cs_group": category.get("cs_group", "Unclassified"),
+                }
+            )
+
+    per_cell = pd.DataFrame(rows)
+    skipped_cells = pd.DataFrame(skipped_rows)
+    if per_cell.empty:
+        return {
+            "per_cell": per_cell,
+            "overall": pd.DataFrame(),
+            "group_summary": pd.DataFrame(),
+            "comparisons": pd.DataFrame(),
+            "good_frame_snr_comparisons": pd.DataFrame(),
+            "skipped_cells": skipped_cells,
+            "figure_path": None,
+            "figure": None,
+            "spatial_data": spatial_data,
+        }
+
+    valid_df = per_cell.loc[np.asarray(per_cell["valid_change"], dtype=bool)].copy()
+    good_snr_df = per_cell.loc[np.isfinite(per_cell["overall_good_frame_mean_snr"].to_numpy(dtype=float))].copy()
+    overall = {
+        "n_cells_total": int(len(per_cell)),
+        "n_cells_valid_change": int(len(valid_df)),
+        "n_cells_valid_good_frame_snr": int(len(good_snr_df)),
+        "n_cells_skipped": int(len(skipped_cells)),
+        **_finite_stats(valid_df["first_1min_mean_snr"], "first_1min_mean_snr"),
+        **_finite_stats(valid_df["last_1min_mean_snr"], "last_1min_mean_snr"),
+        **_finite_stats(valid_df["pct_snr_change_last_vs_first"], "pct_snr_change_last_vs_first"),
+        **_finite_stats(good_snr_df["overall_good_frame_mean_snr"], "overall_good_frame_mean_snr"),
+        **_finite_stats(good_snr_df["good_snr_minutes"], "good_snr_minutes"),
+    }
+    overall_df = pd.DataFrame([overall])
+
+    summary_rows: list[dict[str, Any]] = []
+    group_specs = [
+        ("all_cells", "All cells", None, None),
+        ("place_nonplace", "Place cell", "place_nonplace_group", "Place cell"),
+        ("place_nonplace", "Non-place cell", "place_nonplace_group", "Non-place cell"),
+        ("cs_place_nonplace", "CS+ place cell", "cs_group", "CS+ place cell"),
+        ("cs_place_nonplace", "CS- place cell", "cs_group", "CS- place cell"),
+        ("cs_place_nonplace", "Non-place cell", "cs_group", "Non-place cell"),
+    ]
+    for grouping, group, group_col, group_value in group_specs:
+        if group_col is None:
+            group_df = valid_df
+            group_snr_df = good_snr_df
+        else:
+            group_df = valid_df.loc[valid_df[group_col] == group_value]
+            group_snr_df = good_snr_df.loc[good_snr_df[group_col] == group_value]
+        summary_rows.append(
+            {
+                "grouping": grouping,
+                "group": group,
+                "n_cells": int(len(group_df)),
+                "n_animals": int(group_df["animal_id"].nunique()) if len(group_df) else 0,
+                "n_cells_valid_good_frame_snr": int(len(group_snr_df)),
+                "n_animals_valid_good_frame_snr": (
+                    int(group_snr_df["animal_id"].nunique()) if len(group_snr_df) else 0
+                ),
+                **_finite_stats(group_df["first_1min_mean_snr"], "first_1min_mean_snr"),
+                **_finite_stats(group_df["last_1min_mean_snr"], "last_1min_mean_snr"),
+                **_finite_stats(group_df["pct_snr_change_last_vs_first"], "pct_snr_change_last_vs_first"),
+                **_finite_stats(group_snr_df["overall_good_frame_mean_snr"], "overall_good_frame_mean_snr"),
+                **_finite_stats(group_snr_df["good_snr_minutes"], "good_snr_minutes"),
+            }
+        )
+    group_summary = pd.DataFrame(summary_rows)
+
+    comparison_specs = [
+        ("place_vs_nonplace", "place_nonplace_group", "Place cell", "Non-place cell"),
+        ("csplus_vs_csminus", "cs_group", "CS+ place cell", "CS- place cell"),
+        ("csplus_vs_nonplace", "cs_group", "CS+ place cell", "Non-place cell"),
+        ("csminus_vs_nonplace", "cs_group", "CS- place cell", "Non-place cell"),
+    ]
+
+    def _build_comparisons(df: Any, value_col: str) -> Any:
+        comparison_rows: list[dict[str, Any]] = []
+        for comparison, group_col, group_a, group_b in comparison_specs:
+            a = df.loc[df[group_col] == group_a, value_col].to_numpy(dtype=float)
+            b = df.loc[df[group_col] == group_b, value_col].to_numpy(dtype=float)
+            a = a[np.isfinite(a)]
+            b = b[np.isfinite(b)]
+            if a.size > 0 and b.size > 0:
+                try:
+                    res = scipy_stats.mannwhitneyu(a, b, alternative="two-sided")
+                    statistic = float(res.statistic)
+                    p_value = float(res.pvalue)
+                    test = "mann-whitney u"
+                except Exception:
+                    statistic = np.nan
+                    p_value = np.nan
+                    test = "mann-whitney u"
+            else:
+                statistic = np.nan
+                p_value = np.nan
+                test = "not enough cells"
+            comparison_rows.append(
+                {
+                    "comparison": comparison,
+                    "metric": value_col,
+                    "group_a": group_a,
+                    "group_b": group_b,
+                    "n_a": int(a.size),
+                    "n_b": int(b.size),
+                    "median_a": float(np.nanmedian(a)) if a.size else np.nan,
+                    "median_b": float(np.nanmedian(b)) if b.size else np.nan,
+                    "median_delta_a_minus_b": (
+                        float(np.nanmedian(a) - np.nanmedian(b)) if a.size and b.size else np.nan
+                    ),
+                    "test": test,
+                    "statistic": statistic,
+                    "p_value": p_value,
+                }
+            )
+        out = pd.DataFrame(comparison_rows)
+        if not out.empty:
+            out["holm_p_value"] = _holm_adjust(out["p_value"].to_list())
+            out["significance"] = out["p_value"].map(_sig_label)
+            out["holm_significance"] = out["holm_p_value"].map(_sig_label)
+        return out
+
+    comparisons = _build_comparisons(valid_df, "pct_snr_change_last_vs_first")
+    good_frame_snr_comparisons = _build_comparisons(good_snr_df, "overall_good_frame_mean_snr")
+
+    fig = None
+    figure_path = None
+    if (show_plot or figure_save_folder is not None) and (len(valid_df) > 0 or len(good_snr_df) > 0):
+        csplus_color = "#EE9B00"
+        csminus_color = "#026C80"
+        nonplc_color = "#888888"
+        all_place_color = "#333333"
+
+        base_width, base_height = tuple(float(v) for v in figsize)
+        fig, axes = plt.subplots(2, 3, figsize=(base_width, base_height * 2.05))
+        axes = np.asarray(axes)
+        vals_all = valid_df["pct_snr_change_last_vs_first"].to_numpy(dtype=float)
+        vals_all = vals_all[np.isfinite(vals_all)]
+        drop_vals_all = -vals_all
+        if drop_vals_all.size > 0:
+            axes[0, 0].hist(drop_vals_all, bins=12, color=nonplc_color, edgecolor="white", linewidth=0.4)
+            axes[0, 0].axvline(0.0, color="#666666", linewidth=0.6, linestyle="--")
+        else:
+            axes[0, 0].text(0.5, 0.5, "No valid cells", ha="center", va="center", transform=axes[0, 0].transAxes)
+        axes[0, 0].set_title("All cells")
+        axes[0, 0].set_xlabel("% SNR drop")
+        axes[0, 0].set_ylabel("Cell count")
+        axes[0, 0].spines["top"].set_visible(False)
+        axes[0, 0].spines["right"].set_visible(False)
+        axes[0, 0].tick_params(labelsize=5, direction="in", length=1.75)
+
+        _plot_box_with_points(
+            axes[0, 1],
+            valid_df,
+            "place_nonplace_group",
+            ["Place cell", "Non-place cell"],
+            [all_place_color, nonplc_color],
+            title="Place vs non-place",
+            ylabel="% SNR change",
+        )
+        _add_comparison_brackets(
+            axes[0, 1],
+            comparisons,
+            [
+                {
+                    "comparison": "place_vs_nonplace",
+                    "pos1": 1,
+                    "pos2": 2,
+                    "color": all_place_color,
+                },
+            ],
+        )
+        _plot_box_with_points(
+            axes[0, 2],
+            valid_df,
+            "cs_group",
+            ["CS+ place cell", "CS- place cell", "Non-place cell"],
+            [csplus_color, csminus_color, nonplc_color],
+            title="CS groups",
+        )
+        _add_comparison_brackets(
+            axes[0, 2],
+            comparisons,
+            [
+                {
+                    "comparison": "csplus_vs_csminus",
+                    "pos1": 1,
+                    "pos2": 2,
+                    "color": "black",
+                },
+                {
+                    "comparison": "csplus_vs_nonplace",
+                    "pos1": 1,
+                    "pos2": 3,
+                    "color": csplus_color,
+                },
+                {
+                    "comparison": "csminus_vs_nonplace",
+                    "pos1": 2,
+                    "pos2": 3,
+                    "color": csminus_color,
+                },
+            ],
+        )
+        mean_snr_vals = good_snr_df["overall_good_frame_mean_snr"].to_numpy(dtype=float)
+        mean_snr_vals = mean_snr_vals[np.isfinite(mean_snr_vals)]
+        if mean_snr_vals.size > 0:
+            axes[1, 0].hist(mean_snr_vals, bins=12, color=nonplc_color, edgecolor="white", linewidth=0.4)
+        else:
+            axes[1, 0].text(0.5, 0.5, "No valid cells", ha="center", va="center", transform=axes[1, 0].transAxes)
+        axes[1, 0].set_title("All cells")
+        axes[1, 0].set_xlabel("Good-frame mean SNR")
+        axes[1, 0].set_ylabel("Cell count")
+        axes[1, 0].spines["top"].set_visible(False)
+        axes[1, 0].spines["right"].set_visible(False)
+        axes[1, 0].tick_params(labelsize=5, direction="in", length=1.75)
+
+        _plot_box_with_points(
+            axes[1, 1],
+            good_snr_df,
+            "place_nonplace_group",
+            ["Place cell", "Non-place cell"],
+            [all_place_color, nonplc_color],
+            value_col="overall_good_frame_mean_snr",
+            title="Place vs non-place",
+            ylabel="Good-frame mean SNR",
+            zero_line=False,
+        )
+        _add_comparison_brackets(
+            axes[1, 1],
+            good_frame_snr_comparisons,
+            [
+                {
+                    "comparison": "place_vs_nonplace",
+                    "pos1": 1,
+                    "pos2": 2,
+                    "color": all_place_color,
+                },
+            ],
+        )
+        _plot_box_with_points(
+            axes[1, 2],
+            good_snr_df,
+            "cs_group",
+            ["CS+ place cell", "CS- place cell", "Non-place cell"],
+            [csplus_color, csminus_color, nonplc_color],
+            value_col="overall_good_frame_mean_snr",
+            title="CS groups",
+            zero_line=False,
+        )
+        _add_comparison_brackets(
+            axes[1, 2],
+            good_frame_snr_comparisons,
+            [
+                {
+                    "comparison": "csplus_vs_csminus",
+                    "pos1": 1,
+                    "pos2": 2,
+                    "color": "black",
+                },
+                {
+                    "comparison": "csplus_vs_nonplace",
+                    "pos1": 1,
+                    "pos2": 3,
+                    "color": csplus_color,
+                },
+                {
+                    "comparison": "csminus_vs_nonplace",
+                    "pos1": 2,
+                    "pos2": 3,
+                    "color": csminus_color,
+                },
+            ],
+        )
+        fig.tight_layout(w_pad=0.7)
+
+        if figure_save_folder is not None:
+            figure_dir = Path(figure_save_folder)
+            figure_dir.mkdir(parents=True, exist_ok=True)
+            figure_path = str(figure_dir / str(save_name))
+            fig.savefig(figure_path, dpi=300)
+    if show_plot and fig is not None:
+        plt.show()
+    elif fig is not None:
+        plt.close(fig)
+
+    print(
+        "First-vs-last saved/interpolated SNR change: "
+        f"valid cells={overall['n_cells_valid_change']}/{overall['n_cells_total']}, "
+        f"median change={overall['pct_snr_change_last_vs_first_median']:.2f}% "
+        "(negative means SNR dropped)."
+    )
+    if figure_path:
+        print(f"Saved: {figure_path}")
+
+    return {
+        "per_cell": per_cell,
+        "overall": overall_df,
+        "group_summary": group_summary,
+        "comparisons": comparisons,
+        "good_frame_snr_comparisons": good_frame_snr_comparisons,
+        "skipped_cells": skipped_cells,
+        "figure_path": figure_path,
+        "figure": fig if show_plot else None,
+        "spatial_data": spatial_data,
+    }
+
+
+def plot_animal_movement_summary_boxplots(
+    config: PipelineConfig,
+    figure_save_folder: str | Path,
+    *,
+    first_n_minutes: float = 10.0,
+    figsize: tuple[float, float] = (3.6, 1.45),
+    save_name: str = "AnimalMovementSummary.svg",
+    show_plot: bool = True,
+) -> dict[str, Any]:
+    import pandas as pd
+
+    first_n_minutes_use = float(first_n_minutes)
+    if not np.isclose(first_n_minutes_use, 10.0, atol=1e-8):
+        raise ValueError(
+            "animal_movement_summary.pkl currently stores first-10-minute distance only; "
+            "use first_n_minutes=10.0."
+        )
+
+    rows: list[dict[str, Any]] = []
+    for animal_id in config.animals:
+        summary = load_animal_movement_summary(animal_id, config)
+        rows.append(
+            {
+                "animal_id": str(summary.get("animal_id", animal_id)),
+                "moving_percent": float(summary.get("moving_percent", np.nan)),
+                "mean_speed_cm_s": float(summary.get("mean_speed_cm_s", np.nan)),
+                "distance_first_10_min_m": float(summary.get("distance_first_10_min_m", np.nan)),
+            }
+        )
+
+    summary_df = pd.DataFrame(rows)
+    if summary_df.empty:
+        raise ValueError("No cached animal movement summaries were found.")
+
+    if len(tuple(figsize)) != 2:
+        raise ValueError("figsize must be a 2-tuple: (width, height).")
+    fig, axes = plt.subplots(1, 3, figsize=tuple(float(v) for v in figsize))
+    axes = np.atleast_1d(axes)
+    rng = np.random.default_rng(42)
+    metric_specs = [
+        ("moving_percent", "Moving time (%)", "#4D4D4D"),
+        ("mean_speed_cm_s", "Mean speed moving (cm/s)", "#4D4D4D"),
+        ("distance_first_10_min_m", "Distance first 10 min (m)", "#4D4D4D"),
+    ]
+
+    for ax, (metric_key, y_label, color) in zip(axes, metric_specs):
+        vals = summary_df[metric_key].to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        bp = ax.boxplot(
+            [vals],
+            positions=[1.0],
+            widths=0.42,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box in bp["boxes"]:
+            box.set_facecolor(color)
+            box.set_alpha(0.25)
+
+        if vals.size > 0:
+            x_jitter = 1.0 + rng.uniform(-0.08, 0.08, size=vals.size)
+            ax.scatter(x_jitter, vals, s=10, color=color, alpha=0.9, linewidths=0, zorder=2)
+
+        ax.set_xlim(0.65, 1.35)
+        ax.set_xticks([])
+        ax.set_ylabel(y_label)
+        ax.tick_params(labelsize=5, direction="in", length=1.75)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.tight_layout(w_pad=0.9)
+    figure_dir = Path(figure_save_folder)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    figure_path = figure_dir / str(save_name)
+    fig.savefig(figure_path, dpi=300)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return {
+        "figure_path": str(figure_path),
+        "summary_df": summary_df,
+        "figure": fig if show_plot else None,
+    }
+
+
+def plot_animal_movement_first_last_window_comparison(
+    config: PipelineConfig,
+    figure_save_folder: str | Path,
+    *,
+    window_minutes: float = 10.0,
+    include_short_recordings_in_first_window: bool = False,
+    figsize: tuple[float, float] = (2.4, 1.2),
+    save_name: str = "AnimalMovementFirstLast10minComparison.svg",
+    annotate_stats: bool = True,
+    show_plot: bool = True,
+) -> dict[str, Any]:
+    import pandas as pd
+
+    def _format_significance_label(p_value: float) -> str:
+        if not np.isfinite(p_value):
+            return "n/a"
+        if p_value < 0.001:
+            return "***"
+        if p_value < 0.01:
+            return "**"
+        if p_value < 0.05:
+            return "*"
+        return "n.s."
+
+    window_minutes = float(window_minutes)
+    if window_minutes <= 0:
+        raise ValueError("window_minutes must be > 0.")
+
+    rows: list[dict[str, Any]] = []
+    skipped_animals: list[dict[str, Any]] = []
+    unpaired_animals: list[dict[str, Any]] = []
+    for animal_id in config.animals:
+        merged = _load_merged_data(config.data_root / animal_id, config)
+        movement_inputs = _prepare_animal_movement_summary_inputs(animal_id, merged, config)
+        frame_rate = float(movement_inputs["frame_rate"])
+        n_frames = int(movement_inputs["n_frames"])
+        recording_duration_min = float(n_frames / frame_rate / 60.0)
+        window_frames = int(np.floor(window_minutes * 60.0 * frame_rate))
+        window_frames = max(1, window_frames)
+
+        if n_frames <= window_frames:
+            skip_row = {
+                "animal_id": str(animal_id),
+                "recording_duration_min": recording_duration_min,
+                "reason": f"recording <= {window_minutes:g} min",
+            }
+            if not include_short_recordings_in_first_window or n_frames <= 0:
+                skipped_animals.append(skip_row)
+                continue
+            unpaired_animals.append(skip_row)
+
+        has_last_window = n_frames > window_frames
+        first_end_frame = min(n_frames, window_frames)
+        window_defs = [
+            ("first", f"First {window_minutes:g} min", 0, first_end_frame),
+        ]
+        if has_last_window:
+            window_defs.append(
+                ("last", f"Last {window_minutes:g} min", n_frames - window_frames, n_frames)
+            )
+        for window_key, window_label, start_frame, end_frame in window_defs:
+            metrics = _compute_animal_movement_window_metrics(movement_inputs, start_frame, end_frame)
+            rows.append(
+                {
+                    "animal_id": str(animal_id),
+                    "window": window_key,
+                    "window_label": window_label,
+                    "recording_duration_min": recording_duration_min,
+                    "window_minutes": window_minutes,
+                    "start_min": float(metrics["start_frame"] / frame_rate / 60.0),
+                    "end_min": float(metrics["end_frame"] / frame_rate / 60.0),
+                    "actual_window_minutes": float(
+                        (metrics["end_frame"] - metrics["start_frame"]) / frame_rate / 60.0
+                    ),
+                    "has_last_window": bool(has_last_window),
+                    "is_paired_window": bool(has_last_window),
+                    "n_valid_frames": int(metrics["n_valid_frames"]),
+                    "n_moving_frames": int(metrics["n_moving_frames"]),
+                    "moving_percent": float(metrics["moving_percent"]),
+                    "mean_speed_cm_s": float(metrics["mean_speed_cm_s"]),
+                    "distance_m": float(metrics["distance_m"]),
+                }
+            )
+
+    comparison_df = pd.DataFrame(rows)
+    if comparison_df.empty:
+        raise ValueError(f"No animals have recordings longer than {window_minutes:g} minutes.")
+
+    metric_specs = [
+        ("moving_percent", "Moving time (%)"),
+        ("mean_speed_cm_s", "Mean moving speed (cm/s)"),
+        ("distance_m", "Distance (m)"),
+    ]
+
+    paired_df = comparison_df.pivot(index="animal_id", columns="window", values=[m[0] for m in metric_specs])
+    paired_df.columns = [f"{metric}_{window}" for metric, window in paired_df.columns]
+    paired_df = paired_df.reset_index()
+    for metric_key, _ in metric_specs:
+        for window_key in ("first", "last"):
+            column = f"{metric_key}_{window_key}"
+            if column not in paired_df.columns:
+                paired_df[column] = np.nan
+
+    stats_rows: list[dict[str, Any]] = []
+    for metric_key, y_label in metric_specs:
+        first_vals = paired_df[f"{metric_key}_first"].to_numpy(dtype=float)
+        last_vals = paired_df[f"{metric_key}_last"].to_numpy(dtype=float)
+        valid = np.isfinite(first_vals) & np.isfinite(last_vals)
+        n_valid = int(np.sum(valid))
+        delta = last_vals[valid] - first_vals[valid]
+        if n_valid >= 2 and not np.allclose(delta, 0.0, equal_nan=False):
+            try:
+                test_res = scipy_stats.wilcoxon(last_vals[valid], first_vals[valid])
+                p_value = float(test_res.pvalue)
+                test_stat = float(test_res.statistic)
+                test_name = "wilcoxon"
+            except ValueError:
+                p_value = np.nan
+                test_stat = np.nan
+                test_name = "wilcoxon"
+        elif n_valid >= 2:
+            p_value = 1.0
+            test_stat = 0.0
+            test_name = "wilcoxon"
+        else:
+            p_value = np.nan
+            test_stat = np.nan
+            test_name = "not enough paired animals"
+
+        stats_rows.append(
+            {
+                "metric": metric_key,
+                "label": y_label,
+                "n_animals": n_valid,
+                "first_mean": float(np.nanmean(first_vals[valid])) if n_valid else np.nan,
+                "last_mean": float(np.nanmean(last_vals[valid])) if n_valid else np.nan,
+                "mean_delta_last_minus_first": float(np.nanmean(delta)) if n_valid else np.nan,
+                "median_delta_last_minus_first": float(np.nanmedian(delta)) if n_valid else np.nan,
+                "test": test_name,
+                "statistic": test_stat,
+                "p_value": p_value,
+            }
+        )
+    stats_df = pd.DataFrame(stats_rows)
+
+    if len(tuple(figsize)) != 2:
+        raise ValueError("figsize must be a 2-tuple: (width, height).")
+    fig, axes = plt.subplots(1, 3, figsize=tuple(float(v) for v in figsize))
+    axes = np.atleast_1d(axes)
+    rng = np.random.default_rng(42)
+    colors = {"first": "#4D4D4D", "last": "#A8574F"}
+
+    for ax, (metric_key, y_label) in zip(axes, metric_specs):
+        first_vals = paired_df[f"{metric_key}_first"].to_numpy(dtype=float)
+        last_vals = paired_df[f"{metric_key}_last"].to_numpy(dtype=float)
+        valid = np.isfinite(first_vals) & np.isfinite(last_vals)
+        first_finite = np.isfinite(first_vals)
+        last_finite = np.isfinite(last_vals)
+        plot_vals = [first_vals[first_finite], last_vals[last_finite]]
+        bp = ax.boxplot(
+            plot_vals,
+            positions=[1.0, 2.0],
+            widths=0.42,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box, color in zip(bp["boxes"], [colors["first"], colors["last"]]):
+            box.set_facecolor(color)
+            box.set_alpha(0.25)
+
+        if np.any(valid):
+            jitter_first = rng.uniform(-0.04, 0.04, size=int(np.sum(valid)))
+            jitter_last = rng.uniform(-0.04, 0.04, size=int(np.sum(valid)))
+            for idx, (first_val, last_val) in enumerate(zip(first_vals[valid], last_vals[valid])):
+                ax.plot(
+                    [1.0 + jitter_first[idx], 2.0 + jitter_last[idx]],
+                    [first_val, last_val],
+                    color="#B0B0B0",
+                    linewidth=0.45,
+                    zorder=1,
+                )
+            ax.scatter(
+                1.0 + jitter_first,
+                first_vals[valid],
+                s=9,
+                color=colors["first"],
+                alpha=0.9,
+                linewidths=0,
+                zorder=2,
+            )
+            ax.scatter(
+                2.0 + jitter_last,
+                last_vals[valid],
+                s=9,
+                color=colors["last"],
+                alpha=0.9,
+                linewidths=0,
+                zorder=2,
+            )
+
+        unpaired_first = first_finite & ~np.isfinite(last_vals)
+        if np.any(unpaired_first):
+            jitter_unpaired_first = rng.uniform(-0.04, 0.04, size=int(np.sum(unpaired_first)))
+            ax.scatter(
+                1.0 + jitter_unpaired_first,
+                first_vals[unpaired_first],
+                s=9,
+                color=colors["first"],
+                alpha=0.9,
+                linewidths=0,
+                zorder=2,
+            )
+
+        unpaired_last = last_finite & ~np.isfinite(first_vals)
+        if np.any(unpaired_last):
+            jitter_unpaired_last = rng.uniform(-0.04, 0.04, size=int(np.sum(unpaired_last)))
+            ax.scatter(
+                2.0 + jitter_unpaired_last,
+                last_vals[unpaired_last],
+                s=9,
+                color=colors["last"],
+                alpha=0.9,
+                linewidths=0,
+                zorder=2,
+            )
+
+        if annotate_stats and np.any(valid):
+            stats_match = stats_df.loc[stats_df["metric"] == metric_key]
+            p_value = float(stats_match["p_value"].iloc[0]) if not stats_match.empty else np.nan
+            finite_plot_vals = np.concatenate(plot_vals)
+            finite_plot_vals = finite_plot_vals[np.isfinite(finite_plot_vals)]
+            if finite_plot_vals.size > 0:
+                y_min = float(np.nanmin(finite_plot_vals))
+                y_max = float(np.nanmax(finite_plot_vals))
+                y_span = y_max - y_min
+                if (not np.isfinite(y_span)) or y_span <= 0:
+                    y_span = max(abs(y_max), 1.0)
+                y_line = y_max + 0.10 * y_span
+                y_tick = y_max + 0.06 * y_span
+                y_text = y_max + 0.15 * y_span
+                ax.plot(
+                    [1.0, 1.0, 2.0, 2.0],
+                    [y_tick, y_line, y_line, y_tick],
+                    color="black",
+                    linewidth=0.45,
+                    clip_on=False,
+                )
+                ax.text(
+                    1.5,
+                    y_text,
+                    _format_significance_label(p_value),
+                    ha="center",
+                    va="bottom",
+                    fontsize=5,
+                )
+                cur_low, cur_high = ax.get_ylim()
+                ax.set_ylim(cur_low, max(cur_high, y_max + 0.28 * y_span))
+
+        ax.set_xlim(0.55, 2.45)
+        ax.set_xticks([1.0, 2.0])
+        ax.set_xticklabels([f"First\n{window_minutes:g} mins", f"Last\n{window_minutes:g} mins"], fontsize=5)
+        ax.set_ylabel(y_label)
+        ax.tick_params(labelsize=5, direction="in", length=1.75)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.tight_layout(w_pad=0.8)
+    figure_dir = Path(figure_save_folder)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    figure_path = figure_dir / str(save_name)
+    fig.savefig(figure_path, dpi=300)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return {
+        "figure_path": str(figure_path),
+        "comparison_df": comparison_df,
+        "paired_df": paired_df,
+        "stats_df": stats_df,
+        "skipped_animals": skipped_animals,
+        "unpaired_animals": unpaired_animals,
+        "figure": fig if show_plot else None,
+    }
+
+
+def _compute_plateau_event_count_summary_df(
+    config: PipelineConfig,
+    df_all,
+    *,
+    plateau_include_long_cb_as_plateau: bool = False,
+    plateau_cb_min_duration_ms: float = 200.0,
+    plateau_speed_threshold: float | None = None,
+):
+    import pandas as pd
+
+    if "session" not in df_all.columns or "cell_idx" not in df_all.columns:
+        raise KeyError("df_all must contain 'session' and 'cell_idx' columns.")
+
+    speed_threshold_use = (
+        float(config.analysis.speed_threshold)
+        if plateau_speed_threshold is None
+        else float(plateau_speed_threshold)
+    )
+    if not np.isfinite(speed_threshold_use) or speed_threshold_use < 0:
+        raise ValueError("plateau_speed_threshold must be a finite number >= 0.")
+
+    session_cache: dict[str, dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+
+    for row in df_all[["session", "cell_idx"]].itertuples(index=False):
+        animal_id = str(row.session)
+        cell_idx = int(row.cell_idx)
+
+        cache = session_cache.get(animal_id)
+        if cache is None:
+            merged = _load_merged_data(config.data_root / animal_id, config)
+            x_neural = np.asarray(merged["x_neural"], dtype=float).reshape(-1)
+            y_neural = np.asarray(
+                merged.get("y_neural", np.full_like(x_neural, np.nan)),
+                dtype=float,
+            ).reshape(-1)
+            speed = np.asarray(
+                merged.get("speed", np.full_like(x_neural, np.nan)),
+                dtype=float,
+            ).reshape(-1)
+            frame_rate = float(merged.get("frame_rate", np.nan))
+            if (not np.isfinite(frame_rate)) or frame_rate <= 0:
+                raise ValueError(f"{animal_id}: merged_data frame_rate must be a finite number > 0.")
+
+            n_frames = int(min(x_neural.size, y_neural.size, speed.size))
+            x_neural = x_neural[:n_frames]
+            y_neural = y_neural[:n_frames]
+            speed = speed[:n_frames]
+            speed_clean = np.asarray(speed, dtype=float).copy()
+            speed_clean[speed_clean > 60.0] = np.nan
+            valid_frames_global = np.isfinite(x_neural) & np.isfinite(y_neural) & np.isfinite(speed_clean)
+            bad_masks = np.asarray(
+                _compute_bad_masks(
+                    merged,
+                    config.analysis.snr_threshold,
+                    config.analysis.min_good_minutes,
+                ),
+                dtype=bool,
+            )
+
+            cache = {
+                "merged": merged,
+                "frame_rate": frame_rate,
+                "n_frames": n_frames,
+                "speed_clean": speed_clean,
+                "valid_frames_global": valid_frames_global,
+                "bad_masks": bad_masks,
+                "moving_masks": {},
+                "plateau_counts": {},
+            }
+            session_cache[animal_id] = cache
+
+        plateau_counts = cache["plateau_counts"]
+        if cell_idx not in plateau_counts:
+            n_frames = int(cache["n_frames"])
+            bad_masks = np.asarray(cache["bad_masks"], dtype=bool)
+            if bad_masks.ndim == 2 and cell_idx < bad_masks.shape[0] and bad_masks.shape[1] == n_frames:
+                bad_mask = bad_masks[cell_idx]
+            else:
+                bad_mask = np.zeros(n_frames, dtype=bool)
+            valid_frames_cell = np.asarray(cache["valid_frames_global"], dtype=bool) & (~bad_mask)
+
+            moving_masks = cache["moving_masks"]
+            moving_mask_cell = moving_masks.get(cell_idx)
+            if moving_mask_cell is None:
+                speed_for_epochs = np.asarray(cache["speed_clean"], dtype=float).copy()
+                speed_for_epochs[~valid_frames_cell] = np.nan
+                _, _, moving_idx_cell = core._compute_moving_epochs(
+                    speed_for_epochs,
+                    float(cache["frame_rate"]),
+                    kernel_size=int(config.analysis.kernel_size),
+                    filter_type="boxcar",
+                    speed_threshold=speed_threshold_use,
+                    min_duration_s=float(config.analysis.min_duration_s),
+                    merge_gap_s=float(config.analysis.merge_gap_s),
+                )
+                moving_mask_cell = np.zeros(n_frames, dtype=bool)
+                if len(moving_idx_cell) > 0:
+                    moving_mask_cell[np.asarray(moving_idx_cell, dtype=int)] = True
+                moving_mask_cell &= valid_frames_cell
+                moving_masks[cell_idx] = moving_mask_cell
+
+            plateau_starts, _ = _build_plateau_intervals_for_cell(
+                cell_idx=cell_idx,
+                plateaus_dicts=cache["merged"].get("plateaus_dicts"),
+                complex_bursts_dicts=cache["merged"].get("complex_bursts_dicts"),
+                include_long_cb_as_plateau=bool(plateau_include_long_cb_as_plateau),
+                cb_plateau_min_duration_ms=float(plateau_cb_min_duration_ms),
+                frame_rate=float(cache["frame_rate"]),
+                n_frames=n_frames,
+            )
+            plateau_starts = np.asarray(plateau_starts, dtype=int)
+            plateau_starts = plateau_starts[(plateau_starts >= 0) & (plateau_starts < n_frames)]
+            plateau_starts = plateau_starts[valid_frames_cell[plateau_starts]]
+
+            n_loco = int(np.sum(moving_mask_cell[plateau_starts])) if plateau_starts.size > 0 else 0
+            n_quiet = int(plateau_starts.size - n_loco)
+            plateau_counts[cell_idx] = (n_loco, n_quiet)
+
+        n_loco, n_quiet = plateau_counts[cell_idx]
+        rows.append(
+            {
+                "session": animal_id,
+                "cell_idx": cell_idx,
+                "plateau_event_count_loco": int(n_loco),
+                "plateau_event_count_quiet": int(n_quiet),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _compute_complex_burst_event_summary_df(
+    config: PipelineConfig,
+    df_all,
+    *,
+    speed_threshold: float | None = None,
+):
+    import pandas as pd
+
+    if "session" not in df_all.columns or "cell_idx" not in df_all.columns:
+        raise KeyError("df_all must contain 'session' and 'cell_idx' columns.")
+
+    speed_threshold_use = (
+        float(config.analysis.speed_threshold)
+        if speed_threshold is None
+        else float(speed_threshold)
+    )
+    if not np.isfinite(speed_threshold_use) or speed_threshold_use < 0:
+        raise ValueError("speed_threshold must be a finite number >= 0.")
+
+    session_cache: dict[str, dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+
+    for row in df_all[["session", "cell_idx"]].itertuples(index=False):
+        animal_id = str(row.session)
+        cell_idx = int(row.cell_idx)
+
+        cache = session_cache.get(animal_id)
+        if cache is None:
+            merged = _load_merged_data(config.data_root / animal_id, config)
+            x_neural = np.asarray(merged["x_neural"], dtype=float).reshape(-1)
+            y_neural = np.asarray(
+                merged.get("y_neural", np.full_like(x_neural, np.nan)),
+                dtype=float,
+            ).reshape(-1)
+            speed = np.asarray(
+                merged.get("speed", np.full_like(x_neural, np.nan)),
+                dtype=float,
+            ).reshape(-1)
+            frame_rate = float(merged.get("frame_rate", np.nan))
+            if (not np.isfinite(frame_rate)) or frame_rate <= 0:
+                raise ValueError(f"{animal_id}: merged_data frame_rate must be a finite number > 0.")
+
+            n_frames = int(min(x_neural.size, y_neural.size, speed.size))
+            x_neural = x_neural[:n_frames]
+            y_neural = y_neural[:n_frames]
+            speed = speed[:n_frames]
+            speed_clean = np.asarray(speed, dtype=float).copy()
+            speed_clean[speed_clean > 60.0] = np.nan
+            valid_frames_global = np.isfinite(x_neural) & np.isfinite(y_neural) & np.isfinite(speed_clean)
+            bad_masks = np.asarray(
+                _compute_bad_masks(
+                    merged,
+                    config.analysis.snr_threshold,
+                    config.analysis.min_good_minutes,
+                ),
+                dtype=bool,
+            )
+
+            cache = {
+                "merged": merged,
+                "frame_rate": frame_rate,
+                "n_frames": n_frames,
+                "speed_clean": speed_clean,
+                "valid_frames_global": valid_frames_global,
+                "bad_masks": bad_masks,
+                "moving_masks": {},
+                "burst_summary": {},
+            }
+            session_cache[animal_id] = cache
+
+        burst_summary = cache["burst_summary"]
+        if cell_idx not in burst_summary:
+            n_frames = int(cache["n_frames"])
+            bad_masks = np.asarray(cache["bad_masks"], dtype=bool)
+            if bad_masks.ndim == 2 and cell_idx < bad_masks.shape[0] and bad_masks.shape[1] == n_frames:
+                bad_mask = bad_masks[cell_idx]
+            else:
+                bad_mask = np.zeros(n_frames, dtype=bool)
+            valid_frames_cell = np.asarray(cache["valid_frames_global"], dtype=bool) & (~bad_mask)
+
+            moving_masks = cache["moving_masks"]
+            moving_mask_cell = moving_masks.get(cell_idx)
+            if moving_mask_cell is None:
+                speed_for_epochs = np.asarray(cache["speed_clean"], dtype=float).copy()
+                speed_for_epochs[~valid_frames_cell] = np.nan
+                _, _, moving_idx_cell = core._compute_moving_epochs(
+                    speed_for_epochs,
+                    float(cache["frame_rate"]),
+                    kernel_size=int(config.analysis.kernel_size),
+                    filter_type="boxcar",
+                    speed_threshold=speed_threshold_use,
+                    min_duration_s=float(config.analysis.min_duration_s),
+                    merge_gap_s=float(config.analysis.merge_gap_s),
+                )
+                moving_mask_cell = np.zeros(n_frames, dtype=bool)
+                if len(moving_idx_cell) > 0:
+                    moving_mask_cell[np.asarray(moving_idx_cell, dtype=int)] = True
+                moving_mask_cell &= valid_frames_cell
+                moving_masks[cell_idx] = moving_mask_cell
+
+            quiet_mask_cell = valid_frames_cell & (~moving_mask_cell)
+            loco_time_s = float(np.sum(moving_mask_cell) / float(cache["frame_rate"]))
+            quiet_time_s = float(np.sum(quiet_mask_cell) / float(cache["frame_rate"]))
+
+            cb_entry = None
+            complex_bursts_dicts = cache["merged"].get("complex_bursts_dicts", [])
+            if isinstance(complex_bursts_dicts, (list, tuple)) and cell_idx < len(complex_bursts_dicts):
+                cb_entry = complex_bursts_dicts[cell_idx]
+            elif isinstance(complex_bursts_dicts, dict):
+                cb_entry = complex_bursts_dicts
+
+            cb_starts = np.array([], dtype=int)
+            if isinstance(cb_entry, dict):
+                cb_starts = np.asarray(cb_entry.get("starts", []), dtype=int).reshape(-1)
+            cb_starts = cb_starts[(cb_starts >= 0) & (cb_starts < n_frames)]
+            cb_starts = cb_starts[valid_frames_cell[cb_starts]]
+
+            n_loco = int(np.sum(moving_mask_cell[cb_starts])) if cb_starts.size > 0 else 0
+            n_quiet = int(cb_starts.size - n_loco)
+            burst_summary[cell_idx] = {
+                "complex_burst_event_count_loco": n_loco,
+                "complex_burst_event_count_quiet": n_quiet,
+                "complex_burst_event_rate_loco": (float(n_loco) / loco_time_s) if loco_time_s > 0 else np.nan,
+                "complex_burst_event_rate_quiet": (float(n_quiet) / quiet_time_s) if quiet_time_s > 0 else np.nan,
+            }
+
+        row_payload = dict(burst_summary[cell_idx])
+        row_payload["session"] = animal_id
+        row_payload["cell_idx"] = cell_idx
+        rows.append(row_payload)
+
+    return pd.DataFrame(rows)
+
+
+def plot_state_dependent_firing_rates_with_plateau_count(
+    config: PipelineConfig,
+    pooled_stats: Any,
+    figure_save_folder: str | Path,
+    *,
+    plateau_include_long_cb_as_plateau: bool = False,
+    plateau_cb_min_duration_ms: float = 200.0,
+    plateau_speed_threshold: float | None = None,
+    rate_ylim_max: float = 6.0,
+    plateau_zoom_ylim_max: float = 10.0,
+    figsize: tuple[float, float] = (4.8, 1.0),
+    save_name: str = "StateDep_FiringRates_AllCells_WithPlateauCount.svg",
+    show_plot: bool = True,
+) -> dict[str, Any]:
+    import pandas as pd
+    from utils.pooled_figures_core import (
+        _global_ylim as pooled_global_ylim,
+        _paired_test as pooled_paired_test,
+        _sig_label as pooled_sig_label,
+        _style_violin_medians as pooled_style_violin_medians,
+    )
+
+    df_all = getattr(pooled_stats, "df_all", pooled_stats)
+    if not isinstance(df_all, pd.DataFrame):
+        raise TypeError("pooled_stats must be a PooledStatsData object or a pandas DataFrame.")
+
+    plateau_df = _compute_plateau_event_count_summary_df(
+        config,
+        df_all,
+        plateau_include_long_cb_as_plateau=plateau_include_long_cb_as_plateau,
+        plateau_cb_min_duration_ms=plateau_cb_min_duration_ms,
+        plateau_speed_threshold=plateau_speed_threshold,
+    )
+    complex_burst_df = _compute_complex_burst_event_summary_df(
+        config,
+        df_all,
+        speed_threshold=plateau_speed_threshold,
+    )
+    summary_df = df_all.copy().merge(
+        plateau_df,
+        on=["session", "cell_idx"],
+        how="left",
+        validate="one_to_one",
+    ).merge(
+        complex_burst_df,
+        on=["session", "cell_idx"],
+        how="left",
+        validate="one_to_one",
+    )
+    summary_df["plateau_event_count_loco"] = pd.to_numeric(
+        summary_df["plateau_event_count_loco"],
+        errors="coerce",
+    ).fillna(0.0)
+    summary_df["plateau_event_count_quiet"] = pd.to_numeric(
+        summary_df["plateau_event_count_quiet"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    if len(tuple(figsize)) != 2:
+        raise ValueError("figsize must be a 2-tuple: (width, height).")
+    rate_ylim_max = float(rate_ylim_max)
+    plateau_zoom_ylim_max = float(plateau_zoom_ylim_max)
+    if (not np.isfinite(rate_ylim_max)) or rate_ylim_max <= 0:
+        raise ValueError("rate_ylim_max must be a finite number > 0.")
+    if (not np.isfinite(plateau_zoom_ylim_max)) or plateau_zoom_ylim_max <= 0:
+        raise ValueError("plateau_zoom_ylim_max must be a finite number > 0.")
+
+    fig, axes = plt.subplots(1, 6, figsize=tuple(float(v) for v in figsize), sharex=True)
+    axes = np.atleast_1d(axes)
+    axes[1].sharey(axes[0])
+    axes[2].sharey(axes[0])
+    run_color = "#f9e800ff"
+    rest_color = "#563c25"
+    rate_specs = [
+        ("all", axes[0]),
+        ("ss", axes[1]),
+        ("cs", axes[2]),
+    ]
+    rate_ylim = (0.0, rate_ylim_max)
+
+    stats_results: list[dict[str, Any]] = []
+    subplot_counts: dict[str, int] = {}
+
+    def _plot_split_half_violin_pair(
+        ax,
+        vals_loco: np.ndarray,
+        vals_quiet: np.ndarray,
+        *,
+        sig_label: str = "",
+        ylim: tuple[float, float] | None = None,
+    ) -> None:
+        vals_loco = np.asarray(vals_loco, dtype=float)
+        vals_quiet = np.asarray(vals_quiet, dtype=float)
+        plot_specs = [
+            (1.0, vals_loco, run_color, "left"),
+            (2.0, vals_quiet, rest_color, "right"),
+        ]
+        rng = np.random.default_rng(0)
+
+        for pos, vals, color, side in plot_specs:
+            finite_vals = vals[np.isfinite(vals)]
+            if finite_vals.size >= 2:
+                parts = ax.violinplot(
+                    [finite_vals],
+                    positions=[pos],
+                    showmedians=True,
+                    showextrema=False,
+                )
+                body = parts["bodies"][0]
+                verts = body.get_paths()[0].vertices
+                if side == "left":
+                    verts[:, 0] = np.clip(verts[:, 0], -np.inf, pos)
+                else:
+                    verts[:, 0] = np.clip(verts[:, 0], pos, np.inf)
+                body.set_facecolor(color)
+                body.set_edgecolor("none")
+                body.set_alpha(0.3)
+                body.set_zorder(1)
+                if "cmedians" in parts:
+                    clipped_segments = []
+                    for seg in parts["cmedians"].get_segments():
+                        seg = np.asarray(seg, dtype=float).copy()
+                        if side == "left":
+                            seg[:, 0] = np.clip(seg[:, 0], -np.inf, pos)
+                        else:
+                            seg[:, 0] = np.clip(seg[:, 0], pos, np.inf)
+                        clipped_segments.append(seg)
+                    parts["cmedians"].set_segments(clipped_segments)
+                pooled_style_violin_medians(parts)
+
+            if finite_vals.size > 0:
+                scatter_offsets = 0.05 + rng.random(finite_vals.size) * 0.12
+                if side == "left":
+                    scatter_x = pos + scatter_offsets
+                else:
+                    scatter_x = pos - scatter_offsets
+                ax.scatter(
+                    scatter_x,
+                    finite_vals,
+                    s=5,
+                    color="black",
+                    alpha=0.6,
+                    linewidths=0,
+                    zorder=3,
+                )
+
+        n_pairs = min(len(vals_loco), len(vals_quiet))
+        for i in range(n_pairs):
+            if np.isfinite(vals_loco[i]) and np.isfinite(vals_quiet[i]):
+                ax.plot(
+                    [1.12, 1.88],
+                    [vals_loco[i], vals_quiet[i]],
+                    color="black",
+                    alpha=0.3,
+                    linewidth=0.6,
+                    zorder=2,
+                )
+
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+            if sig_label:
+                ax.text(
+                    1.5,
+                    ylim[1] - 0.05 * (ylim[1] - ylim[0]),
+                    sig_label,
+                    ha="center",
+                    va="bottom",
+                    fontsize=6,
+                )
+        elif sig_label:
+            ax.text(
+                1.5,
+                0.99,
+                sig_label,
+                ha="center",
+                va="top",
+                fontsize=6,
+                transform=ax.get_xaxis_transform(),
+            )
+
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels(["Loco.", "Quiet"], fontsize=5)
+        ax.set_xlim(0.5, 2.5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    for spike_type, ax in rate_specs:
+        data_loco_all = summary_df[f"{spike_type}_rate_loco"].to_numpy(dtype=float)
+        data_quiet_all = summary_df[f"{spike_type}_rate_quiet"].to_numpy(dtype=float)
+        pair_mask = np.isfinite(data_loco_all) & np.isfinite(data_quiet_all)
+        if spike_type == "cs":
+            pair_mask &= ((data_loco_all != 0) | (data_quiet_all != 0))
+        data_loco = data_loco_all[pair_mask]
+        data_quiet = data_quiet_all[pair_mask]
+        subplot_counts[f"{spike_type}_rate"] = int(len(data_loco))
+
+        p_val, test_stat, test_name, n_valid, shapiro_p = pooled_paired_test(data_loco, data_quiet)
+        sig = pooled_sig_label(p_val)
+        _plot_split_half_violin_pair(ax, data_loco, data_quiet, sig_label=sig, ylim=rate_ylim)
+        stats_results.append(
+            {
+                "metric": f"{spike_type}_rate",
+                "n_cells": int(n_valid),
+                "test": test_name,
+                "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                "loco_mean": float(np.nanmean(data_loco)) if data_loco.size > 0 else np.nan,
+                "loco_std": float(np.nanstd(data_loco)) if data_loco.size > 0 else np.nan,
+                "quiet_mean": float(np.nanmean(data_quiet)) if data_quiet.size > 0 else np.nan,
+                "quiet_std": float(np.nanstd(data_quiet)) if data_quiet.size > 0 else np.nan,
+                "test_stat": float(test_stat) if np.isfinite(test_stat) else np.nan,
+                "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+            }
+        )
+
+        ax.set_ylabel("Rate (Hz)" if ax == axes[0] else "", fontsize=6)
+        if ax != axes[0]:
+            ax.tick_params(left=False, labelleft=False)
+
+    cb_rate_ax = axes[3]
+    cb_rate_loco = summary_df["complex_burst_event_rate_loco"].to_numpy(dtype=float)
+    cb_rate_quiet = summary_df["complex_burst_event_rate_quiet"].to_numpy(dtype=float)
+    cb_count_loco = summary_df["complex_burst_event_count_loco"].to_numpy(dtype=float)
+    cb_count_quiet = summary_df["complex_burst_event_count_quiet"].to_numpy(dtype=float)
+    cb_pair_mask = np.isfinite(cb_rate_loco) & np.isfinite(cb_rate_quiet)
+    cb_pair_mask &= (
+        (np.isfinite(cb_count_loco) & (cb_count_loco > 0))
+        | (np.isfinite(cb_count_quiet) & (cb_count_quiet > 0))
+    )
+    cb_rate_loco = cb_rate_loco[cb_pair_mask]
+    cb_rate_quiet = cb_rate_quiet[cb_pair_mask]
+    subplot_counts["complex_burst_rate"] = int(len(cb_rate_loco))
+
+    p_val, test_stat, test_name, n_valid, shapiro_p = pooled_paired_test(cb_rate_loco, cb_rate_quiet)
+    sig = pooled_sig_label(p_val)
+    cb_rate_ylim = pooled_global_ylim([cb_rate_loco, cb_rate_quiet])
+    _plot_split_half_violin_pair(cb_rate_ax, cb_rate_loco, cb_rate_quiet, sig_label=sig, ylim=cb_rate_ylim)
+
+    cb_rate_ax.set_ylabel("CB event rate (Hz)", fontsize=6)
+
+    stats_results.append(
+        {
+            "metric": "complex_burst_event_rate",
+            "n_cells": int(n_valid),
+            "test": test_name,
+            "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+            "loco_mean": float(np.nanmean(cb_rate_loco)) if cb_rate_loco.size > 0 else np.nan,
+            "loco_std": float(np.nanstd(cb_rate_loco)) if cb_rate_loco.size > 0 else np.nan,
+            "quiet_mean": float(np.nanmean(cb_rate_quiet)) if cb_rate_quiet.size > 0 else np.nan,
+            "quiet_std": float(np.nanstd(cb_rate_quiet)) if cb_rate_quiet.size > 0 else np.nan,
+            "test_stat": float(test_stat) if np.isfinite(test_stat) else np.nan,
+            "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+        }
+    )
+
+    plateau_ax = axes[4]
+    plateau_zoom_ax = axes[5]
+    plateau_loco_all = summary_df["plateau_event_count_loco"].to_numpy(dtype=float)
+    plateau_quiet_all = summary_df["plateau_event_count_quiet"].to_numpy(dtype=float)
+    plateau_pair_mask = (
+        np.isfinite(plateau_loco_all)
+        & np.isfinite(plateau_quiet_all)
+        & ((plateau_loco_all > 0) | (plateau_quiet_all > 0))
+    )
+    plateau_loco = plateau_loco_all[plateau_pair_mask]
+    plateau_quiet = plateau_quiet_all[plateau_pair_mask]
+    subplot_counts["plateau"] = int(len(plateau_loco))
+    subplot_counts["plateau_zoom"] = int(len(plateau_loco))
+    p_val, test_stat, test_name, n_valid, shapiro_p = pooled_paired_test(plateau_loco, plateau_quiet)
+    sig = pooled_sig_label(p_val)
+    plateau_ylim = pooled_global_ylim([plateau_loco, plateau_quiet])
+
+    def _plot_plateau_panel(
+        ax,
+        *,
+        ylim_override: tuple[float, float] | None = None,
+        hide_yticks: bool = False,
+        custom_yticks: list[float] | tuple[float, ...] | None = None,
+    ):
+        ylim_use = ylim_override if ylim_override is not None else plateau_ylim
+        _plot_split_half_violin_pair(ax, plateau_loco, plateau_quiet, sig_label=sig, ylim=ylim_use)
+        ax.set_ylabel("Plateau event #" if not hide_yticks else "", fontsize=6)
+        if hide_yticks:
+            ax.set_yticks([])
+        elif custom_yticks is not None:
+            ax.set_yticks(list(custom_yticks))
+
+    _plot_plateau_panel(plateau_ax)
+    _plot_plateau_panel(
+        plateau_zoom_ax,
+        ylim_override=(0.0, plateau_zoom_ylim_max),
+        hide_yticks=False,
+        custom_yticks=(0.0, 5.0),
+    )
+
+    stats_results.append(
+        {
+            "metric": "plateau_event_count",
+            "n_cells": int(n_valid),
+            "test": test_name,
+            "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+            "loco_mean": float(np.nanmean(plateau_loco)) if plateau_loco.size > 0 else np.nan,
+            "loco_std": float(np.nanstd(plateau_loco)) if plateau_loco.size > 0 else np.nan,
+            "quiet_mean": float(np.nanmean(plateau_quiet)) if plateau_quiet.size > 0 else np.nan,
+            "quiet_std": float(np.nanstd(plateau_quiet)) if plateau_quiet.size > 0 else np.nan,
+            "test_stat": float(test_stat) if np.isfinite(test_stat) else np.nan,
+            "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+        }
+    )
+
+    fig.tight_layout()
+    figure_dir = Path(figure_save_folder)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    figure_path = figure_dir / str(save_name)
+    fig.savefig(figure_path, dpi=300)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return {
+        "figure_path": str(figure_path),
+        "summary_df": summary_df,
+        "subplot_counts": subplot_counts,
+        "plateau_pair_mask": plateau_pair_mask,
+        "n_plateau_cells_plotted": int(np.sum(plateau_pair_mask)),
+        "stats_results": pd.DataFrame(stats_results),
+        "figure": fig if show_plot else None,
+        "rate_ylim_max": rate_ylim_max,
+        "plateau_zoom_ylim_max": plateau_zoom_ylim_max,
     }
 
 
@@ -4608,6 +8403,7 @@ def _empty_distance_defined_direction_result(
         "pf_entry_rel": np.array([], dtype=float),
         "pf_exit_rel": np.array([], dtype=float),
         "n_plateaus_per_trial": np.array([], dtype=int),
+        "plateau_trace_events_by_trial": [],
         "theta_mean": np.full(n_bins, np.nan, dtype=float),
         "slow_mean": np.full(n_bins, np.nan, dtype=float),
         "rate_mean": np.full(n_bins, np.nan, dtype=float),
@@ -4636,6 +8432,12 @@ def _aggregate_distance_defined_trials(
     ss_pct_arr = np.vstack([np.asarray(t["ss_pct_trial"], dtype=float) for t in trials])
     cs_pct_arr = np.vstack([np.asarray(t["cs_pct_trial"], dtype=float) for t in trials])
     plateau_arr = np.vstack([np.asarray(t["plateau_trial"], dtype=float) for t in trials])
+    plateau_trace_events_by_trial = [
+        list(t.get("plateau_trace_events", []))
+        if isinstance(t.get("plateau_trace_events", []), (list, tuple))
+        else []
+        for t in trials
+    ]
     starts = np.asarray([int(t["epoch_start"]) for t in trials], dtype=int)
     ends = np.asarray([int(t["epoch_end"]) for t in trials], dtype=int)
     centers = np.asarray([int(t["center_idx"]) for t in trials], dtype=int)
@@ -4651,6 +8453,19 @@ def _aggregate_distance_defined_trials(
         fr_all_hz = np.where(nonrest_duration_sec > 0, n_spikes_all / nonrest_duration_sec, np.nan)
         fr_ss_hz = np.where(nonrest_duration_sec > 0, n_spikes_ss / nonrest_duration_sec, np.nan)
         fr_cs_hz = np.where(nonrest_duration_sec > 0, n_spikes_cs / nonrest_duration_sec, np.nan)
+
+    def _nanmean_columns(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=float)
+        out = np.full(len(time_rel), np.nan, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != len(time_rel):
+            return out
+        valid = np.isfinite(arr)
+        counts = np.sum(valid, axis=0)
+        if np.any(counts > 0):
+            sums = np.nansum(arr, axis=0)
+            out[counts > 0] = sums[counts > 0] / counts[counts > 0]
+        return out
+
     return {
         "n_trials": n_trials,
         "n_total_trials": n_trials,
@@ -4686,6 +8501,7 @@ def _aggregate_distance_defined_trials(
         "pf_entry_rel": np.asarray([float(t["pf_entry_rel"]) for t in trials], dtype=float),
         "pf_exit_rel": np.asarray([float(t["pf_exit_rel"]) for t in trials], dtype=float),
         "n_plateaus_per_trial": np.asarray([int(t["n_plateaus"]) for t in trials], dtype=int),
+        "plateau_trace_events_by_trial": plateau_trace_events_by_trial,
         "theta_mean": np.nanmean(theta_arr, axis=0),
         "slow_mean": np.nanmean(slow_arr, axis=0),
         "rate_mean": np.nanmean(rate_arr, axis=0),
@@ -4763,13 +8579,14 @@ def _find_distance_defined_trials_iterative(
         if candidate_indices.size == 0:
             continue
         pointer = 0
-        while pointer < n:
-            pos = int(np.searchsorted(candidate_indices, int(pointer), side="left"))
-            while pos < int(candidate_indices.size) and bool(taken[int(candidate_indices[pos])]):
-                pos += 1
-            if pos >= int(candidate_indices.size):
-                break
+        pos = 0
+        n_candidates = int(candidate_indices.size)
+        while pos < n_candidates:
             center_idx = int(candidate_indices[pos])
+            if center_idx < pointer or bool(taken[center_idx]):
+                pos += 1
+                continue
+            candidate_center_idx = int(center_idx)
             detect_start_idx = _find_left(center_idx, left_detect_reach)
             detect_end_idx = _find_right(center_idx, right_detect_reach)
             if (
@@ -4777,23 +8594,25 @@ def _find_distance_defined_trials_iterative(
                 or detect_end_idx is None
                 or detect_end_idx <= detect_start_idx
             ):
-                pointer = center_idx + 1
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
                 continue
             start_idx = _find_left(center_idx, left_trial_reach)
             end_idx = _find_right(center_idx, right_trial_reach)
             if start_idx is None or end_idx is None or end_idx <= start_idx:
-                pointer = center_idx + 1
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
                 continue
-            # Refine the provisional center to the closest-to-peak moving frame
-            # inside the detected trial span, then rebuild the trial bounds around
-            # that refined center.
+
+            # Refine to the closest-to-peak moving frame inside the trial span.
             left_pos = int(np.searchsorted(moving_valid_indices, int(start_idx), side="left"))
             right_pos = int(np.searchsorted(moving_valid_indices, int(end_idx), side="right"))
             trial_candidates = moving_valid_indices[left_pos:right_pos]
             if trial_candidates.size > 0 and np.any(taken[trial_candidates]):
                 trial_candidates = trial_candidates[~taken[trial_candidates]]
             if trial_candidates.size == 0:
-                pointer = center_idx + 1
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
                 continue
             trial_dists = np.asarray(dist_arr[trial_candidates], dtype=float)
             center_idx = int(trial_candidates[int(np.nanargmin(trial_dists))])
@@ -4804,16 +8623,19 @@ def _find_distance_defined_trials_iterative(
                 or detect_end_idx is None
                 or detect_end_idx <= detect_start_idx
             ):
-                pointer = center_idx + 1
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
                 continue
             start_idx = _find_left(center_idx, left_trial_reach)
             end_idx = _find_right(center_idx, right_trial_reach)
             if start_idx is None or end_idx is None or end_idx <= start_idx:
-                pointer = center_idx + 1
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
                 continue
             end_exclusive = int(end_idx + 1)
             if np.any(taken[start_idx:end_exclusive]):
-                pointer = center_idx + 1
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
                 continue
             trials.append(
                 {
@@ -4827,6 +8649,7 @@ def _find_distance_defined_trials_iterative(
             )
             taken[start_idx:end_exclusive] = True
             pointer = int(end_exclusive)
+            pos = int(np.searchsorted(candidate_indices, int(pointer), side="left"))
     if len(trials) > 1:
         trials = sorted(
             trials,
@@ -4871,6 +8694,7 @@ def compute_pf_distance_centered_trial_data_iterative(
     include_long_cb_as_plateau: bool = True,
     cb_plateau_min_duration_ms: float = 100.0,
     plateau_min_duration_ms: float = 100.0,
+    plateau_trace_window_ms: float = 100.0,
     include_resting_plateaus: bool = True,
     analysis_override: dict[str, Any] | None = None,
     distance_mode: str = "cumulative_path",
@@ -4878,6 +8702,9 @@ def compute_pf_distance_centered_trial_data_iterative(
     if analysis_override is None or not bool(analysis_override.get("is_place_cell", False)):
         return None
     distance_mode = _normalize_distance_mode(distance_mode)
+    plateau_trace_window_ms = float(plateau_trace_window_ms)
+    if (not np.isfinite(plateau_trace_window_ms)) or plateau_trace_window_ms < 0:
+        raise ValueError("plateau_trace_window_ms must be a finite number >= 0.")
 
     distance_window_cm_req, distance_window_cm_eff, distance_rel = _build_symmetric_distance_axis(
         distance_window_cm,
@@ -5011,6 +8838,47 @@ def compute_pf_distance_centered_trial_data_iterative(
         frame_rate=float(frame_rate),
         n_frames=int(len(trace)),
     )
+
+    def _extract_plateau_trace_events_for_trial(
+        trial_start: int,
+        trial_end: int,
+    ) -> list[dict[str, np.ndarray]]:
+        events: list[dict[str, np.ndarray]] = []
+        if plateau_starts.size == 0 or plateau_ends.size == 0:
+            return events
+        window_frames = max(0, int(round(float(plateau_trace_window_ms) / 1000.0 * float(frame_rate))))
+        n_plateau = int(min(plateau_starts.size, plateau_ends.size))
+        for p_start_raw, p_end_raw in zip(plateau_starts[:n_plateau], plateau_ends[:n_plateau]):
+            p_start = int(p_start_raw)
+            p_end = int(p_end_raw)
+            if p_end < p_start:
+                p_end = p_start
+            if p_end < int(trial_start) or p_start >= int(trial_end):
+                continue
+            snippet_start = max(0, p_start - window_frames)
+            snippet_end = min(int(len(trace)), p_end + window_frames + 1)
+            if snippet_end <= snippet_start:
+                continue
+            seg = np.asarray(trace[snippet_start:snippet_end], dtype=float)
+            if seg.size == 0 or not np.any(np.isfinite(seg)):
+                continue
+            frame_idx = np.arange(snippet_start, snippet_end, dtype=float)
+            x_ms = (frame_idx - float(p_start)) / float(frame_rate) * 1000.0
+            plateau_end_ms = (float(p_end) + 1.0 - float(p_start)) / float(frame_rate) * 1000.0
+            events.append(
+                {
+                    "x_ms": np.asarray(x_ms, dtype=np.float32),
+                    "trace_spkh": np.asarray(seg, dtype=np.float32),
+                    "plateau_start_ms": 0.0,
+                    "plateau_end_ms": float(plateau_end_ms),
+                    "plateau_trace_window_ms": float(plateau_trace_window_ms),
+                    "plateau_start_frame": int(p_start),
+                    "plateau_end_frame": int(p_end),
+                    "trial_start_frame": int(trial_start),
+                    "trial_end_frame": int(trial_end),
+                }
+            )
+        return events
 
     baseline_start_offset = int(round(2.0 * frame_rate))
     baseline_end_offset = int(round(1.0 * frame_rate))
@@ -5154,6 +9022,7 @@ def compute_pf_distance_centered_trial_data_iterative(
             sums = np.bincount(bin_idx[plateau_mask], weights=np.asarray(plateau_values[plateau_mask], dtype=float), minlength=n_bins)
             valid_counts = counts > 0
             plateau_trial[valid_counts] = sums[valid_counts] / counts[valid_counts]
+        plateau_trace_events = _extract_plateau_trace_events_for_trial(start, end)
 
         nonrest_duration_sec = float(np.sum(occupancy_sec))
         traversal_type = core._classify_traversal_direction_pf_entry_exit(
@@ -5187,6 +9056,7 @@ def compute_pf_distance_centered_trial_data_iterative(
                 "ss_pct_trial": ss_pct_trial,
                 "cs_pct_trial": cs_pct_trial,
                 "plateau_trial": plateau_trial,
+                "plateau_trace_events": plateau_trace_events,
             }
         )
 
@@ -5237,7 +9107,8 @@ def _build_trial_plot_runtime_payload(
     config: PipelineConfig,
 ) -> dict[str, Any]:
     animal_dir = config.data_root / animal_id
-    merged = _load_merged_data(animal_dir)
+    merged = _load_merged_data(animal_dir, config)
+    merged = _clean_behavior_speed_outliers_for_cache(merged, config, animal_id=animal_id)
     spatial_by_idx = _load_spatial_analysis_by_idx(animal_dir)
 
     # Match Figures.ipynb behavior: trial plots use SNR-interpolated traces.
@@ -5776,32 +9647,28 @@ def generate_trial_by_trial_plc_plots(
                     category_counters[category_name]["skipped_or_error"] += 1
                     continue
 
-                components = list(analysis.get("place_field_components", []) or [])
+                components = _sanitize_ranked_pf_components(
+                    list(analysis.get("place_field_components", []) or []),
+                    np.asarray(analysis.get("place_field_mask", []), dtype=bool),
+                    rate_map=np.asarray(analysis.get("rate_map", []), dtype=float),
+                    fallback_peak_rate=float(analysis.get("peak_rate", np.nan)),
+                    max_components=None,
+                )
                 if not components:
-                    fallback_mask = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
-                    if fallback_mask.size > 0 and np.any(fallback_mask):
-                        components = [
-                            {
-                                "mask": fallback_mask,
-                                "size": int(np.sum(fallback_mask)),
-                                "peak_rate": np.nan,
-                            }
-                        ]
-                    else:
-                        summary_rows.append(
-                            {
-                                "category": category_name,
-                                "animal_id": animal_id,
-                                "cell_idx": cell_idx,
-                                "cell_num": cell_idx + 1,
-                                "pf_rank": np.nan,
-                                "status": "skip_no_place_field_mask",
-                                "n_traversals": np.nan,
-                                "message": "no PF components and empty PF mask",
-                            }
-                        )
-                        category_counters[category_name]["skipped_or_error"] += 1
-                        continue
+                    summary_rows.append(
+                        {
+                            "category": category_name,
+                            "animal_id": animal_id,
+                            "cell_idx": cell_idx,
+                            "cell_num": cell_idx + 1,
+                            "pf_rank": np.nan,
+                            "status": "skip_no_place_field_mask",
+                            "n_traversals": np.nan,
+                            "message": "no PF components and empty PF mask",
+                        }
+                    )
+                    category_counters[category_name]["skipped_or_error"] += 1
+                    continue
 
                 # Prepare per-component masks used in reliability-aware traversal analysis,
                 # and contour overlays for trajectory plots (PF1=magenta, PF2=cyan).
@@ -6131,6 +9998,7 @@ def generate_trial_by_trial_plc_plots(
         "cell_num",
         "pf_rank",
         "status",
+        "n_traversals",
         "n_detected_traversals",
         "n_classified_traversals",
         "n_preferred_traversals",
@@ -6326,14 +10194,16 @@ def generate_distance_defined_trial_by_trial_plc_plots(
                     category_counters[category_name]["skipped_or_error"] += 1
                     continue
 
-                components = list(analysis.get("place_field_components", []) or [])
+                components = _sanitize_ranked_pf_components(
+                    list(analysis.get("place_field_components", []) or []),
+                    np.asarray(analysis.get("place_field_mask", []), dtype=bool),
+                    rate_map=np.asarray(analysis.get("rate_map", []), dtype=float),
+                    fallback_peak_rate=float(analysis.get("peak_rate", np.nan)),
+                    max_components=None,
+                )
                 if not components:
-                    fallback_mask = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
-                    if fallback_mask.size > 0 and np.any(fallback_mask):
-                        components = [{"mask": fallback_mask, "peak_rate": analysis.get("peak_rate", np.nan)}]
-                    else:
-                        category_counters[category_name]["skipped_or_error"] += 1
-                        continue
+                    category_counters[category_name]["skipped_or_error"] += 1
+                    continue
 
                 rank_to_eval_mask: dict[int, np.ndarray] = {}
                 trajectory_contours: list[dict[str, Any]] = []
@@ -6847,13 +10717,15 @@ def _compute_component_pf_centered_result(
     if analysis is None or not bool(analysis.get("is_place_cell", False)):
         return None
 
-    components = list(analysis.get("place_field_components", []) or [])
+    components = _sanitize_ranked_pf_components(
+        list(analysis.get("place_field_components", []) or []),
+        np.asarray(analysis.get("place_field_mask", []), dtype=bool),
+        rate_map=np.asarray(analysis.get("rate_map", []), dtype=float),
+        fallback_peak_rate=float(analysis.get("peak_rate", np.nan)),
+        max_components=None,
+    )
     if not components:
-        fallback_mask = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
-        if fallback_mask.size > 0 and np.any(fallback_mask):
-            components = [{"mask": fallback_mask, "peak_rate": analysis.get("peak_rate", np.nan)}]
-        else:
-            return None
+        return None
 
     rank_idx = int(pf_rank) - 1
     if rank_idx < 0 or rank_idx >= len(components):
@@ -6912,7 +10784,6 @@ def _compute_component_pf_centered_result(
         plateaus_dicts=merged.get("plateaus_dicts", None),
         plateau_min_duration_ms=float(config.traversal.plateau_min_duration_ms),
         analysis_override=analysis_override,
-        distance_mode=str(getattr(distance_params, "distance_mode", "cumulative_path")),
     )
     if result is None:
         return None
@@ -6942,13 +10813,15 @@ def compute_distance_centered_component_result(
     if analysis is None or not bool(analysis.get("is_place_cell", False)):
         return None
 
-    components = list(analysis.get("place_field_components", []) or [])
+    components = _sanitize_ranked_pf_components(
+        list(analysis.get("place_field_components", []) or []),
+        np.asarray(analysis.get("place_field_mask", []), dtype=bool),
+        rate_map=np.asarray(analysis.get("rate_map", []), dtype=float),
+        fallback_peak_rate=float(analysis.get("peak_rate", np.nan)),
+        max_components=None,
+    )
     if not components:
-        fallback_mask = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
-        if fallback_mask.size > 0 and np.any(fallback_mask):
-            components = [{"mask": fallback_mask, "peak_rate": analysis.get("peak_rate", np.nan)}]
-        else:
-            return None
+        return None
 
     rank_idx = int(pf_rank) - 1
     if rank_idx < 0 or rank_idx >= len(components):
@@ -7047,6 +10920,9 @@ def compute_distance_defined_component_result_iterative(
     include_resting_plateaus: bool,
     cb_plateau_min_duration_ms: float,
     distance_mode: str,
+    plateau_trace_window_ms: float = 100.0,
+    align_all_pf_components_to_session_compare: bool = True,
+    session_compare_cache_version: str = "v2",
     min_traversals: int | None = None,
     bad_frame_mask: np.ndarray | None = None,
 ) -> dict[str, Any] | None:
@@ -7059,27 +10935,36 @@ def compute_distance_defined_component_result_iterative(
     source = str(pf_source_mode).strip().lower()
     if source not in {"all", "ss"}:
         raise ValueError(f"Unknown pf_source_mode='{pf_source_mode}'. Use 'all' or 'ss'.")
-
     if source == "ss":
         if not bool(analysis.get("is_place_cell_ss", False)):
             return None
-        components = list(analysis.get("ss_place_field_components", []) or [])
-        fallback_mask = np.asarray(analysis.get("ss_place_field_mask", []), dtype=bool)
-        fallback_peak_rate = analysis.get("ss_peak_rate", np.nan)
-        source_rate_map = np.asarray(analysis.get("ss_rate_map", []), dtype=float)
     else:
         if not bool(analysis.get("is_place_cell", False)):
             return None
-        components = list(analysis.get("place_field_components", []) or [])
-        fallback_mask = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
-        fallback_peak_rate = analysis.get("peak_rate", np.nan)
-        source_rate_map = np.asarray(analysis.get("rate_map", []), dtype=float)
 
+    pf_source_info = _resolve_distance_defined_pf_component_source(
+        animal_id=animal_id,
+        cell_idx=int(cell_idx),
+        analysis=analysis,
+        config=config,
+        pf_source_mode=source,
+        align_all_pf_components_to_session_compare=bool(align_all_pf_components_to_session_compare),
+        session_compare_cache_version=str(session_compare_cache_version),
+    )
+    components_raw = list(pf_source_info.get("components_raw", []) or [])
+    fallback_mask = np.asarray(pf_source_info.get("fallback_mask", []), dtype=bool)
+    fallback_peak_rate = pf_source_info.get("fallback_peak_rate", np.nan)
+    source_rate_map = np.asarray(pf_source_info.get("source_rate_map", []), dtype=float)
+
+    components = _sanitize_ranked_pf_components(
+        components_raw,
+        fallback_mask,
+        rate_map=(source_rate_map if source_rate_map.size > 0 else None),
+        fallback_peak_rate=float(fallback_peak_rate),
+        max_components=None,
+    )
     if not components:
-        if fallback_mask.size > 0 and np.any(fallback_mask):
-            components = [{"mask": fallback_mask, "peak_rate": fallback_peak_rate}]
-        else:
-            return None
+        return None
 
     rank_idx = int(pf_rank) - 1
     if rank_idx < 0 or rank_idx >= len(components):
@@ -7139,6 +11024,7 @@ def compute_distance_defined_component_result_iterative(
         include_resting_plateaus=bool(include_resting_plateaus),
         cb_plateau_min_duration_ms=float(cb_plateau_min_duration_ms),
         plateau_min_duration_ms=float(config.traversal.plateau_min_duration_ms),
+        plateau_trace_window_ms=float(plateau_trace_window_ms),
         analysis_override=analysis_override,
         distance_mode=str(distance_mode),
     )
@@ -7151,6 +11037,457 @@ def compute_distance_defined_component_result_iterative(
     result["pf_component_size_bins"] = int(np.sum(comp_mask))
     result["pf_component_eval_size_bins"] = int(np.sum(eval_mask))
     result["pf_source"] = ("ss" if source == "ss" else "all")
+    result["pf_component_source_name"] = str(pf_source_info.get("source_name", "unknown"))
+    return result
+
+
+def _empty_time_defined_direction_result(
+    time_rel: np.ndarray,
+    *,
+    n_total_trials: int = 0,
+) -> dict[str, Any]:
+    n_time = int(len(time_rel))
+    empty = np.full((0, n_time), np.nan, dtype=float)
+    return {
+        "n_trials": 0,
+        "n_total_trials": int(n_total_trials),
+        "n_reliable_trials": 0,
+        "reliability": np.nan,
+        "traversal_types": [],
+        "trial_data": {
+            "epoch_start_frames": np.array([], dtype=int),
+            "epoch_end_frames": np.array([], dtype=int),
+            "center_frames": np.array([], dtype=int),
+            "center_vicinity_cm": np.array([], dtype=float),
+            "epoch_start_sec": np.array([], dtype=float),
+            "epoch_end_sec": np.array([], dtype=float),
+            "duration_sec": np.array([], dtype=float),
+            "nonrest_duration_sec": np.array([], dtype=float),
+            "n_spikes_all": np.array([], dtype=int),
+            "n_spikes_ss": np.array([], dtype=int),
+            "n_spikes_cs": np.array([], dtype=int),
+            "fr_all_hz": np.array([], dtype=float),
+            "fr_ss_hz": np.array([], dtype=float),
+            "fr_cs_hz": np.array([], dtype=float),
+            "traversal_types": np.array([], dtype=object),
+            "session_idx": np.array([], dtype=int),
+        },
+        "theta_stack": empty.copy(),
+        "slow_stack": empty.copy(),
+        "rate_stack": empty.copy(),
+        "ss_rate_stack": empty.copy(),
+        "cs_rate_stack": empty.copy(),
+        "ss_pct_stack": empty.copy(),
+        "cs_pct_stack": empty.copy(),
+        "plateau_stack": np.zeros((0, n_time), dtype=float),
+        "pf_entry_rel": np.array([], dtype=float),
+        "pf_exit_rel": np.array([], dtype=float),
+        "n_plateaus_per_trial": np.array([], dtype=int),
+        "theta_mean": np.full(n_time, np.nan, dtype=float),
+        "slow_mean": np.full(n_time, np.nan, dtype=float),
+        "rate_mean": np.full(n_time, np.nan, dtype=float),
+        "ss_rate_mean": np.full(n_time, np.nan, dtype=float),
+        "cs_rate_mean": np.full(n_time, np.nan, dtype=float),
+        "ss_pct_mean": np.full(n_time, np.nan, dtype=float),
+        "cs_pct_mean": np.full(n_time, np.nan, dtype=float),
+    }
+
+
+def _nanmean_columns(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim != 2:
+        return np.array([], dtype=float)
+    out = np.full(int(arr.shape[1]), np.nan, dtype=float)
+    valid = np.isfinite(arr)
+    counts = np.sum(valid, axis=0)
+    if np.any(counts > 0):
+        sums = np.nansum(arr, axis=0)
+        out[counts > 0] = sums[counts > 0] / counts[counts > 0]
+    return out
+
+
+def _aggregate_time_defined_trials(
+    trials: list[dict[str, Any]],
+    time_rel: np.ndarray,
+    frame_rate: float,
+) -> dict[str, Any]:
+    if len(trials) == 0:
+        return _empty_time_defined_direction_result(time_rel, n_total_trials=0)
+
+    n_trials = int(len(trials))
+    n_reliable = int(sum(int(t.get("n_spikes_all", 0)) > 0 for t in trials))
+    theta_arr = np.vstack([np.asarray(t["theta_trial"], dtype=float) for t in trials])
+    slow_arr = np.vstack([np.asarray(t["slow_trial"], dtype=float) for t in trials])
+    rate_arr = np.vstack([np.asarray(t["rate_trial"], dtype=float) for t in trials])
+    ss_rate_arr = np.vstack([np.asarray(t["ss_rate_trial"], dtype=float) for t in trials])
+    cs_rate_arr = np.vstack([np.asarray(t["cs_rate_trial"], dtype=float) for t in trials])
+    ss_pct_arr = np.vstack([np.asarray(t["ss_pct_trial"], dtype=float) for t in trials])
+    cs_pct_arr = np.vstack([np.asarray(t["cs_pct_trial"], dtype=float) for t in trials])
+    plateau_arr = np.vstack([np.asarray(t["plateau_trial"], dtype=float) for t in trials])
+    starts = np.asarray([int(t["epoch_start"]) for t in trials], dtype=int)
+    ends = np.asarray([int(t["epoch_end"]) for t in trials], dtype=int)
+    centers = np.asarray([int(t["center_idx"]) for t in trials], dtype=int)
+    vicinity = np.asarray([float(t.get("center_vicinity_cm", np.nan)) for t in trials], dtype=float)
+    session_idx = np.asarray([int(t.get("session_idx", 0)) for t in trials], dtype=int)
+    n_spikes_all = np.asarray([int(t.get("n_spikes_all", 0)) for t in trials], dtype=int)
+    n_spikes_ss = np.asarray([int(t.get("n_spikes_ss", 0)) for t in trials], dtype=int)
+    n_spikes_cs = np.asarray([int(t.get("n_spikes_cs", 0)) for t in trials], dtype=int)
+    nonrest_duration_sec = np.asarray([float(t.get("nonrest_duration_sec", np.nan)) for t in trials], dtype=float)
+    traversal_types = np.asarray([str(t.get("traversal_type", "unknown")) for t in trials], dtype=object)
+    duration_sec = (ends - starts).astype(float) / float(frame_rate)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fr_all_hz = np.where(nonrest_duration_sec > 0, n_spikes_all / nonrest_duration_sec, np.nan)
+        fr_ss_hz = np.where(nonrest_duration_sec > 0, n_spikes_ss / nonrest_duration_sec, np.nan)
+        fr_cs_hz = np.where(nonrest_duration_sec > 0, n_spikes_cs / nonrest_duration_sec, np.nan)
+    return {
+        "n_trials": n_trials,
+        "n_total_trials": n_trials,
+        "n_reliable_trials": n_reliable,
+        "reliability": float(n_reliable) / float(n_trials) if n_trials > 0 else np.nan,
+        "traversal_types": traversal_types.tolist(),
+        "trial_data": {
+            "epoch_start_frames": starts,
+            "epoch_end_frames": ends,
+            "center_frames": centers,
+            "center_vicinity_cm": vicinity,
+            "epoch_start_sec": starts.astype(float) / float(frame_rate),
+            "epoch_end_sec": ends.astype(float) / float(frame_rate),
+            "duration_sec": duration_sec,
+            "nonrest_duration_sec": nonrest_duration_sec,
+            "n_spikes_all": n_spikes_all,
+            "n_spikes_ss": n_spikes_ss,
+            "n_spikes_cs": n_spikes_cs,
+            "fr_all_hz": fr_all_hz,
+            "fr_ss_hz": fr_ss_hz,
+            "fr_cs_hz": fr_cs_hz,
+            "traversal_types": traversal_types,
+            "session_idx": session_idx,
+        },
+        "theta_stack": theta_arr,
+        "slow_stack": slow_arr,
+        "rate_stack": rate_arr,
+        "ss_rate_stack": ss_rate_arr,
+        "cs_rate_stack": cs_rate_arr,
+        "ss_pct_stack": ss_pct_arr,
+        "cs_pct_stack": cs_pct_arr,
+        "plateau_stack": plateau_arr,
+        "pf_entry_rel": np.asarray([float(t.get("pf_entry_rel", np.nan)) for t in trials], dtype=float),
+        "pf_exit_rel": np.asarray([float(t.get("pf_exit_rel", np.nan)) for t in trials], dtype=float),
+        "n_plateaus_per_trial": np.asarray([int(t.get("n_plateaus", 0)) for t in trials], dtype=int),
+        "theta_mean": _nanmean_columns(theta_arr),
+        "slow_mean": _nanmean_columns(slow_arr),
+        "rate_mean": _nanmean_columns(rate_arr),
+        "ss_rate_mean": _nanmean_columns(ss_rate_arr),
+        "cs_rate_mean": _nanmean_columns(cs_rate_arr),
+        "ss_pct_mean": _nanmean_columns(ss_pct_arr),
+        "cs_pct_mean": _nanmean_columns(cs_pct_arr),
+    }
+
+
+def _build_time_defined_result_from_distance_result(
+    distance_result: dict[str, Any],
+    *,
+    cell_idx: int,
+    traces: np.ndarray,
+    vms: np.ndarray,
+    speed: np.ndarray,
+    all_spikes: list[np.ndarray] | np.ndarray,
+    refined_SS: list[np.ndarray] | np.ndarray,
+    all_CS_spikes: list[np.ndarray] | np.ndarray,
+    frame_rate: float,
+    time_window_sec: float,
+    theta_freqs: tuple[float, float],
+    slow_freqs: float,
+    firing_rate_bin_ms: float,
+    firing_rate_smooth_ms: float,
+    subtract_pre_traversal_baseline: bool,
+    resting_speed_threshold: float,
+    include_resting_plateaus: bool,
+    plateaus_dicts: list[dict[str, Any] | None] | dict[str, Any] | None,
+    complex_bursts_dicts: list[dict[str, Any] | None] | dict[str, Any] | None,
+    include_long_cb_as_plateau: bool,
+    cb_plateau_min_duration_ms: float,
+    bad_frame_mask: np.ndarray | None,
+    min_traversals: int,
+) -> dict[str, Any] | None:
+    if distance_result is None:
+        return None
+    time_window_sec = float(time_window_sec)
+    if (not np.isfinite(time_window_sec)) or time_window_sec <= 0:
+        raise ValueError("time_window_sec must be a finite number > 0.")
+    frame_rate = float(frame_rate)
+    window_frames = max(1, int(round(time_window_sec * frame_rate)))
+    time_rel = np.arange(-window_frames, window_frames + 1, dtype=float) / frame_rate
+    n_time = int(time_rel.size)
+
+    trace = np.asarray(traces[cell_idx], dtype=float)
+    trace = interpolate_nan_segment(trace)
+    theta_vm = bandpass_filter(trace, theta_freqs[0], theta_freqs[1], frame_rate, order=5)
+    slow_vm = lowpass_filter(trace, slow_freqs, frame_rate, order=5)
+    theta_amp = np.abs(signal.hilbert(theta_vm))
+    vms_cell = np.asarray(vms[cell_idx], dtype=float)
+    n_frames = int(trace.size)
+
+    bad_mask = None
+    if bad_frame_mask is not None:
+        bad_mask = np.asarray(bad_frame_mask, dtype=bool)
+        if bad_mask.ndim != 1 or bad_mask.size != n_frames:
+            bad_mask = None
+
+    def _spike_indices(src: Any) -> np.ndarray:
+        if isinstance(src, (list, tuple)):
+            idx = np.asarray(src[cell_idx], dtype=int) if cell_idx < len(src) else np.array([], dtype=int)
+        else:
+            arr = np.asarray(src, dtype=object)
+            idx = np.asarray(arr[cell_idx], dtype=int) if arr.ndim > 0 and cell_idx < arr.shape[0] else np.array([], dtype=int)
+        idx = np.unique(idx[(idx >= 0) & (idx < n_frames)])
+        if bad_mask is not None and idx.size > 0:
+            idx = idx[~bad_mask[idx]]
+        return idx
+
+    all_spike_indices = _spike_indices(all_spikes)
+    ss_indices = _spike_indices(refined_SS)
+    cs_indices = _spike_indices(all_CS_spikes)
+    ifr_all = _compute_ifr_from_spike_indices(n_frames, all_spike_indices, frame_rate, firing_rate_bin_ms, firing_rate_smooth_ms)
+    ifr_ss = _compute_ifr_from_spike_indices(n_frames, ss_indices, frame_rate, firing_rate_bin_ms, firing_rate_smooth_ms)
+    ifr_cs = _compute_ifr_from_spike_indices(n_frames, cs_indices, frame_rate, firing_rate_bin_ms, firing_rate_smooth_ms)
+    plateau_starts, plateau_ends = _build_plateau_intervals_for_cell(
+        cell_idx=int(cell_idx),
+        plateaus_dicts=plateaus_dicts,
+        complex_bursts_dicts=complex_bursts_dicts,
+        include_long_cb_as_plateau=bool(include_long_cb_as_plateau),
+        cb_plateau_min_duration_ms=float(cb_plateau_min_duration_ms),
+        frame_rate=float(frame_rate),
+        n_frames=int(n_frames),
+    )
+
+    all_dir = distance_result.get("all", {})
+    trial_data = all_dir.get("trial_data", {}) if isinstance(all_dir, dict) else {}
+    starts = np.asarray(trial_data.get("epoch_start_frames", []), dtype=int)
+    ends = np.asarray(trial_data.get("epoch_end_frames", []), dtype=int)
+    centers = np.asarray(trial_data.get("center_frames", []), dtype=int)
+    traversal_types = np.asarray(trial_data.get("traversal_types", []), dtype=object)
+    session_idx = np.asarray(trial_data.get("session_idx", []), dtype=int)
+    vicinity = np.asarray(trial_data.get("center_vicinity_cm", []), dtype=float)
+    nonrest_duration_sec = np.asarray(trial_data.get("nonrest_duration_sec", []), dtype=float)
+    n_spikes_all = np.asarray(trial_data.get("n_spikes_all", []), dtype=int)
+    n_spikes_ss = np.asarray(trial_data.get("n_spikes_ss", []), dtype=int)
+    n_spikes_cs = np.asarray(trial_data.get("n_spikes_cs", []), dtype=int)
+    n_trials_raw = min(starts.size, ends.size, centers.size)
+    if n_trials_raw <= 0:
+        return None
+
+    n_plateaus_distance = np.asarray(all_dir.get("n_plateaus_per_trial", []), dtype=int)
+    baseline_start_offset = int(round(2.0 * frame_rate))
+    baseline_end_offset = int(round(1.0 * frame_rate))
+    trial_payloads: list[dict[str, Any]] = []
+
+    for i in range(n_trials_raw):
+        epoch_start = int(starts[i])
+        epoch_end = int(ends[i])
+        center_idx = int(centers[i])
+        if epoch_end <= epoch_start or center_idx < 0 or center_idx >= n_frames:
+            continue
+
+        base_start = max(epoch_start - baseline_start_offset, 0)
+        base_end = max(epoch_start - baseline_end_offset, 0)
+        baseline_theta = np.nanmean(theta_amp[base_start:base_end]) if base_end > base_start else np.nan
+        baseline_slow = np.nanmean(slow_vm[base_start:base_end]) if base_end > base_start else np.nan
+
+        src_start = center_idx - window_frames
+        src_end = center_idx + window_frames + 1
+        read_start = max(src_start, 0)
+        read_end = min(src_end, n_frames)
+        if read_end <= read_start:
+            continue
+        write_start = read_start - src_start
+        write_end = write_start + (read_end - read_start)
+        valid_seg = np.ones(read_end - read_start, dtype=bool)
+        if bad_mask is not None:
+            valid_seg &= ~bad_mask[read_start:read_end]
+        speed_seg = np.asarray(speed[read_start:read_end], dtype=float)
+        if not bool(include_resting_plateaus):
+            valid_plateau_seg = valid_seg & np.isfinite(speed_seg) & (speed_seg >= float(resting_speed_threshold))
+        else:
+            valid_plateau_seg = valid_seg
+
+        def _fill_trace(values: np.ndarray | None, *, baseline: float | None = None) -> np.ndarray:
+            out = np.full(n_time, np.nan, dtype=float)
+            if values is None:
+                return out
+            seg = np.asarray(values[read_start:read_end], dtype=float).copy()
+            if baseline is not None and np.isfinite(float(baseline)):
+                seg = seg - float(baseline)
+            seg[~valid_seg] = np.nan
+            out[write_start:write_end] = seg
+            return out
+
+        theta_trial = _fill_trace(theta_amp, baseline=(baseline_theta if bool(subtract_pre_traversal_baseline) else None))
+        slow_trial = _fill_trace(slow_vm, baseline=(baseline_slow if bool(subtract_pre_traversal_baseline) else None))
+        rate_trial = _fill_trace(ifr_all)
+        ss_rate_trial = _fill_trace(ifr_ss)
+        cs_rate_trial = _fill_trace(ifr_cs)
+        denom = ss_rate_trial + cs_rate_trial
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ss_pct_trial = np.where(np.isfinite(denom) & (denom > 0), 100.0 * ss_rate_trial / denom, np.nan)
+            cs_pct_trial = np.where(np.isfinite(denom) & (denom > 0), 100.0 * cs_rate_trial / denom, np.nan)
+
+        plateau_trial = np.zeros(n_time, dtype=float)
+        has_plateau = bool(i < n_plateaus_distance.size and int(n_plateaus_distance[i]) > 0)
+        if has_plateau:
+            plateau_values = np.asarray(vms_cell[read_start:read_end], dtype=float).copy()
+            if bool(subtract_pre_traversal_baseline) and np.isfinite(baseline_slow):
+                plateau_values = plateau_values - float(baseline_slow)
+            plateau_values[~valid_plateau_seg] = 0.0
+            plateau_presence = np.zeros(read_end - read_start, dtype=bool)
+            for ps, pe in zip(plateau_starts, plateau_ends):
+                overlap_start = max(int(ps), read_start, epoch_start)
+                overlap_end = min(int(pe) + 1, read_end, epoch_end)
+                if overlap_start < overlap_end:
+                    plateau_presence[(overlap_start - read_start):(overlap_end - read_start)] = True
+            plateau_presence &= valid_plateau_seg
+            if np.any(plateau_presence):
+                plateau_seg_out = plateau_trial[write_start:write_end].copy()
+                plateau_seg_out[plateau_presence] = plateau_values[plateau_presence]
+                plateau_trial[write_start:write_end] = plateau_seg_out
+
+        trial_payloads.append(
+            {
+                "epoch_start": epoch_start,
+                "epoch_end": epoch_end,
+                "center_idx": center_idx,
+                "center_vicinity_cm": float(vicinity[i]) if i < vicinity.size else np.nan,
+                "session_idx": int(session_idx[i]) if i < session_idx.size else 0,
+                "traversal_type": str(traversal_types[i]) if i < traversal_types.size else "unknown",
+                "pf_entry_rel": float((epoch_start - center_idx) / frame_rate),
+                "pf_exit_rel": float((epoch_end - center_idx) / frame_rate),
+                "n_plateaus": int(has_plateau),
+                "n_spikes_all": int(n_spikes_all[i]) if i < n_spikes_all.size else 0,
+                "n_spikes_ss": int(n_spikes_ss[i]) if i < n_spikes_ss.size else 0,
+                "n_spikes_cs": int(n_spikes_cs[i]) if i < n_spikes_cs.size else 0,
+                "nonrest_duration_sec": float(nonrest_duration_sec[i]) if i < nonrest_duration_sec.size else np.nan,
+                "theta_trial": theta_trial,
+                "slow_trial": slow_trial,
+                "rate_trial": rate_trial,
+                "ss_rate_trial": ss_rate_trial,
+                "cs_rate_trial": cs_rate_trial,
+                "ss_pct_trial": ss_pct_trial,
+                "cs_pct_trial": cs_pct_trial,
+                "plateau_trial": plateau_trial,
+            }
+        )
+
+    if len(trial_payloads) < int(min_traversals):
+        return None
+
+    all_result = _aggregate_time_defined_trials(trial_payloads, time_rel, frame_rate=float(frame_rate))
+    cw_result = _aggregate_time_defined_trials(
+        [t for t in trial_payloads if str(t.get("traversal_type", "")) == "cw"],
+        time_rel,
+        frame_rate=float(frame_rate),
+    )
+    ccw_result = _aggregate_time_defined_trials(
+        [t for t in trial_payloads if str(t.get("traversal_type", "")) == "ccw"],
+        time_rel,
+        frame_rate=float(frame_rate),
+    )
+    out = dict(distance_result)
+    out.pop("distance_rel", None)
+    out["time_rel"] = time_rel
+    out["time_window_sec"] = float(time_window_sec)
+    out["time_bin_sec"] = float(1.0 / frame_rate)
+    out["center_by_pf_position"] = True
+    out["all"] = all_result
+    out["cw"] = cw_result
+    out["ccw"] = ccw_result
+    return out
+
+
+def compute_time_defined_component_result_iterative(
+    animal_id: str,
+    cell_idx: int,
+    pf_rank: int,
+    runtime: dict[str, Any],
+    config: PipelineConfig,
+    distance_params: PFDistanceCenteredParams,
+    dilation_bins: int,
+    dilation_shape: str,
+    *,
+    time_window_sec: float,
+    distance_window_cm: float,
+    detection_window_cm: float,
+    distance_bin_cm: float,
+    center_vicinity_min_cm: int,
+    center_vicinity_max_cm: int,
+    moving_speed_threshold: float,
+    resting_speed_threshold: float,
+    exclude_trials_with_bad_frames: bool,
+    pf_source_mode: str,
+    include_long_cb_as_plateau: bool,
+    include_resting_plateaus: bool,
+    cb_plateau_min_duration_ms: float,
+    distance_mode: str,
+    align_all_pf_components_to_session_compare: bool = True,
+    session_compare_cache_version: str = "v2",
+    min_traversals: int | None = None,
+    bad_frame_mask: np.ndarray | None = None,
+) -> dict[str, Any] | None:
+    distance_result = compute_distance_defined_component_result_iterative(
+        animal_id=animal_id,
+        cell_idx=cell_idx,
+        pf_rank=pf_rank,
+        runtime=runtime,
+        config=config,
+        distance_params=distance_params,
+        dilation_bins=dilation_bins,
+        dilation_shape=dilation_shape,
+        distance_window_cm=distance_window_cm,
+        detection_window_cm=detection_window_cm,
+        distance_bin_cm=distance_bin_cm,
+        center_vicinity_min_cm=center_vicinity_min_cm,
+        center_vicinity_max_cm=center_vicinity_max_cm,
+        moving_speed_threshold=moving_speed_threshold,
+        resting_speed_threshold=resting_speed_threshold,
+        exclude_trials_with_bad_frames=exclude_trials_with_bad_frames,
+        pf_source_mode=pf_source_mode,
+        include_long_cb_as_plateau=include_long_cb_as_plateau,
+        include_resting_plateaus=include_resting_plateaus,
+        cb_plateau_min_duration_ms=cb_plateau_min_duration_ms,
+        distance_mode=distance_mode,
+        plateau_trace_window_ms=float(getattr(distance_params, "plateau_trace_window_ms", 100.0)),
+        align_all_pf_components_to_session_compare=align_all_pf_components_to_session_compare,
+        session_compare_cache_version=session_compare_cache_version,
+        min_traversals=min_traversals,
+        bad_frame_mask=bad_frame_mask,
+    )
+    if distance_result is None:
+        return None
+    merged = runtime["merged"]
+    result = _build_time_defined_result_from_distance_result(
+        distance_result,
+        cell_idx=int(cell_idx),
+        traces=runtime["traces"],
+        vms=runtime["vms"],
+        speed=np.asarray(merged["speed"], dtype=float),
+        all_spikes=merged.get("all_spikes", merged["spikes"]),
+        refined_SS=merged.get("refined_SS", [np.array([], dtype=int) for _ in merged["spikes"]]),
+        all_CS_spikes=merged.get("all_CS_spikes", [np.array([], dtype=int) for _ in merged["spikes"]]),
+        frame_rate=float(merged["frame_rate"]),
+        time_window_sec=float(time_window_sec),
+        theta_freqs=tuple(config.analysis.theta_freqs),
+        slow_freqs=float(config.analysis.slow_freqs),
+        firing_rate_bin_ms=float(config.traversal.firing_rate_bin_ms),
+        firing_rate_smooth_ms=float(config.traversal.firing_rate_smooth_ms),
+        subtract_pre_traversal_baseline=bool(distance_params.subtract_pre_traversal_baseline),
+        resting_speed_threshold=float(resting_speed_threshold),
+        include_resting_plateaus=bool(include_resting_plateaus),
+        plateaus_dicts=merged.get("plateaus_dicts", None),
+        complex_bursts_dicts=merged.get("complex_bursts_dicts", None),
+        include_long_cb_as_plateau=bool(include_long_cb_as_plateau),
+        cb_plateau_min_duration_ms=float(cb_plateau_min_duration_ms),
+        bad_frame_mask=bad_frame_mask,
+        min_traversals=int(distance_params.min_traversals) if min_traversals is None else int(min_traversals),
+    )
     return result
 
 
@@ -7183,8 +11520,14 @@ def generate_distance_defined_trials_and_dataset(
     include_long_cb_as_plateau: bool | None = None,
     include_resting_plateaus: bool = True,
     cb_plateau_min_duration_ms: float | None = None,
+    plateau_trace_window_ms: float | None = None,
+    align_all_pf_components_to_session_compare: bool = True,
+    session_compare_cache_version: str = "v2",
+    max_trials_per_component_plot: int | None = 120,
+    print_component_progress: bool = True,
 ) -> dict[str, Any]:
     import pandas as pd
+    import time
     from scipy.ndimage import binary_dilation
 
     if distance_params is None:
@@ -7193,6 +11536,8 @@ def generate_distance_defined_trials_and_dataset(
         include_long_cb_as_plateau = bool(getattr(distance_params, "include_long_cb_as_plateau", True))
     if cb_plateau_min_duration_ms is None:
         cb_plateau_min_duration_ms = float(getattr(distance_params, "cb_plateau_min_duration_ms", 100.0))
+    if plateau_trace_window_ms is None:
+        plateau_trace_window_ms = float(getattr(distance_params, "plateau_trace_window_ms", 100.0))
     if moving_speed_threshold is None:
         moving_speed_threshold = float(config.analysis.speed_threshold)
     if distance_mode is None:
@@ -7225,6 +11570,9 @@ def generate_distance_defined_trials_and_dataset(
         raise ValueError("Invalid center vicinity range.")
     if (not np.isfinite(float(cb_plateau_min_duration_ms))) or float(cb_plateau_min_duration_ms) <= 0:
         raise ValueError("cb_plateau_min_duration_ms must be a finite number > 0.")
+    plateau_trace_window_ms = float(plateau_trace_window_ms)
+    if (not np.isfinite(plateau_trace_window_ms)) or plateau_trace_window_ms < 0:
+        raise ValueError("plateau_trace_window_ms must be a finite number >= 0.")
 
     if figure_save_folder is None:
         figure_root = config.figures_root / "CKII_pooled"
@@ -7275,6 +11623,12 @@ def generate_distance_defined_trials_and_dataset(
     trial_max_plot_duration_s = float(max_plot_trial_duration_s)
     if not np.isfinite(trial_max_plot_duration_s) or trial_max_plot_duration_s <= 0:
         raise ValueError("max_plot_trial_duration_s must be > 0.")
+    if max_trials_per_component_plot is None:
+        max_trials_per_component_plot_eff = None
+    else:
+        max_trials_per_component_plot_eff = int(max_trials_per_component_plot)
+        if max_trials_per_component_plot_eff <= 0:
+            raise ValueError("max_trials_per_component_plot must be None or a positive integer.")
     trial_theta_freqs = tuple(config.analysis.theta_freqs)
     trial_slow_freqs = float(config.analysis.slow_freqs)
     trial_session_indices = tuple(config.traversal.session_indices)
@@ -7299,6 +11653,7 @@ def generate_distance_defined_trials_and_dataset(
             "include_long_cb_as_plateau": bool(include_long_cb_as_plateau),
             "include_resting_plateaus": bool(include_resting_plateaus),
             "cb_plateau_min_duration_ms": float(cb_plateau_min_duration_ms),
+            "plateau_trace_window_ms": float(plateau_trace_window_ms),
             "center_vicinity_min_cm": int(center_vicinity_min_cm),
             "center_vicinity_max_cm": int(center_vicinity_max_cm),
             "moving_speed_threshold": float(moving_speed_threshold),
@@ -7312,6 +11667,10 @@ def generate_distance_defined_trials_and_dataset(
             "smooth_window_cm": float(distance_params.smooth_window),
             "traversal_merge_gap_s": float(getattr(config.traversal, "traversal_merge_gap_s", 0.0)),
             "session_indices": tuple(config.traversal.session_indices),
+            "align_all_pf_components_to_session_compare": bool(align_all_pf_components_to_session_compare),
+            "session_compare_cache_version": str(session_compare_cache_version),
+            "max_trials_per_component_plot": max_trials_per_component_plot_eff,
+            "print_component_progress": bool(print_component_progress),
         }
     }
 
@@ -7347,6 +11706,25 @@ def generate_distance_defined_trials_and_dataset(
             }
         )
 
+    def _append_distance_dataset_entry(
+        *,
+        category_payload: dict[int, dict[str, Any]],
+        rank_int: int,
+        animal_id: str,
+        cell_idx: int,
+        result: dict[str, Any],
+        pf_source_mode: str,
+    ) -> None:
+        category_payload[int(rank_int)]["entries"].append(
+            {
+                "session": str(animal_id),
+                "cell_idx": int(cell_idx),
+                "pf_rank": int(rank_int),
+                "pf_source": str(result.get("pf_source", pf_source_mode)),
+                "data": result,
+            }
+        )
+
     def _append_skip_rows_for_all_ranks(
         *,
         category_name: str,
@@ -7373,6 +11751,7 @@ def generate_distance_defined_trials_and_dataset(
             "attempted_cells": 0,
             "attempted_components": 0,
             "saved": 0,
+            "plots_skipped_many_trials": 0,
             "skipped_or_error": 0,
         }
         category_payload: dict[int, dict[str, Any]] = {}
@@ -7446,12 +11825,6 @@ def generate_distance_defined_trials_and_dataset(
                             message="nonPLC category requires is_place_cell_ss=True (non all-spike PLC + SS PLC).",
                         )
                         continue
-                    components = list(analysis.get("ss_place_field_components", []) or [])
-                    fallback_mask = np.asarray(analysis.get("ss_place_field_mask", []), dtype=bool)
-                    fallback_peak = analysis.get("ss_peak_rate", np.nan)
-                    missing_pf_message = (
-                        "No non-empty ss_place_field_components and no non-empty fallback ss_place_field_mask."
-                    )
                 else:
                     if not bool(analysis.get("is_place_cell", False)):
                         category_counters[cat]["skipped_or_error"] += 1
@@ -7465,28 +11838,41 @@ def generate_distance_defined_trials_and_dataset(
                             message="Cell missing in runtime spatial analysis or is_place_cell=False.",
                         )
                         continue
-                    components = list(analysis.get("place_field_components", []) or [])
-                    fallback_mask = np.asarray(analysis.get("place_field_mask", []), dtype=bool)
-                    fallback_peak = analysis.get("peak_rate", np.nan)
-                    missing_pf_message = (
-                        "No non-empty place_field_components and no non-empty fallback place_field_mask."
-                    )
 
+                pf_source_info = _resolve_distance_defined_pf_component_source(
+                    animal_id=animal_id,
+                    cell_idx=int(cell_idx),
+                    analysis=analysis,
+                    config=config,
+                    pf_source_mode=pf_source_mode,
+                    align_all_pf_components_to_session_compare=bool(align_all_pf_components_to_session_compare),
+                    session_compare_cache_version=str(session_compare_cache_version),
+                )
+                components_raw = list(pf_source_info.get("components_raw", []) or [])
+                fallback_mask = np.asarray(pf_source_info.get("fallback_mask", []), dtype=bool)
+                fallback_peak = pf_source_info.get("fallback_peak_rate", np.nan)
+                source_rate_map = np.asarray(pf_source_info.get("source_rate_map", []), dtype=float)
+                missing_pf_message = str(pf_source_info.get("missing_pf_message", "No place-field components."))
+
+                components = _sanitize_ranked_pf_components(
+                    components_raw,
+                    fallback_mask,
+                    rate_map=(source_rate_map if source_rate_map.size > 0 else None),
+                    fallback_peak_rate=float(fallback_peak),
+                    max_components=None,
+                )
                 if not components:
-                    if fallback_mask.size > 0 and np.any(fallback_mask):
-                        components = [{"mask": fallback_mask, "peak_rate": fallback_peak}]
-                    else:
-                        category_counters[cat]["skipped_or_error"] += 1
-                        for pf_rank in pf_ranks:
-                            category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
-                        _append_skip_rows_for_all_ranks(
-                            category_name=cat,
-                            animal_id=animal_id,
-                            cell_idx=cell_idx,
-                            status="skip_no_place_field_components",
-                            message=missing_pf_message,
-                        )
-                        continue
+                    category_counters[cat]["skipped_or_error"] += 1
+                    for pf_rank in pf_ranks:
+                        category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+                    _append_skip_rows_for_all_ranks(
+                        category_name=cat,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        status="skip_no_place_field_components",
+                        message=missing_pf_message,
+                    )
+                    continue
 
                 rank_to_eval_mask: dict[int, np.ndarray] = {}
                 trajectory_contours: list[dict[str, Any]] = []
@@ -7603,6 +11989,13 @@ def generate_distance_defined_trials_and_dataset(
                         )
                         continue
 
+                    if print_component_progress:
+                        print(
+                            f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                            "computing trials...",
+                            flush=True,
+                        )
+                    component_start = time.perf_counter()
                     result = compute_distance_defined_component_result_iterative(
                         animal_id=animal_id,
                         cell_idx=cell_idx,
@@ -7624,11 +12017,21 @@ def generate_distance_defined_trials_and_dataset(
                         include_long_cb_as_plateau=bool(include_long_cb_as_plateau),
                         include_resting_plateaus=bool(include_resting_plateaus),
                         cb_plateau_min_duration_ms=float(cb_plateau_min_duration_ms),
+                        plateau_trace_window_ms=float(plateau_trace_window_ms),
                         distance_mode=str(distance_mode),
+                        align_all_pf_components_to_session_compare=bool(align_all_pf_components_to_session_compare),
+                        session_compare_cache_version=str(session_compare_cache_version),
                         min_traversals=1,
                         bad_frame_mask=traversal_bad_mask,
                     )
+                    compute_elapsed = time.perf_counter() - component_start
                     if result is None:
+                        if print_component_progress:
+                            print(
+                                f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                                f"no valid result ({compute_elapsed:.1f}s).",
+                                flush=True,
+                            )
                         category_payload[rank_int]["n_skipped"] = int(category_payload[rank_int]["n_skipped"]) + 1
                         category_counters[cat]["skipped_or_error"] += 1
                         _append_summary_row(
@@ -7684,7 +12087,839 @@ def generate_distance_defined_trials_and_dataset(
                     traversal_types = list(np.asarray(trial_data.get("traversal_types", []), dtype=object))
                     n_trials = int(epoch_start_frames.size)
                     traversal_epochs = list(zip(epoch_start_frames.tolist(), epoch_end_frames.tolist()))
+                    if print_component_progress:
+                        print(
+                            f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                            f"computed {n_trials} trials in {compute_elapsed:.1f}s.",
+                            flush=True,
+                        )
                     place_field_mask = result.get("place_field_mask", rank_to_eval_mask.get(rank_int))
+                    pf_bins = result.get("pf_bins", None)
+                    pf_peak_xy = result.get("pf_peak_xy", None)
+                    if place_field_mask is None or pf_bins is None:
+                        category_payload[rank_int]["n_skipped"] = int(category_payload[rank_int]["n_skipped"]) + 1
+                        category_counters[cat]["skipped_or_error"] += 1
+                        _append_summary_row(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            pf_rank=rank_int,
+                            status="skip_missing_pf_geometry",
+                            message="Missing place_field_mask and/or pf_bins for plotting.",
+                            n_traversals=int(n_trials),
+                        )
+                        continue
+
+                    if (
+                        max_trials_per_component_plot_eff is not None
+                        and n_trials > int(max_trials_per_component_plot_eff)
+                    ):
+                        _append_distance_dataset_entry(
+                            category_payload=category_payload,
+                            rank_int=rank_int,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            result=result,
+                            pf_source_mode=pf_source_mode,
+                        )
+                        category_counters[cat]["saved"] += 1
+                        category_counters[cat]["plots_skipped_many_trials"] += 1
+                        message = (
+                            f"Dataset kept, SVG skipped because n_trials={n_trials} exceeds "
+                            f"max_trials_per_component_plot={max_trials_per_component_plot_eff}."
+                        )
+                        _append_summary_row(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            pf_rank=rank_int,
+                            status="saved_dataset_plot_skipped_many_trials",
+                            message=message,
+                            n_traversals=int(n_trials),
+                        )
+                        if print_component_progress:
+                            print(
+                                f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                                f"{message}",
+                                flush=True,
+                            )
+                        continue
+
+                    plateau_starts_plot, plateau_ends_plot = _build_plateau_intervals_for_cell(
+                        cell_idx=int(cell_idx),
+                        plateaus_dicts=plateaus_dicts,
+                        complex_bursts_dicts=complex_bursts_dicts,
+                        include_long_cb_as_plateau=bool(include_long_cb_as_plateau),
+                        cb_plateau_min_duration_ms=float(cb_plateau_min_duration_ms),
+                        frame_rate=float(frame_rate),
+                        n_frames=int(x_neural.shape[0]),
+                    )
+                    plateaus_for_plot = {"starts": plateau_starts_plot, "ends": plateau_ends_plot}
+
+                    if print_component_progress:
+                        print(
+                            f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                            f"plotting {n_trials} trials...",
+                            flush=True,
+                        )
+                    plot_start = time.perf_counter()
+                    plot_result = core.plot_place_field_traversal_trials_with_cb_example_centered_by_max_rate(
+                        trace,
+                        theta_vm,
+                        slow_vm,
+                        speed_plot,
+                        x_neural_plot,
+                        y_neural_plot,
+                        traversal_epochs,
+                        place_field_mask,
+                        pf_bins,
+                        frame_rate,
+                        complex_bursts_dicts=complex_bursts_dicts,
+                        cell_idx=cell_idx,
+                        traversal_types=traversal_types,
+                        padding_sec=0.0,
+                        zscore_traces=False,
+                        theta_freqs=trial_theta_freqs,
+                        slow_freqs=trial_slow_freqs,
+                        session_start_frames=session_start_frames,
+                        session_indices=trial_session_indices,
+                        color_by_session=True,
+                        resting_speed_threshold=trial_resting_speed_threshold,
+                        show_rest_patches=bool(show_rest_patches),
+                        show_pf_prepost_patches=True,
+                        pf_prepost_patch_alpha=0.1,
+                        pf_prepost_patch_scope="full_window",
+                        pf_prepost_running_only=False,
+                        pf_prepost_patch_defs=[
+                            {
+                                "mask": np.asarray(place_field_mask, dtype=bool),
+                                "color": ("magenta" if rank_int == 1 else "cyan"),
+                            }
+                        ],
+                        rest_patch_scope="full_window",
+                        rest_patch_require_in_pf=False,
+                        min_rest_patch_duration_s=1.0,
+                        rest_patch_color="#B3B3B3",
+                        rest_patch_alpha=0.25,
+                        shade_traversal_epoch=False,
+                        gradient_traversal_trajectory=True,
+                        trajectory_rasterized=True,
+                        trajectory_direction_label_top=True,
+                        trajectory_direction_label_fontsize=5,
+                        max_plot_trial_duration_s=trial_max_plot_duration_s,
+                        drop_epochs_with_bad_timepoints=bool(distance_params.exclude_trials_with_bad_frames),
+                        refined_SS=refined_ss_cell,
+                        all_CS_spikes=all_cs_spikes_cell,
+                        all_spikes=all_spikes_cell,
+                        firing_rate_bin_ms=trial_firing_rate_bin_ms,
+                        firing_rate_smooth_ms=trial_firing_rate_smooth_ms,
+                        show_firing_rate=False,
+                        simple_spike_color="#026C80",
+                        complex_spike_color="#EE9B00",
+                        pf_peak_xy=pf_peak_xy,
+                        pf_center_window_sec=trial_pf_center_window_sec,
+                        plot_pf_centered_average=True,
+                        return_pf_centered=True,
+                        return_spike_rate_means=True,
+                        show=show_plots,
+                        bad_timepoints=traversal_bad_mask,
+                        return_trial_firing_rates=True,
+                        center_by_pf_position=True,
+                        max_pf_distance_cm=distance_params.max_pf_distance_cm,
+                        plateaus_dicts=plateaus_for_plot,
+                        slow_trace_gap=float(trace_slow_gap),
+                        theta_slow_pad_factor=float(theta_slow_pad_factor),
+                        trace_ymax_from_simple_spikes=(str(cat) == "CSminus"),
+                        sharey=bool(sharey),
+                        place_field_contours=trajectory_contours,
+                        center_position_label=f"Closest to PF{pf_rank}",
+                        pf_peak_label=f"PF{pf_rank} peak",
+                        pf_peak_color=("magenta" if rank_int == 1 else "cyan"),
+                    )
+                    plot_elapsed = time.perf_counter() - plot_start
+                    fig = plot_result[0] if isinstance(plot_result, tuple) and len(plot_result) > 0 else plot_result
+                    axes = plot_result[1] if isinstance(plot_result, tuple) and len(plot_result) > 1 else None
+                    valid_epochs_plot = (
+                        list(plot_result[2])
+                        if isinstance(plot_result, tuple) and len(plot_result) > 2 and plot_result[2] is not None
+                        else list(traversal_epochs)
+                    )
+                    n_trials_plot = int(len(valid_epochs_plot))
+                    if fig is None:
+                        if print_component_progress:
+                            print(
+                                f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                                f"plot returned fig=None ({plot_elapsed:.1f}s).",
+                                flush=True,
+                            )
+                        category_payload[rank_int]["n_skipped"] = int(category_payload[rank_int]["n_skipped"]) + 1
+                        category_counters[cat]["skipped_or_error"] += 1
+                        _append_summary_row(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            pf_rank=rank_int,
+                            status="skip_plot_figure_none",
+                            message="Traversal plot function returned fig=None.",
+                            n_traversals=int(n_trials),
+                        )
+                        continue
+                    if n_trials_plot != n_trials:
+                        if not show_plots:
+                            plt.close(fig)
+                        if print_component_progress:
+                            print(
+                                f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                                f"plot epoch mismatch ({n_trials_plot} plotted vs {n_trials} dataset).",
+                                flush=True,
+                            )
+                        category_payload[rank_int]["n_skipped"] = int(category_payload[rank_int]["n_skipped"]) + 1
+                        category_counters[cat]["skipped_or_error"] += 1
+                        _append_summary_row(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            pf_rank=rank_int,
+                            status="skip_plot_epoch_mismatch",
+                            message=(
+                                f"Dataset trials ({n_trials}) != plotted valid epochs ({n_trials_plot}); "
+                                "skipped to keep dataset/plot consistency."
+                            ),
+                            n_traversals=int(n_trials_plot),
+                        )
+                        continue
+
+                    _remove_trial_plot_trajectory_start_end_indicators(axes)
+                    out_name = f"{animal_id}_Cell{cell_idx + 1}_PF{rank_int}_distance_defined_traversal.svg"
+                    out_path = out_dir / out_name
+                    if print_component_progress:
+                        print(
+                            f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                            f"saving {out_path}...",
+                            flush=True,
+                        )
+                    save_start = time.perf_counter()
+                    fig.savefig(out_path, dpi=300)
+                    save_elapsed = time.perf_counter() - save_start
+                    if not show_plots:
+                        plt.close(fig)
+                    _append_distance_dataset_entry(
+                        category_payload=category_payload,
+                        rank_int=rank_int,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        result=result,
+                        pf_source_mode=pf_source_mode,
+                    )
+                    _append_summary_row(
+                        category_name=cat,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        pf_rank=rank_int,
+                        status="saved",
+                        message=str(out_path),
+                        n_traversals=int(n_trials_plot),
+                    )
+                    category_counters[cat]["saved"] += 1
+                    if print_component_progress:
+                        print(
+                            f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1} PF{rank_int}: "
+                            f"saved ({plot_elapsed:.1f}s plot, {save_elapsed:.1f}s save).",
+                            flush=True,
+                        )
+            except Exception as exc:
+                if print_component_progress:
+                    print(
+                        f"[distance-defined] {cat} {animal_id} Cell{cell_idx + 1}: error: {exc}",
+                        flush=True,
+                    )
+                _append_summary_row(
+                    category_name=cat,
+                    animal_id=animal_id,
+                    cell_idx=cell_idx,
+                    pf_rank=np.nan,
+                    status="error",
+                    message=str(exc),
+                )
+                category_counters[cat]["skipped_or_error"] += 1
+                for pf_rank in pf_ranks:
+                    category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+
+        for pf_rank in pf_ranks:
+            block = category_payload[int(pf_rank)]
+            block["n_entries"] = int(len(block["entries"]))
+        dataset[cat] = category_payload
+
+    summary_columns = [
+        "category",
+        "animal_id",
+        "cell_idx",
+        "cell_num",
+        "pf_rank",
+        "status",
+        "n_detected_traversals",
+        "n_classified_traversals",
+        "n_preferred_traversals",
+        "n_nonpreferred_traversals",
+        "n_unclassified_traversals",
+        "preferred_fraction_threshold",
+        "preferred_half_width_deg",
+        "min_covered_green_bins",
+        "traversal_bin_selection_mode",
+        "preferred_angle_source",
+        "fit_angle_fallback_to_empirical",
+        "classification_frame_selection_mode",
+        "classification_drz_segment_mode",
+        "classification_phase_signed_drz_filter",
+        "classification_speed_threshold_used",
+        "first_n_minutes",
+        "min_valid_traversal_duration_s",
+        "message",
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
+    if save_summary_csv:
+        summary_df.to_csv(summary_csv, index=False)
+
+    plot_summary = {
+        "output_dirs": {k: str(v) for k, v in output_dirs.items()},
+        "summary_csv": str(summary_csv) if save_summary_csv else None,
+        "summary_df": summary_df,
+        "counters": category_counters,
+        "distance_window_cm": float(distance_window_cm),
+        "distance_window_cm_requested": float(distance_window_cm_req),
+        "distance_window_cm_effective": float(distance_window_cm_eff),
+        "detection_window_cm": float(detection_window_cm_eff),
+        "detection_window_cm_requested": float(detection_window_cm_req),
+        "detection_window_cm_effective": float(detection_window_cm_eff),
+        "distance_bin_cm": float(distance_bin_cm),
+        "distance_mode": str(distance_mode),
+        "include_long_cb_as_plateau": bool(include_long_cb_as_plateau),
+        "include_resting_plateaus": bool(include_resting_plateaus),
+        "cb_plateau_min_duration_ms": float(cb_plateau_min_duration_ms),
+        "plateau_trace_window_ms": float(plateau_trace_window_ms),
+        "center_vicinity_min_cm": int(center_vicinity_min_cm),
+        "center_vicinity_max_cm": int(center_vicinity_max_cm),
+        "moving_speed_threshold": float(moving_speed_threshold),
+        "resting_speed_threshold": float(trial_resting_speed_threshold),
+        "dilation_bins": int(dilation_bins),
+        "dilation_shape": str(dilation_shape),
+        "trace_slow_gap": float(trace_slow_gap),
+        "theta_slow_pad_factor": float(theta_slow_pad_factor),
+        "max_plot_trial_duration_s": float(trial_max_plot_duration_s),
+        "max_trials_per_component_plot": max_trials_per_component_plot_eff,
+        "print_component_progress": bool(print_component_progress),
+    }
+    return {"plot_summary": plot_summary, "dataset": dataset}
+
+
+def generate_time_defined_trials_and_dataset(
+    config: PipelineConfig,
+    spatial_data: Any,
+    distance_params: PFDistanceCenteredParams | None = None,
+    *,
+    figure_save_folder: str | Path | None = None,
+    time_window_sec: float = 4.0,
+    distance_window_cm: float = 15.0,
+    detection_window_cm: float | None = None,
+    distance_bin_cm: float = 1.5,
+    distance_mode: str | None = None,
+    center_vicinity_min_cm: int = 1,
+    center_vicinity_max_cm: int = 5,
+    moving_speed_threshold: float | None = None,
+    resting_speed_threshold: float = 0.5,
+    pf_ranks: tuple[int, ...] = (1, 2),
+    categories: tuple[str, ...] = ("CSplus", "CSminus"),
+    clear_output: bool = True,
+    save_summary_csv: bool = True,
+    show_plots: bool = False,
+    show_rest_patches: bool = True,
+    pf_reliability_dilation_bins: int | None = None,
+    pf_reliability_dilation_shape: str | None = None,
+    trace_slow_gap: float = 1.0,
+    theta_slow_pad_factor: float = 0.05,
+    sharey: bool = True,
+    max_plot_trial_duration_s: float | None = None,
+    include_long_cb_as_plateau: bool | None = None,
+    include_resting_plateaus: bool = True,
+    cb_plateau_min_duration_ms: float | None = None,
+    align_all_pf_components_to_session_compare: bool = True,
+    session_compare_cache_version: str = "v2",
+) -> dict[str, Any]:
+    import pandas as pd
+    from scipy.ndimage import binary_dilation
+
+    if distance_params is None:
+        distance_params = PFDistanceCenteredParams()
+    time_window_sec = float(time_window_sec)
+    if (not np.isfinite(time_window_sec)) or time_window_sec <= 0:
+        raise ValueError("time_window_sec must be a finite number > 0.")
+    if include_long_cb_as_plateau is None:
+        include_long_cb_as_plateau = bool(getattr(distance_params, "include_long_cb_as_plateau", True))
+    if cb_plateau_min_duration_ms is None:
+        cb_plateau_min_duration_ms = float(getattr(distance_params, "cb_plateau_min_duration_ms", 100.0))
+    if moving_speed_threshold is None:
+        moving_speed_threshold = float(config.analysis.speed_threshold)
+    if distance_mode is None:
+        distance_mode = str(getattr(distance_params, "distance_mode", "cumulative_path"))
+    distance_mode = _normalize_distance_mode(distance_mode)
+    distance_window_cm_req, distance_window_cm_eff, _ = _build_symmetric_distance_axis(
+        distance_window_cm,
+        distance_bin_cm,
+    )
+    if detection_window_cm is None:
+        detection_window_cm = float(getattr(distance_params, "detection_window_cm", 10.0))
+    detection_window_cm_req = float(detection_window_cm)
+    if (not np.isfinite(detection_window_cm_req)) or detection_window_cm_req <= 0:
+        raise ValueError("detection_window_cm must be a finite number > 0.")
+    detection_window_cm_eff = min(float(detection_window_cm_req), float(distance_window_cm_eff))
+    if int(center_vicinity_min_cm) <= 0 or int(center_vicinity_max_cm) < int(center_vicinity_min_cm):
+        raise ValueError("Invalid center vicinity range.")
+    if (not np.isfinite(float(cb_plateau_min_duration_ms))) or float(cb_plateau_min_duration_ms) <= 0:
+        raise ValueError("cb_plateau_min_duration_ms must be a finite number > 0.")
+
+    if figure_save_folder is None:
+        figure_root = config.figures_root / "CKII_pooled"
+    else:
+        figure_root = Path(figure_save_folder)
+    figure_root.mkdir(parents=True, exist_ok=True)
+
+    output_dirs: dict[str, Path] = {}
+    for cat in categories:
+        cat_norm = _normalize_pf_category_name(cat)
+        if cat_norm == "CSplus":
+            out_dir = figure_root / "PF_time_defined_trials_CSplus_PLCs"
+        elif cat_norm == "CSminus":
+            out_dir = figure_root / "PF_time_defined_trials_CSminus_PLCs"
+        elif cat_norm == "nonPLC":
+            out_dir = figure_root / "PF_time_defined_trials_nonPLC"
+        else:
+            out_dir = figure_root / f"PF_time_defined_trials_{cat_norm}"
+        output_dirs[cat_norm] = out_dir
+    summary_csv = figure_root / "PF_time_defined_trials_summary.csv"
+
+    if clear_output:
+        for out_dir in output_dirs.values():
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        for out_dir in output_dirs.values():
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+    if pf_reliability_dilation_bins is None:
+        dilation_bins = int(config.place_cell.pf_reliability_dilation_bins)
+    else:
+        dilation_bins = int(pf_reliability_dilation_bins)
+    if pf_reliability_dilation_shape is None:
+        dilation_shape = str(config.place_cell.pf_reliability_dilation_shape).strip().lower()
+    else:
+        dilation_shape = str(pf_reliability_dilation_shape).strip().lower()
+    if dilation_bins < 0:
+        raise ValueError("pf_reliability_dilation_bins must be >= 0.")
+    dilation_structure = (
+        core._build_pf_dilation_structure(dilation_bins, dilation_shape)
+        if dilation_bins > 0
+        else None
+    )
+
+    trial_resting_speed_threshold = float(resting_speed_threshold)
+    if max_plot_trial_duration_s is None:
+        trial_max_plot_duration_s = max(2.0 * float(time_window_sec), 1.0)
+    else:
+        trial_max_plot_duration_s = float(max_plot_trial_duration_s)
+    if not np.isfinite(trial_max_plot_duration_s) or trial_max_plot_duration_s <= 0:
+        raise ValueError("max_plot_trial_duration_s must be > 0.")
+    trial_theta_freqs = tuple(config.analysis.theta_freqs)
+    trial_slow_freqs = float(config.analysis.slow_freqs)
+    trial_session_indices = tuple(config.traversal.session_indices)
+    trial_firing_rate_bin_ms = float(config.traversal.firing_rate_bin_ms)
+    trial_firing_rate_smooth_ms = float(config.traversal.firing_rate_smooth_ms)
+    trial_pf_center_window_sec = float(config.traversal.pf_center_window_sec)
+
+    dataset: dict[str, Any] = {
+        "metadata": {
+            "axis_kind": "time",
+            "dilation_bins": int(dilation_bins),
+            "dilation_shape": str(dilation_shape),
+            "pf_ranks": tuple(int(r) for r in pf_ranks),
+            "categories": tuple(_normalize_pf_category_name(c) for c in categories),
+            "time_window_sec": float(time_window_sec),
+            "distance_window_cm": float(distance_window_cm_eff),
+            "distance_window_cm_requested": float(distance_window_cm_req),
+            "distance_window_cm_effective": float(distance_window_cm_eff),
+            "detection_window_cm": float(detection_window_cm_eff),
+            "detection_window_cm_requested": float(detection_window_cm_req),
+            "detection_window_cm_effective": float(detection_window_cm_eff),
+            "distance_bin_cm": float(distance_bin_cm),
+            "distance_mode": str(distance_mode),
+            "include_long_cb_as_plateau": bool(include_long_cb_as_plateau),
+            "include_resting_plateaus": bool(include_resting_plateaus),
+            "cb_plateau_min_duration_ms": float(cb_plateau_min_duration_ms),
+            "center_vicinity_min_cm": int(center_vicinity_min_cm),
+            "center_vicinity_max_cm": int(center_vicinity_max_cm),
+            "moving_speed_threshold": float(moving_speed_threshold),
+            "resting_speed_threshold": float(trial_resting_speed_threshold),
+            "min_traversals": int(distance_params.min_traversals),
+            "min_traversals_per_type": int(distance_params.min_traversals_per_type),
+            "subtract_pre_traversal_baseline": bool(distance_params.subtract_pre_traversal_baseline),
+            "exclude_trials_with_bad_frames": bool(distance_params.exclude_trials_with_bad_frames),
+            "pf_component_selection": str(distance_params.pf_component_selection),
+            "max_pf_distance_cm": distance_params.max_pf_distance_cm,
+            "smooth_window_sec": float(getattr(distance_params, "smooth_window", 0.0)),
+            "traversal_merge_gap_s": float(getattr(config.traversal, "traversal_merge_gap_s", 0.0)),
+            "session_indices": tuple(config.traversal.session_indices),
+            "align_all_pf_components_to_session_compare": bool(align_all_pf_components_to_session_compare),
+            "session_compare_cache_version": str(session_compare_cache_version),
+        }
+    }
+
+    runtime_cache: dict[str, dict[str, Any]] = {}
+    summary_rows: list[dict[str, Any]] = []
+    category_counters: dict[str, dict[str, int]] = {}
+    category_pf_sources: dict[str, str] = {
+        _normalize_pf_category_name(cat): ("ss" if _normalize_pf_category_name(cat) == "nonPLC" else "all")
+        for cat in categories
+    }
+    dataset["metadata"]["pf_source_by_category"] = dict(category_pf_sources)
+
+    def _append_summary_row(
+        *,
+        category_name: str,
+        animal_id: str,
+        cell_idx: int,
+        pf_rank: int | float,
+        status: str,
+        message: str,
+        n_traversals: int | float = np.nan,
+    ) -> None:
+        summary_rows.append(
+            {
+                "category": category_name,
+                "animal_id": str(animal_id),
+                "cell_idx": int(cell_idx),
+                "cell_num": int(cell_idx + 1) if int(cell_idx) >= 0 else np.nan,
+                "pf_rank": pf_rank,
+                "status": str(status),
+                "n_traversals": n_traversals,
+                "message": str(message),
+            }
+        )
+
+    def _append_skip_rows_for_all_ranks(
+        *,
+        category_name: str,
+        animal_id: str,
+        cell_idx: int,
+        status: str,
+        message: str,
+    ) -> None:
+        for rank in pf_ranks:
+            _append_summary_row(
+                category_name=category_name,
+                animal_id=animal_id,
+                cell_idx=cell_idx,
+                pf_rank=int(rank),
+                status=status,
+                message=message,
+            )
+
+    for category in categories:
+        cat = _normalize_pf_category_name(category)
+        out_dir = output_dirs[cat]
+        category_cells = _get_spatial_category_cells(spatial_data, cat)
+        category_counters[cat] = {
+            "attempted_cells": 0,
+            "attempted_components": 0,
+            "saved": 0,
+            "skipped_or_error": 0,
+        }
+        category_payload: dict[int, dict[str, Any]] = {}
+        for pf_rank in pf_ranks:
+            category_payload[int(pf_rank)] = {
+                "time_rel": None,
+                "entries": [],
+                "n_requested_cells": len(category_cells),
+                "n_entries": 0,
+                "n_skipped": 0,
+            }
+
+        for cell_meta in category_cells:
+            animal_id = str(cell_meta.get("session", ""))
+            cell_idx = int(cell_meta.get("cell_idx", -1))
+            category_counters[cat]["attempted_cells"] += 1
+            if not animal_id or cell_idx < 0:
+                category_counters[cat]["skipped_or_error"] += 1
+                for pf_rank in pf_ranks:
+                    category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+                _append_skip_rows_for_all_ranks(
+                    category_name=cat,
+                    animal_id=animal_id,
+                    cell_idx=cell_idx,
+                    status="skip_invalid_cell_meta",
+                    message="Missing/invalid animal_id or cell_idx in spatial_data cell metadata.",
+                )
+                continue
+            try:
+                if animal_id not in runtime_cache:
+                    runtime_cache[animal_id] = _build_trial_plot_runtime_payload(animal_id, config)
+                runtime = runtime_cache[animal_id]
+                merged = runtime["merged"]
+                spatial_by_idx = runtime["spatial_by_idx"]
+                analysis = spatial_by_idx.get(cell_idx)
+                if analysis is None:
+                    category_counters[cat]["skipped_or_error"] += 1
+                    for pf_rank in pf_ranks:
+                        category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+                    _append_skip_rows_for_all_ranks(
+                        category_name=cat,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        status="skip_missing_runtime_spatial_analysis",
+                        message="Cell missing in runtime spatial analysis.",
+                    )
+                    continue
+
+                pf_source_mode = str(category_pf_sources.get(cat, "all")).strip().lower()
+                if pf_source_mode == "ss":
+                    if bool(analysis.get("is_place_cell", False)):
+                        category_counters[cat]["skipped_or_error"] += 1
+                        for pf_rank in pf_ranks:
+                            category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+                        _append_skip_rows_for_all_ranks(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            status="skip_nonplc_is_place_cell",
+                            message="nonPLC category requires is_place_cell=False, but this cell is an all-spike place cell.",
+                        )
+                        continue
+                    if not bool(analysis.get("is_place_cell_ss", False)):
+                        category_counters[cat]["skipped_or_error"] += 1
+                        for pf_rank in pf_ranks:
+                            category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+                        _append_skip_rows_for_all_ranks(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            status="skip_nonplc_not_ss_place_cell",
+                            message="nonPLC category requires is_place_cell_ss=True (non all-spike PLC + SS PLC).",
+                        )
+                        continue
+                elif not bool(analysis.get("is_place_cell", False)):
+                    category_counters[cat]["skipped_or_error"] += 1
+                    for pf_rank in pf_ranks:
+                        category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+                    _append_skip_rows_for_all_ranks(
+                        category_name=cat,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        status="skip_not_place_cell_runtime",
+                        message="Cell missing in runtime spatial analysis or is_place_cell=False.",
+                    )
+                    continue
+
+                pf_source_info = _resolve_distance_defined_pf_component_source(
+                    animal_id=animal_id,
+                    cell_idx=int(cell_idx),
+                    analysis=analysis,
+                    config=config,
+                    pf_source_mode=pf_source_mode,
+                    align_all_pf_components_to_session_compare=bool(align_all_pf_components_to_session_compare),
+                    session_compare_cache_version=str(session_compare_cache_version),
+                )
+                components_raw = list(pf_source_info.get("components_raw", []) or [])
+                fallback_mask = np.asarray(pf_source_info.get("fallback_mask", []), dtype=bool)
+                fallback_peak = pf_source_info.get("fallback_peak_rate", np.nan)
+                source_rate_map = np.asarray(pf_source_info.get("source_rate_map", []), dtype=float)
+                components = _sanitize_ranked_pf_components(
+                    components_raw,
+                    fallback_mask,
+                    rate_map=(source_rate_map if source_rate_map.size > 0 else None),
+                    fallback_peak_rate=float(fallback_peak),
+                    max_components=None,
+                )
+                if not components:
+                    category_counters[cat]["skipped_or_error"] += 1
+                    for pf_rank in pf_ranks:
+                        category_payload[int(pf_rank)]["n_skipped"] = int(category_payload[int(pf_rank)]["n_skipped"]) + 1
+                    _append_skip_rows_for_all_ranks(
+                        category_name=cat,
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        status="skip_no_place_field_components",
+                        message=str(pf_source_info.get("missing_pf_message", "No place-field components.")),
+                    )
+                    continue
+
+                trajectory_contours: list[dict[str, Any]] = []
+                for rank_i, comp_i in enumerate(components, start=1):
+                    comp_mask_i = np.asarray(comp_i.get("mask", []), dtype=bool)
+                    if comp_mask_i.size == 0 or not np.any(comp_mask_i):
+                        continue
+                    comp_eval_i = comp_mask_i
+                    if dilation_structure is not None:
+                        comp_eval_i = binary_dilation(comp_mask_i, structure=dilation_structure)
+                    if rank_i <= 2:
+                        trajectory_contours.append(
+                            {
+                                "mask": np.asarray(comp_eval_i, dtype=bool),
+                                "color": "magenta" if rank_i == 1 else "cyan",
+                                "linewidth": 0.8,
+                                "linestyle": "solid",
+                                "alpha": 1.0,
+                            }
+                        )
+
+                traces = runtime["traces"]
+                x_neural = np.asarray(merged["x_neural"], dtype=float)
+                y_neural = np.asarray(merged["y_neural"], dtype=float)
+                speed = np.asarray(merged["speed"], dtype=float)
+                spikes = merged["spikes"]
+                all_spikes = merged.get("all_spikes", merged["spikes"])
+                refined_ss = merged.get("refined_SS", [np.array([], dtype=int) for _ in spikes])
+                all_cs_spikes = merged.get("all_CS_spikes", [np.array([], dtype=int) for _ in spikes])
+                complex_bursts_dicts = merged.get("complex_bursts_dicts", [])
+                plateaus_dicts = merged.get("plateaus_dicts", None)
+                session_start_frames = merged.get("session_start_frames", [0])
+                frame_rate = float(merged["frame_rate"])
+
+                bad_timepoints = (
+                    runtime["bad_masks"][cell_idx]
+                    if isinstance(runtime["bad_masks"], np.ndarray) and cell_idx < len(runtime["bad_masks"])
+                    else None
+                )
+                bad_mask = None
+                if bad_timepoints is not None:
+                    bad_mask = np.asarray(bad_timepoints, dtype=bool)
+                    if bad_mask.shape[0] != x_neural.shape[0]:
+                        raise ValueError(f"bad_timepoints length mismatch for {animal_id} cell {cell_idx}.")
+                raw_bad_mask = None
+                traces_raw_source = merged.get("traces", None)
+                if traces_raw_source is not None and cell_idx < len(traces_raw_source):
+                    raw_trace = np.asarray(traces_raw_source[cell_idx], dtype=float)
+                    if raw_trace.ndim == 1 and raw_trace.shape[0] == x_neural.shape[0]:
+                        raw_bad_mask = ~np.isfinite(raw_trace)
+                traversal_bad_mask = None
+                if bad_mask is not None and raw_bad_mask is not None:
+                    traversal_bad_mask = bad_mask | raw_bad_mask
+                elif bad_mask is not None:
+                    traversal_bad_mask = bad_mask
+                elif raw_bad_mask is not None:
+                    traversal_bad_mask = raw_bad_mask
+
+                x_neural_plot = x_neural.copy()
+                y_neural_plot = y_neural.copy()
+                speed_plot = speed.copy()
+                if traversal_bad_mask is not None:
+                    x_neural_plot[traversal_bad_mask] = np.nan
+                    y_neural_plot[traversal_bad_mask] = np.nan
+                    speed_plot[traversal_bad_mask] = np.nan
+
+                def _filter_spike_indices(spike_source: Any) -> np.ndarray:
+                    if isinstance(spike_source, (list, tuple, np.ndarray)):
+                        src = spike_source[cell_idx] if isinstance(spike_source, (list, tuple)) else spike_source
+                    else:
+                        src = np.array([], dtype=int)
+                    idx = np.asarray(src, dtype=int)
+                    idx = idx[(idx >= 0) & (idx < x_neural.shape[0])]
+                    if traversal_bad_mask is not None and idx.size > 0:
+                        idx = idx[~traversal_bad_mask[idx]]
+                    return idx
+
+                all_spikes_cell = _filter_spike_indices(all_spikes)
+                refined_ss_cell = _filter_spike_indices(refined_ss)
+                all_cs_spikes_cell = _filter_spike_indices(all_cs_spikes)
+                trace = np.asarray(traces[cell_idx], dtype=float)
+                trace = core.interpolate_nan_segment(trace)
+                theta_vm = core.bandpass_filter(trace, trial_theta_freqs[0], trial_theta_freqs[1], frame_rate, order=5)
+                slow_vm = core.lowpass_filter(trace, trial_slow_freqs, frame_rate, order=5)
+
+                for pf_rank in pf_ranks:
+                    rank_int = int(pf_rank)
+                    category_counters[cat]["attempted_components"] += 1
+                    result = compute_time_defined_component_result_iterative(
+                        animal_id=animal_id,
+                        cell_idx=cell_idx,
+                        pf_rank=rank_int,
+                        runtime=runtime,
+                        config=config,
+                        distance_params=distance_params,
+                        dilation_bins=dilation_bins,
+                        dilation_shape=dilation_shape,
+                        time_window_sec=float(time_window_sec),
+                        distance_window_cm=float(distance_window_cm_eff),
+                        detection_window_cm=float(detection_window_cm_eff),
+                        distance_bin_cm=float(distance_bin_cm),
+                        center_vicinity_min_cm=int(center_vicinity_min_cm),
+                        center_vicinity_max_cm=int(center_vicinity_max_cm),
+                        moving_speed_threshold=float(moving_speed_threshold),
+                        resting_speed_threshold=float(trial_resting_speed_threshold),
+                        exclude_trials_with_bad_frames=bool(distance_params.exclude_trials_with_bad_frames),
+                        pf_source_mode=str(pf_source_mode),
+                        include_long_cb_as_plateau=bool(include_long_cb_as_plateau),
+                        include_resting_plateaus=bool(include_resting_plateaus),
+                        cb_plateau_min_duration_ms=float(cb_plateau_min_duration_ms),
+                        distance_mode=str(distance_mode),
+                        align_all_pf_components_to_session_compare=bool(align_all_pf_components_to_session_compare),
+                        session_compare_cache_version=str(session_compare_cache_version),
+                        min_traversals=1,
+                        bad_frame_mask=traversal_bad_mask,
+                    )
+                    if result is None:
+                        category_payload[rank_int]["n_skipped"] = int(category_payload[rank_int]["n_skipped"]) + 1
+                        category_counters[cat]["skipped_or_error"] += 1
+                        _append_summary_row(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            pf_rank=rank_int,
+                            status="skip_no_time_defined_result",
+                            message="Time-defined conversion returned no valid trials.",
+                        )
+                        continue
+
+                    time_rel = np.asarray(result.get("time_rel", []), dtype=float)
+                    if time_rel.size == 0:
+                        category_payload[rank_int]["n_skipped"] = int(category_payload[rank_int]["n_skipped"]) + 1
+                        category_counters[cat]["skipped_or_error"] += 1
+                        _append_summary_row(
+                            category_name=cat,
+                            animal_id=animal_id,
+                            cell_idx=cell_idx,
+                            pf_rank=rank_int,
+                            status="skip_empty_time_axis",
+                            message="time_rel is empty in computed component result.",
+                        )
+                        continue
+                    time_rel_ref = category_payload[rank_int]["time_rel"]
+                    if time_rel_ref is None:
+                        category_payload[rank_int]["time_rel"] = time_rel
+                        dataset["metadata"]["time_bin_sec"] = float(np.nanmedian(np.diff(time_rel))) if time_rel.size > 1 else float(1.0 / frame_rate)
+                    else:
+                        time_rel_ref_arr = np.asarray(time_rel_ref, dtype=float)
+                        if time_rel_ref_arr.size != time_rel.size:
+                            category_payload[rank_int]["n_skipped"] = int(category_payload[rank_int]["n_skipped"]) + 1
+                            category_counters[cat]["skipped_or_error"] += 1
+                            _append_summary_row(
+                                category_name=cat,
+                                animal_id=animal_id,
+                                cell_idx=cell_idx,
+                                pf_rank=rank_int,
+                                status="skip_time_axis_mismatch",
+                                message=(
+                                    "time_rel length mismatch for this PF rank block "
+                                    f"(existing={time_rel_ref_arr.size}, current={time_rel.size})."
+                                ),
+                            )
+                            continue
+
+                    trial_data = result.get("all", {}).get("trial_data", {})
+                    epoch_start_frames = np.asarray(trial_data.get("epoch_start_frames", []), dtype=int)
+                    epoch_end_frames = np.asarray(trial_data.get("epoch_end_frames", []), dtype=int)
+                    traversal_types = list(np.asarray(trial_data.get("traversal_types", []), dtype=object))
+                    n_trials = int(epoch_start_frames.size)
+                    traversal_epochs = list(zip(epoch_start_frames.tolist(), epoch_end_frames.tolist()))
+                    place_field_mask = result.get("place_field_mask", None)
                     pf_bins = result.get("pf_bins", None)
                     pf_peak_xy = result.get("pf_peak_xy", None)
                     if place_field_mask is None or pf_bins is None:
@@ -7826,7 +13061,7 @@ def generate_distance_defined_trials_and_dataset(
                         continue
 
                     _remove_trial_plot_trajectory_start_end_indicators(axes)
-                    out_name = f"{animal_id}_Cell{cell_idx + 1}_PF{rank_int}_distance_defined_traversal.svg"
+                    out_name = f"{animal_id}_Cell{cell_idx + 1}_PF{rank_int}_time_defined_traversal.svg"
                     out_path = out_dir / out_name
                     fig.savefig(out_path, dpi=300)
                     if not show_plots:
@@ -7875,23 +13110,7 @@ def generate_distance_defined_trials_and_dataset(
         "cell_num",
         "pf_rank",
         "status",
-        "n_detected_traversals",
-        "n_classified_traversals",
-        "n_preferred_traversals",
-        "n_nonpreferred_traversals",
-        "n_unclassified_traversals",
-        "preferred_fraction_threshold",
-        "preferred_half_width_deg",
-        "min_covered_green_bins",
-        "traversal_bin_selection_mode",
-        "preferred_angle_source",
-        "fit_angle_fallback_to_empirical",
-        "classification_frame_selection_mode",
-        "classification_drz_segment_mode",
-        "classification_phase_signed_drz_filter",
-        "classification_speed_threshold_used",
-        "first_n_minutes",
-        "min_valid_traversal_duration_s",
+        "n_traversals",
         "message",
     ]
     summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
@@ -7903,7 +13122,9 @@ def generate_distance_defined_trials_and_dataset(
         "summary_csv": str(summary_csv) if save_summary_csv else None,
         "summary_df": summary_df,
         "counters": category_counters,
-        "distance_window_cm": float(distance_window_cm),
+        "time_window_sec": float(time_window_sec),
+        "time_bin_sec": dataset.get("metadata", {}).get("time_bin_sec", np.nan),
+        "distance_window_cm": float(distance_window_cm_eff),
         "distance_window_cm_requested": float(distance_window_cm_req),
         "distance_window_cm_effective": float(distance_window_cm_eff),
         "detection_window_cm": float(detection_window_cm_eff),
@@ -8231,11 +13452,324 @@ def _compute_pf_centered_panel_layout_inches(
     }
 
 
+def _compute_pf_centered_2session_panel_layout_inches(
+    *,
+    avg_key_counts: list[int] | tuple[int, ...],
+    heatmap_height: float,
+    avg_height: float,
+    subplot_width: float,
+    show_row_ylabel: bool,
+    show_colorbar: bool,
+    show_panel_title: bool,
+) -> dict[str, float]:
+    left_margin = 0.38 if bool(show_row_ylabel) else 0.12
+    right_margin = 0.05
+    top_margin = 0.18 if bool(show_panel_title) else 0.08
+    bottom_margin = 0.24
+    inner_gap = 0.05
+    row_gap = 0.10
+    cbar_gap = 0.08 if bool(show_colorbar) else 0.0
+    cbar_width = 0.032 if bool(show_colorbar) else 0.0
+    panel_width = left_margin + float(subplot_width) + cbar_gap + cbar_width + right_margin
+    row_total_height = 0.0
+    for count in avg_key_counts:
+        n_avg = max(0, int(count))
+        row_total_height += float(heatmap_height) + float(n_avg) * (float(avg_height) + inner_gap)
+    panel_height = top_margin + row_total_height + float(max(0, len(avg_key_counts) - 1)) * row_gap + bottom_margin
+    return {
+        "panel_width": float(panel_width),
+        "panel_height": float(panel_height),
+        "left_margin": float(left_margin),
+        "right_margin": float(right_margin),
+        "top_margin": float(top_margin),
+        "bottom_margin": float(bottom_margin),
+        "inner_gap": float(inner_gap),
+        "row_gap": float(row_gap),
+        "cbar_gap": float(cbar_gap),
+        "cbar_width": float(cbar_width),
+    }
+
+
+def _interpolate_nan_stack_rows(stack: np.ndarray) -> np.ndarray:
+    stack = np.asarray(stack, dtype=float)
+    if stack.ndim != 2:
+        raise ValueError("stack must be a 2D array")
+    out = np.array(stack, dtype=float, copy=True)
+    for i in range(out.shape[0]):
+        out[i] = core.interpolate_nan_segment(np.asarray(out[i], dtype=float))
+    return out
+
+
+def _format_avg_axis_ticklabel(value: float, _: int | None = None) -> str:
+    value_f = float(np.round(float(value), 1))
+    if np.isclose(value_f, 0.0):
+        value_f = 0.0
+    if np.isclose(value_f, np.round(value_f)):
+        return str(int(np.round(value_f)))
+    return f"{value_f:.1f}"
+
+
+def _rank_pf_component_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    max_components: int | None = 2,
+) -> list[dict[str, Any]]:
+    if len(candidates) == 0:
+        return []
+
+    clean: list[dict[str, Any]] = []
+    for item in candidates:
+        comp = dict(item)
+        comp["area_bins"] = int(comp.get("area_bins", int(np.sum(np.asarray(comp.get("mask", []), dtype=bool)))))
+        clean.append(comp)
+
+    finite_peak_items = [item for item in clean if np.isfinite(item.get("peak_rate", np.nan))]
+    if len(finite_peak_items) > 0:
+        primary = min(
+            finite_peak_items,
+            key=lambda item: (
+                -float(item.get("peak_rate", np.nan)),
+                -int(item.get("area_bins", 0)),
+                int(item.get("source_rank", 0)),
+            ),
+        )
+        primary_id = id(primary)
+        remaining = [item for item in clean if id(item) != primary_id]
+        remaining.sort(
+            key=lambda item: (
+                -int(item.get("area_bins", 0)),
+                -float(item.get("peak_rate", -np.inf)) if np.isfinite(item.get("peak_rate", np.nan)) else np.inf,
+                int(item.get("source_rank", 0)),
+            ),
+        )
+        ordered = [primary] + remaining
+    else:
+        ordered = sorted(
+            clean,
+            key=lambda item: (
+                -int(item.get("area_bins", 0)),
+                int(item.get("source_rank", 0)),
+            ),
+        )
+
+    if max_components is None:
+        return ordered
+    return ordered[:max(0, int(max_components))]
+
+
+def _sanitize_ranked_pf_components(
+    components: list[Any] | tuple[Any, ...] | None,
+    fallback_mask: np.ndarray | None,
+    *,
+    rate_map: np.ndarray | None = None,
+    fallback_peak_rate: float = np.nan,
+    max_components: int | None = 2,
+) -> list[dict[str, Any]]:
+    clean: list[dict[str, Any]] = []
+    fallback_shape = None
+    if fallback_mask is not None:
+        fallback_mask = np.asarray(fallback_mask, dtype=bool)
+        if fallback_mask.ndim == 2:
+            fallback_shape = fallback_mask.shape
+
+    if isinstance(components, (list, tuple)):
+        for rank_idx, comp in enumerate(components):
+            arr = None
+            peak_rate = np.nan
+            if isinstance(comp, dict):
+                arr_raw = comp.get("mask", None)
+                if arr_raw is not None:
+                    arr = np.asarray(arr_raw, dtype=bool)
+                peak_rate = float(comp.get("peak_rate", np.nan))
+            else:
+                arr = np.asarray(comp, dtype=bool)
+            if arr is None or arr.ndim != 2:
+                continue
+            if fallback_shape is not None and arr.shape != fallback_shape:
+                continue
+            if not np.any(arr):
+                continue
+            if (not np.isfinite(peak_rate)) and isinstance(rate_map, np.ndarray) and rate_map.shape == arr.shape:
+                vals = np.asarray(rate_map, dtype=float)[arr]
+                if vals.size > 0 and np.any(np.isfinite(vals)):
+                    peak_rate = float(np.nanmax(vals))
+            clean.append(
+                {
+                    "mask": np.asarray(arr, dtype=bool),
+                    "peak_rate": peak_rate,
+                    "source_rank": int(rank_idx),
+                    "area_bins": int(np.sum(arr)),
+                }
+            )
+
+    if len(clean) > 0:
+        return _rank_pf_component_candidates(clean, max_components=max_components)
+
+    if isinstance(fallback_mask, np.ndarray) and fallback_mask.ndim == 2 and np.any(fallback_mask):
+        mask = np.asarray(fallback_mask, dtype=bool)
+        if scipy_ndimage is not None:
+            structure = np.ones((3, 3), dtype=int)
+            labeled, n_comp = scipy_ndimage.label(mask, structure=structure)
+            if int(n_comp) > 0:
+                vals = np.asarray(rate_map, dtype=float) if isinstance(rate_map, np.ndarray) and rate_map.shape == mask.shape else None
+                fallback_components: list[dict[str, Any]] = []
+                for i in range(1, int(n_comp) + 1):
+                    comp_mask = np.asarray(labeled == i, dtype=bool)
+                    if not np.any(comp_mask):
+                        continue
+                    peak_rate = np.nan
+                    if vals is not None:
+                        vv = vals[comp_mask]
+                        if vv.size > 0 and np.any(np.isfinite(vv)):
+                            peak_rate = float(np.nanmax(vv))
+                    fallback_components.append(
+                        {
+                            "mask": comp_mask,
+                            "peak_rate": peak_rate,
+                            "source_rank": int(i - 1),
+                            "area_bins": int(np.sum(comp_mask)),
+                        }
+                    )
+                return _rank_pf_component_candidates(fallback_components, max_components=max_components)
+        return _rank_pf_component_candidates(
+            [{
+                "mask": mask,
+                "peak_rate": float(fallback_peak_rate),
+                "source_rank": 0,
+                "area_bins": int(np.sum(mask)),
+            }],
+            max_components=max_components,
+        )
+
+    return []
+
+
+_SESSION_COMPARE_COMBINED_PF_CACHE: dict[tuple[str, str, str], dict[int, dict[str, Any]] | None] = {}
+
+
+def _load_session_compare_combined_pf_cells(
+    config: PipelineConfig,
+    animal_id: str,
+    cache_version: str = "v2",
+) -> dict[int, dict[str, Any]] | None:
+    cache_key = (str(config.data_root), str(animal_id), str(cache_version))
+    if cache_key in _SESSION_COMPARE_COMBINED_PF_CACHE:
+        return _SESSION_COMPARE_COMBINED_PF_CACHE[cache_key]
+
+    cache_path = Path(config.data_root) / str(animal_id) / f"spatial_session_cache_{cache_version}.pkl"
+    if not cache_path.exists():
+        _SESSION_COMPARE_COMBINED_PF_CACHE[cache_key] = None
+        return None
+
+    try:
+        with cache_path.open("rb") as fh:
+            cache_obj = pickle.load(fh)
+    except Exception:
+        _SESSION_COMPARE_COMBINED_PF_CACHE[cache_key] = None
+        return None
+
+    if not isinstance(cache_obj, dict):
+        _SESSION_COMPARE_COMBINED_PF_CACHE[cache_key] = None
+        return None
+    cells_obj = cache_obj.get("cells", {})
+    if not isinstance(cells_obj, dict):
+        _SESSION_COMPARE_COMBINED_PF_CACHE[cache_key] = None
+        return None
+
+    combined_cells: dict[int, dict[str, Any]] = {}
+    for raw_key, by_cond in cells_obj.items():
+        if not isinstance(by_cond, dict):
+            continue
+        combined = by_cond.get("combined", None)
+        if not isinstance(combined, dict):
+            continue
+        try:
+            key_int = int(raw_key)
+        except Exception:
+            try:
+                key_int = int(combined.get("cell_idx", -1))
+            except Exception:
+                key_int = -1
+        if key_int < 0:
+            continue
+        combined_cells[key_int] = combined
+
+    _SESSION_COMPARE_COMBINED_PF_CACHE[cache_key] = combined_cells
+    return combined_cells
+
+
+def _resolve_distance_defined_pf_component_source(
+    *,
+    animal_id: str,
+    cell_idx: int,
+    analysis: dict[str, Any],
+    config: PipelineConfig,
+    pf_source_mode: str,
+    align_all_pf_components_to_session_compare: bool,
+    session_compare_cache_version: str,
+) -> dict[str, Any]:
+    source = str(pf_source_mode).strip().lower()
+    if source not in {"all", "ss"}:
+        raise ValueError(f"Unknown pf_source_mode='{pf_source_mode}'. Use 'all' or 'ss'.")
+
+    if source == "all" and bool(align_all_pf_components_to_session_compare):
+        combined_cells = _load_session_compare_combined_pf_cells(
+            config,
+            animal_id,
+            cache_version=str(session_compare_cache_version),
+        )
+        combined_cell = None if combined_cells is None else combined_cells.get(int(cell_idx), None)
+        if isinstance(combined_cell, dict) and bool(combined_cell.get("is_place_cell", False)):
+            combined_components = list(combined_cell.get("place_field_components", []) or [])
+            combined_mask = np.asarray(combined_cell.get("place_field_mask", []), dtype=bool)
+            if len(combined_components) > 0 or (combined_mask.size > 0 and np.any(combined_mask)):
+                return {
+                    "source_mode": "all",
+                    "source_name": "session_compare_combined",
+                    "components_raw": combined_components,
+                    "fallback_mask": combined_mask,
+                    "fallback_peak_rate": combined_cell.get("peak_rate", np.nan),
+                    "source_rate_map": np.asarray(combined_cell.get("rate_map", []), dtype=float),
+                    "missing_pf_message": (
+                        "No non-empty place_field_components and no non-empty fallback "
+                        "place_field_mask in session-compare combined cache entry."
+                    ),
+                }
+
+    if source == "ss":
+        return {
+            "source_mode": "ss",
+            "source_name": "runtime_ss",
+            "components_raw": list(analysis.get("ss_place_field_components", []) or []),
+            "fallback_mask": np.asarray(analysis.get("ss_place_field_mask", []), dtype=bool),
+            "fallback_peak_rate": analysis.get("ss_peak_rate", np.nan),
+            "source_rate_map": np.asarray(analysis.get("ss_rate_map", []), dtype=float),
+            "missing_pf_message": (
+                "No non-empty ss_place_field_components and no non-empty fallback "
+                "ss_place_field_mask."
+            ),
+        }
+
+    return {
+        "source_mode": "all",
+        "source_name": "runtime_all",
+        "components_raw": list(analysis.get("place_field_components", []) or []),
+        "fallback_mask": np.asarray(analysis.get("place_field_mask", []), dtype=bool),
+        "fallback_peak_rate": analysis.get("peak_rate", np.nan),
+        "source_rate_map": np.asarray(analysis.get("rate_map", []), dtype=float),
+        "missing_pf_message": (
+            "No non-empty place_field_components and no non-empty fallback "
+            "place_field_mask."
+        ),
+    }
+
+
 def _compute_single_cell_fr_vmaxs(
     entry_data: dict[str, Any],
     time_rel: np.ndarray,
     *,
     smooth_window: int = 0,
+    interpolate_nan: bool = True,
     direction_keys: tuple[str, str, str] = ("all", "cw", "ccw"),
 ) -> tuple[float, float, float]:
     cell_data = entry_data["data"]
@@ -8251,6 +13785,8 @@ def _compute_single_cell_fr_vmaxs(
             stack = np.asarray(stack, dtype=float)
             if stack.ndim != 2 or stack.shape[1] != n_time:
                 continue
+            if bool(interpolate_nan):
+                stack = _interpolate_nan_stack_rows(stack)
             if smooth_window > 1:
                 smoothed = np.zeros_like(stack)
                 for i in range(stack.shape[0]):
@@ -8640,6 +14176,8 @@ def _plot_single_cell_heatmap_on_figure(
                         aspect="auto",
                         origin="upper",
                         extent=[time_rel[0], time_rel[-1], actual_trials + 0.5, 0.5],
+                        interpolation="nearest",
+                        resample=False,
                     )
                     ax.axvline(center_line_x, color="k", linewidth=0.25, linestyle="--", alpha=0.5)
                     gap_y = _session_gap_y(dir_data, actual_trials)
@@ -8693,6 +14231,8 @@ def _plot_single_cell_heatmap_on_figure(
                         cmap=cmap_obj,
                         vmin=vmin_val,
                         vmax=vmax_val,
+                        interpolation="nearest",
+                        resample=False,
                     )
                     if merge_plateau and orig_row == 0:
                         p_stack = plateau_stacks[col]
@@ -8708,6 +14248,8 @@ def _plot_single_cell_heatmap_on_figure(
                                 aspect="auto",
                                 origin="upper",
                                 extent=[time_rel[0], time_rel[-1], actual_trials + 0.5, 0.5],
+                                interpolation="nearest",
+                                resample=False,
                             )
                     ax.axvline(center_line_x, color="k", linewidth=0.25, linestyle="--", alpha=0.5)
                     gap_y = _session_gap_y(dir_data, actual_trials)
@@ -8763,6 +14305,7 @@ def _plot_single_cell_heatmap_on_figure(
                 avg_ax.tick_params(labelsize=5, labelleft=show_avg_left)
             else:
                 avg_ax.tick_params(labelsize=4)
+            avg_ax.yaxis.set_major_formatter(FuncFormatter(_format_avg_axis_ticklabel))
             avg_ax.spines["top"].set_visible(False)
             avg_ax.spines["right"].set_visible(False)
 
@@ -8874,6 +14417,7 @@ def plot_pf_centered_single_cell_heatmap(
     heatmap_wspace: float = 0.15,
     avg_theta_ylim: tuple[float, float] | None = None,
     avg_slow_ylim: tuple[float, float] | None = None,
+    disable_pf2_avg_ylim_sync: bool = False,
     fixed_heatmap_height: float | None = None,
     fixed_subplot_width: float | None = None,
     direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
@@ -9013,6 +14557,7 @@ def plot_pf_centered_dual_component_heatmap(
     heatmap_wspace: float = 0.15,
     avg_theta_ylim: tuple[float, float] | None = None,
     avg_slow_ylim: tuple[float, float] | None = None,
+    disable_pf2_avg_ylim_sync: bool = False,
     fixed_heatmap_height: float | None = None,
     fixed_subplot_width: float | None = None,
     direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
@@ -9226,13 +14771,13 @@ def plot_pf_centered_dual_component_heatmap(
         show_session_gap_line=show_session_gap_line,
         fr_vmax_override=fr_vmax_use,
         colorbar_vmax_override=colorbar_vmax_use,
-        avg_ylim_override=pf1_avg_ylim,
+        avg_ylim_override=(None if bool(disable_pf2_avg_ylim_sync) else pf1_avg_ylim),
         fixed_heatmap_height=fixed_heatmap_height_use,
         fixed_subplot_width=fixed_subplot_width,
         panel_bbox=(right_bbox if exact_layout else None),
         show_row_ylabel=False,
         show_colorbar=True,
-        show_avg_yticks_left_only=True,
+        show_avg_yticks_left_only=(not bool(disable_pf2_avg_ylim_sync)),
         show_column_titles=show_column_titles_use,
         column_title_include_trials=bool(column_title_include_trials),
         x_label_col_idx=x_label_col_idx,
@@ -9283,6 +14828,7 @@ def generate_pf_centered_component_heatmaps(
     show_session_gap_line: bool = False,
     auto_colorbar_vmax_from_pf1_all: bool = True,
     colorbar_std_multiplier: float = 3.0,
+    output_prefix: str = "pf_centered",
     show_plot: bool = False,
 ) -> dict[str, Any]:
     figure_root = Path(figure_save_folder)
@@ -9290,7 +14836,7 @@ def generate_pf_centered_component_heatmaps(
     print(f"PF-centered heatmaps root folder: {figure_root}")
     categories = _ordered_dataset_categories(dataset)
     cat_to_dir = {
-        cat: figure_root / _category_output_dir_name(prefix="pf_centered", category=cat, suffix="_heatmaps")
+        cat: figure_root / _category_output_dir_name(prefix=str(output_prefix), category=cat, suffix="_heatmaps")
         for cat in categories
     }
     summary: dict[str, Any] = {}
@@ -9413,6 +14959,43 @@ def _extract_cell_metric_trace(
     return trace
 
 
+def _normalize_fr_norm_denominator_mode(mode: str | None) -> str:
+    mode_norm = str(mode or "zero").strip().lower()
+    aliases = {
+        "zero": "zero",
+        "at_zero": "zero",
+        "zero_point": "zero",
+        "zero_then_peak": "zero_then_peak",
+        "zero_or_peak": "zero_then_peak",
+        "peak_fallback": "zero_then_peak",
+    }
+    if mode_norm not in aliases:
+        raise ValueError("fr_norm_denominator_mode must be 'zero' or 'zero_then_peak'.")
+    return aliases[mode_norm]
+
+
+def _fr_norm_denominator_from_trace(
+    trace: Any,
+    zero_idx: int,
+    *,
+    mode: str = "zero",
+) -> tuple[float, str]:
+    arr = np.asarray(trace, dtype=float).reshape(-1) if trace is not None else np.array([], dtype=float)
+    if arr.size == 0:
+        return np.nan, "invalid"
+    idx = int(zero_idx)
+    zero_val = float(arr[idx]) if 0 <= idx < arr.size and np.isfinite(arr[idx]) else np.nan
+    if np.isfinite(zero_val) and not np.isclose(zero_val, 0.0):
+        return zero_val, "zero"
+    if _normalize_fr_norm_denominator_mode(mode) == "zero_then_peak":
+        finite = arr[np.isfinite(arr)]
+        if finite.size > 0:
+            peak_val = float(np.nanmax(finite))
+            if np.isfinite(peak_val) and not np.isclose(peak_val, 0.0):
+                return peak_val, "peak_fallback"
+    return np.nan, "invalid"
+
+
 def _plot_pooled_category_3col_on_axes(
     time_rel: np.ndarray,
     entries: list[dict[str, Any]],
@@ -9434,6 +15017,7 @@ def _plot_pooled_category_3col_on_axes(
     ss_cs_row_ylim_max: float | None = None,
     show_ss_cs_legend: bool = True,
     min_traversals_per_type: int = 5,
+    min_trials_per_column: int | None = None,
     x_label: str = "Time from max FR (s)",
     center_line_x: float = 0.0,
     align_all_peak_to_zero: bool = False,
@@ -9444,10 +15028,21 @@ def _plot_pooled_category_3col_on_axes(
     ccw_direction_key: str = "ccw",
     explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
     direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
+    fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
+    show_sem_shading: bool = True,
+    show_column_counts_in_titles: bool = False,
+    x_ticks: tuple[float, ...] | list[float] | np.ndarray | None = None,
 ) -> None:
     min_trav = int(min_traversals_per_type)
     if min_trav < 0:
         raise ValueError("min_traversals_per_type must be >= 0.")
+    if min_trials_per_column is not None:
+        min_col_req = int(min_trials_per_column)
+        if min_col_req < 0:
+            raise ValueError("min_trials_per_column must be >= 0.")
+    else:
+        min_col_req = min_trav
     n_time = len(time_rel)
 
     def _mean_sem(arr: np.ndarray | None) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -9484,11 +15079,34 @@ def _plot_pooled_category_3col_on_axes(
     if len(titles_in) != 3:
         raise ValueError("direction_titles must contain exactly three labels.")
     dir_titles = [str(titles_in[0]), str(titles_in[1]), str(titles_in[2])]
+    ref_norm = str(fr_norm_reference_col).strip().lower()
+    ref_aliases = {
+        "all": "all",
+        "combined": "all",
+        "pref": "preferred",
+        "preferred": "preferred",
+        "nonpref": "nonpreferred",
+        "non-pref": "nonpreferred",
+        "nonpreferred": "nonpreferred",
+        "non-preferred": "nonpreferred",
+    }
+    if ref_norm not in ref_aliases:
+        raise ValueError("fr_norm_reference_col must be one of: 'all', 'preferred', or 'nonpreferred'.")
+    ref_norm = ref_aliases[ref_norm]
+    denom_mode = _normalize_fr_norm_denominator_mode(fr_norm_denominator_mode)
     trace_direction_keys = [all_key, cw_key, ccw_key]
     if pref_fixed is not None:
         trace_direction_keys.extend([pref_fixed, nonpref_fixed])
     trace_direction_keys = list(dict.fromkeys(trace_direction_keys))
     metric_keys = ["rate_stack", "ss_rate_stack", "cs_rate_stack", "theta_stack", "slow_stack"]
+    denom_source_counts: dict[str, int] = {"zero": 0, "peak_fallback": 0, "external": 0, "invalid": 0}
+
+    def _valid_plotted_trace(trace: Any) -> bool:
+        if trace is None:
+            return False
+        arr = np.asarray(trace, dtype=float)
+        return bool(arr.ndim == 1 and arr.size == n_time and np.any(np.isfinite(arr)))
+
     records = []
     for e in entries:
         cell_data = e.get("data")
@@ -9555,22 +15173,69 @@ def _plot_pooled_category_3col_on_axes(
             preferred_dir_key = str(pref_fixed)
             nonpreferred_dir_key = str(nonpref_fixed)
 
+        if preferred_dir_key is None or nonpreferred_dir_key is None:
+            continue
+        plotted_direction_keys = [all_key, str(preferred_dir_key), str(nonpreferred_dir_key)]
+        has_all_plotted_traces = all(
+            _valid_plotted_trace(traces[direction_key].get(metric_key))
+            for direction_key in plotted_direction_keys
+            for metric_key in metric_keys
+        )
+        if not has_all_plotted_traces:
+            continue
+
         # Gate inclusion so each kept cell has enough traversals in all 3 plotted types:
         # All, Preferred, Non-preferred.
         n_all_trials = int(cell_data.get(all_key, {}).get("n_trials", 0))
-        n_pref_trials = int(cell_data.get(str(preferred_dir_key), {}).get("n_trials", 0)) if preferred_dir_key is not None else 0
-        n_nonpref_trials = int(cell_data.get(str(nonpreferred_dir_key), {}).get("n_trials", 0)) if nonpreferred_dir_key is not None else 0
+        n_pref_trials = int(cell_data.get(str(preferred_dir_key), {}).get("n_trials", 0))
+        n_nonpref_trials = int(cell_data.get(str(nonpreferred_dir_key), {}).get("n_trials", 0))
         if (
-            n_all_trials < min_trav
-            or n_pref_trials < min_trav
-            or n_nonpref_trials < min_trav
+            n_all_trials < min_col_req
+            or n_pref_trials < min_col_req
+            or n_nonpref_trials < min_col_req
         ):
+            continue
+        pref_rate = traces[str(preferred_dir_key)].get("rate_stack")
+        nonpref_rate = traces[str(nonpreferred_dir_key)].get("rate_stack")
+        ref_trace_by_col = {
+            "all": all_rate,
+            "preferred": pref_rate,
+            "nonpreferred": nonpref_rate,
+        }
+        rate_zero_by_col = {
+            "all": float(all_zero),
+            "preferred": float(pref_rate[zero_idx]) if pref_rate is not None and np.size(pref_rate) > zero_idx else np.nan,
+            "nonpreferred": float(nonpref_rate[zero_idx]) if nonpref_rate is not None and np.size(nonpref_rate) > zero_idx else np.nan,
+        }
+        rate_denom_by_col: dict[str, float] = {}
+        rate_denom_source_by_col: dict[str, str] = {}
+        for col_key, col_trace in ref_trace_by_col.items():
+            denom_val, denom_source = _fr_norm_denominator_from_trace(
+                col_trace,
+                zero_idx,
+                mode=denom_mode,
+            )
+            rate_denom_by_col[col_key] = float(denom_val) if np.isfinite(denom_val) else np.nan
+            rate_denom_source_by_col[col_key] = str(denom_source)
+        if rate_norm_denom_by_cell is not None:
+            override = rate_norm_denom_by_cell.get((session, cell_idx, "all"))
+            if override is None:
+                override = rate_norm_denom_by_cell.get((session, cell_idx))
+            if override is not None and np.isfinite(override) and not np.isclose(float(override), 0.0):
+                rate_denom_by_col[ref_norm] = float(override)
+                rate_denom_source_by_col[ref_norm] = "external"
+        ref_denom_source = str(rate_denom_source_by_col.get(ref_norm, "invalid"))
+        denom_source_counts[ref_denom_source] = int(denom_source_counts.get(ref_denom_source, 0)) + 1
+        if ref_denom_source == "invalid":
             continue
 
         records.append(
             {
                 "traces": traces,
                 "all_rate_zero": all_zero,
+                "rate_zero_by_col": rate_zero_by_col,
+                "rate_denom_by_col": rate_denom_by_col,
+                "rate_denom_source_by_col": rate_denom_source_by_col,
                 "preferred_direction_key": preferred_dir_key,
                 "nonpreferred_direction_key": nonpreferred_dir_key,
                 "session": session,
@@ -9599,13 +15264,17 @@ def _plot_pooled_category_3col_on_axes(
             if trace.size != n_time:
                 continue
             if normalize_with_all:
-                # Row-1 normalization anchor: all-traversal raw FR at t=0.
-                denom = rec["all_rate_zero"]
+                # Row-1 normalization anchor.  Direction comparison can use
+                # the first comparison column (preferred) to mirror the
+                # two-session plot's session1 normalization.
+                denom = float(rec.get("rate_denom_by_col", {}).get(ref_norm, rec["all_rate_zero"]))
                 # Optional override for row-1 normalization (e.g., PF2 normalized by PF1 All FR).
                 # Apply the same denominator override logic to all row-1/row-2 rate traces so
                 # row 2 remains normalized by the exact row-1 denominator.
                 if rate_norm_denom_by_cell is not None:
-                    override = rate_norm_denom_by_cell.get((rec["session"], int(rec["cell_idx"])))
+                    override = rate_norm_denom_by_cell.get((rec["session"], int(rec["cell_idx"]), "all"))
+                    if override is None:
+                        override = rate_norm_denom_by_cell.get((rec["session"], int(rec["cell_idx"])))
                     if override is not None and np.isfinite(override) and override != 0:
                         denom = float(override)
                 if (not np.isfinite(denom)) or denom == 0:
@@ -9671,28 +15340,34 @@ def _plot_pooled_category_3col_on_axes(
 
         if rate_mean is not None:
             axes[0, col].plot(time_rel, rate_mean, color="#555555", linewidth=1.0)
-            axes[0, col].fill_between(time_rel, rate_mean - rate_sem, rate_mean + rate_sem, color="#555555", alpha=0.2)
+            if bool(show_sem_shading):
+                axes[0, col].fill_between(time_rel, rate_mean - rate_sem, rate_mean + rate_sem, color="#555555", alpha=0.2)
         axes[0, col].axvline(center_line_x, color="black", linewidth=0.4, linestyle="--", alpha=0.6)
-        axes[0, col].set_title(f"{dir_title}", fontsize=6)
+        column_title = f"{dir_title} (n={int(n_cells)})" if bool(show_column_counts_in_titles) else f"{dir_title}"
+        axes[0, col].set_title(column_title, fontsize=6)
 
         if cs_mean is not None:
             axes[1, col].plot(time_rel, cs_mean, color="#EE9B00", linewidth=1.0, label="CS")
-            axes[1, col].fill_between(time_rel, cs_mean - cs_sem, cs_mean + cs_sem, color="#EE9B00", alpha=0.2)
+            if bool(show_sem_shading):
+                axes[1, col].fill_between(time_rel, cs_mean - cs_sem, cs_mean + cs_sem, color="#EE9B00", alpha=0.2)
         if ss_mean is not None:
             axes[1, col].plot(time_rel, ss_mean, color="#026C80", linewidth=1.0, label="SS")
-            axes[1, col].fill_between(time_rel, ss_mean - ss_sem, ss_mean + ss_sem, color="#026C80", alpha=0.2)
+            if bool(show_sem_shading):
+                axes[1, col].fill_between(time_rel, ss_mean - ss_sem, ss_mean + ss_sem, color="#026C80", alpha=0.2)
         axes[1, col].axvline(center_line_x, color="black", linewidth=0.4, linestyle="--", alpha=0.6)
         if col == 0 and show_ss_cs_legend:
             axes[1, col].legend(fontsize=5, frameon=False, loc="upper right")
 
         if theta_mean is not None:
             axes[2, col].plot(time_rel, theta_mean, color="blue", linewidth=1.0)
-            axes[2, col].fill_between(time_rel, theta_mean - theta_sem, theta_mean + theta_sem, color="blue", alpha=0.2)
+            if bool(show_sem_shading):
+                axes[2, col].fill_between(time_rel, theta_mean - theta_sem, theta_mean + theta_sem, color="blue", alpha=0.2)
         axes[2, col].axvline(center_line_x, color="black", linewidth=0.4, linestyle="--", alpha=0.6)
 
         if slow_mean is not None:
             axes[3, col].plot(time_rel, slow_mean, color="red", linewidth=1.0)
-            axes[3, col].fill_between(time_rel, slow_mean - slow_sem, slow_mean + slow_sem, color="red", alpha=0.2)
+            if bool(show_sem_shading):
+                axes[3, col].fill_between(time_rel, slow_mean - slow_sem, slow_mean + slow_sem, color="red", alpha=0.2)
         axes[3, col].axvline(center_line_x, color="black", linewidth=0.4, linestyle="--", alpha=0.6)
         axes[3, col].axhline(0, color="black", linewidth=0.4, linestyle="--", alpha=0.6)
 
@@ -9704,12 +15379,26 @@ def _plot_pooled_category_3col_on_axes(
             f"Pref (n={n_cells_by_direction.get('preferred', 0)}), "
             f"Non-pref (n={n_cells_by_direction.get('nonpreferred', 0)})"
         )
+        print(
+            f"{label} FR norm denominator mode={denom_mode}: "
+            f"zero={int(denom_source_counts.get('zero', 0))}, "
+            f"peak fallback={int(denom_source_counts.get('peak_fallback', 0))}, "
+            f"external={int(denom_source_counts.get('external', 0))}, "
+            f"invalid/skipped={int(denom_source_counts.get('invalid', 0))}"
+        )
     else:
         print(
             f"Counts: "
             f"All (n={n_cells_by_direction.get('all', 0)}), "
             f"Pref (n={n_cells_by_direction.get('preferred', 0)}), "
             f"Non-pref (n={n_cells_by_direction.get('nonpreferred', 0)})"
+        )
+        print(
+            f"FR norm denominator mode={denom_mode}: "
+            f"zero={int(denom_source_counts.get('zero', 0))}, "
+            f"peak fallback={int(denom_source_counts.get('peak_fallback', 0))}, "
+            f"external={int(denom_source_counts.get('external', 0))}, "
+            f"invalid/skipped={int(denom_source_counts.get('invalid', 0))}"
         )
 
     if set_row_labels:
@@ -9742,6 +15431,8 @@ def _plot_pooled_category_3col_on_axes(
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.set_xlim(xlim)
+        if x_ticks is not None:
+            ax.set_xticks(np.asarray(x_ticks, dtype=float))
 
 
 def plot_pooled_category_3col(
@@ -9763,6 +15454,7 @@ def plot_pooled_category_3col(
     fr_row_ylim_max: float | None = None,
     ss_cs_row_ylim_max: float | None = None,
     min_traversals_per_type: int = 5,
+    min_trials_per_column: int | None = None,
     x_label: str = "Time from max FR (s)",
     center_line_x: float = 0.0,
     align_all_peak_to_zero: bool = False,
@@ -9773,6 +15465,12 @@ def plot_pooled_category_3col(
     ccw_direction_key: str = "ccw",
     explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
     direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
+    fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
+    rate_norm_denom_by_cell: dict[tuple[str, int] | tuple[str, int, str], float] | None = None,
+    show_sem_shading: bool = True,
+    show_column_counts_in_titles: bool = False,
+    x_ticks: tuple[float, ...] | list[float] | np.ndarray | None = None,
     show_plot: bool = True,
     close_on_return: bool = True,
 ) -> plt.Figure | None:
@@ -9798,6 +15496,7 @@ def plot_pooled_category_3col(
         fr_row_ylim_max=fr_row_ylim_max,
         ss_cs_row_ylim_max=ss_cs_row_ylim_max,
         min_traversals_per_type=min_traversals_per_type,
+        min_trials_per_column=min_trials_per_column,
         x_label=x_label,
         center_line_x=center_line_x,
         align_all_peak_to_zero=align_all_peak_to_zero,
@@ -9808,6 +15507,12 @@ def plot_pooled_category_3col(
         ccw_direction_key=ccw_direction_key,
         explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
         direction_titles=direction_titles,
+        fr_norm_reference_col=fr_norm_reference_col,
+        fr_norm_denominator_mode=fr_norm_denominator_mode,
+        rate_norm_denom_by_cell=rate_norm_denom_by_cell,
+        show_sem_shading=show_sem_shading,
+        show_column_counts_in_titles=show_column_counts_in_titles,
+        x_ticks=x_ticks,
     )
     fig.suptitle(f"{title}", y=0.98)
     try:
@@ -9846,6 +15551,7 @@ def plot_pooled_category_primary_secondary(
     fr_row_ylim_max: float | None = 1.2,
     ss_cs_row_ylim_max: float | None = None,
     min_traversals_per_type: int = 5,
+    min_trials_per_column: int | None = None,
     x_label: str = "Time from max FR (s)",
     center_line_x: float = 0.0,
     align_all_peak_to_zero: bool = False,
@@ -9856,6 +15562,12 @@ def plot_pooled_category_primary_secondary(
     ccw_direction_key: str = "ccw",
     explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
     direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
+    fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
+    rate_norm_denom_by_cell: dict[tuple[str, int] | tuple[str, int, str], float] | None = None,
+    show_sem_shading: bool = True,
+    show_column_counts_in_titles: bool = False,
+    x_ticks: tuple[float, ...] | list[float] | np.ndarray | None = None,
     show_plot: bool = True,
     close_on_return: bool = True,
 ) -> plt.Figure | None:
@@ -9882,6 +15594,7 @@ def plot_pooled_category_primary_secondary(
             fr_row_ylim_max=fr_row_ylim_max,
             ss_cs_row_ylim_max=ss_cs_row_ylim_max,
             min_traversals_per_type=min_traversals_per_type,
+            min_trials_per_column=min_trials_per_column,
             x_label=x_label,
             center_line_x=center_line_x,
             align_all_peak_to_zero=align_all_peak_to_zero,
@@ -9892,32 +15605,109 @@ def plot_pooled_category_primary_secondary(
             ccw_direction_key=ccw_direction_key,
             explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
             direction_titles=direction_titles,
+            fr_norm_reference_col=fr_norm_reference_col,
+            fr_norm_denominator_mode=fr_norm_denominator_mode,
+            rate_norm_denom_by_cell=rate_norm_denom_by_cell,
+            show_sem_shading=show_sem_shading,
+            show_column_counts_in_titles=show_column_counts_in_titles,
+            x_ticks=x_ticks,
             show_plot=show_plot,
             close_on_return=close_on_return,
         )
 
-    # Build PF1 denominator map for PF2 row-1 normalization:
-    # PF2 uses PF1 all-traversal raw FR at t=0 as denominator.
+    # Build PF1 denominator map for PF2 row-1 normalization, using the same
+    # reference column as PF1.  This mirrors the two-session plot where PF2 is
+    # normalized by the PF1 value from the selected reference column.
     denom_map: dict[tuple[str, int] | tuple[str, int, str], float] = {}
     time_rel_primary = np.asarray(time_rel_primary, dtype=float)
     zero_idx = int(np.argmin(np.abs(time_rel_primary)))
+    ref_norm = str(fr_norm_reference_col).strip().lower()
+    ref_aliases = {
+        "all": "all",
+        "combined": "all",
+        "pref": "preferred",
+        "preferred": "preferred",
+        "nonpref": "nonpreferred",
+        "non-pref": "nonpreferred",
+        "nonpreferred": "nonpreferred",
+        "non-preferred": "nonpreferred",
+    }
+    if ref_norm not in ref_aliases:
+        raise ValueError("fr_norm_reference_col must be one of: 'all', 'preferred', or 'nonpreferred'.")
+    ref_norm = ref_aliases[ref_norm]
 
     for entry in entries_primary:
         session = str(entry.get("session", ""))
         cell_idx = int(entry.get("cell_idx", -1))
         if not session or cell_idx < 0:
             continue
-        all_tr = _extract_cell_metric_trace(
-            entry.get("data", {}),
-            str(all_direction_key),
+        cell_data = entry.get("data", {})
+        cw_tr = _extract_cell_metric_trace(
+            cell_data,
+            str(cw_direction_key),
             "rate_stack",
             len(time_rel_primary),
             smooth_window=smooth_window,
             avg_smooth_window=(smooth_window if avg_smooth_window is None else avg_smooth_window),
         )
-        if all_tr is not None and all_tr.size > zero_idx:
-            denom_map[(session, cell_idx, "all")] = float(all_tr[zero_idx])
-            denom_map[(session, cell_idx)] = float(all_tr[zero_idx])
+        ccw_tr = _extract_cell_metric_trace(
+            cell_data,
+            str(ccw_direction_key),
+            "rate_stack",
+            len(time_rel_primary),
+            smooth_window=smooth_window,
+            avg_smooth_window=(smooth_window if avg_smooth_window is None else avg_smooth_window),
+        )
+        if explicit_preferred_nonpreferred_keys is not None:
+            pref_nonpref = tuple(explicit_preferred_nonpreferred_keys)
+            pref_key = str(pref_nonpref[0]).strip() if len(pref_nonpref) >= 1 else None
+            nonpref_key = str(pref_nonpref[1]).strip() if len(pref_nonpref) >= 2 else None
+        else:
+            preferred_dir = _infer_preferred_direction_from_rate_traces(cw_tr, ccw_tr)
+            if preferred_dir == "cw":
+                pref_key = str(cw_direction_key)
+                nonpref_key = str(ccw_direction_key)
+            elif preferred_dir == "ccw":
+                pref_key = str(ccw_direction_key)
+                nonpref_key = str(cw_direction_key)
+            else:
+                pref_key = None
+                nonpref_key = None
+        if ref_norm == "preferred":
+            ref_key = pref_key
+        elif ref_norm == "nonpreferred":
+            ref_key = nonpref_key
+        else:
+            ref_key = str(all_direction_key)
+        if ref_key is None:
+            continue
+        ref_tr = _extract_cell_metric_trace(
+            cell_data,
+            ref_key,
+            "rate_stack",
+            len(time_rel_primary),
+            smooth_window=smooth_window,
+            avg_smooth_window=(smooth_window if avg_smooth_window is None else avg_smooth_window),
+        )
+        denom_val, _ = _fr_norm_denominator_from_trace(
+            ref_tr,
+            zero_idx,
+            mode=fr_norm_denominator_mode,
+        )
+        if np.isfinite(denom_val) and not np.isclose(float(denom_val), 0.0):
+            denom_map[(session, cell_idx, "all")] = float(denom_val)
+            denom_map[(session, cell_idx)] = float(denom_val)
+    if rate_norm_denom_by_cell is not None:
+        # External denominators are used when another analysis defines the
+        # normalization anchor.  For example, time-centered direction grand
+        # averages can use the exact distance-centered PF1 denominator.
+        for key, value in dict(rate_norm_denom_by_cell).items():
+            try:
+                val = float(value)
+            except Exception:
+                continue
+            if np.isfinite(val) and not np.isclose(val, 0.0):
+                denom_map[key] = val
 
     fig, axes = plt.subplots(
         4,
@@ -9945,6 +15735,7 @@ def plot_pooled_category_primary_secondary(
         ss_cs_row_ylim_max=ss_cs_row_ylim_max,
         show_ss_cs_legend=True,
         min_traversals_per_type=min_traversals_per_type,
+        min_trials_per_column=min_trials_per_column,
         x_label=x_label,
         center_line_x=center_line_x,
         align_all_peak_to_zero=align_all_peak_to_zero,
@@ -9955,6 +15746,12 @@ def plot_pooled_category_primary_secondary(
         ccw_direction_key=ccw_direction_key,
         explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
         direction_titles=direction_titles,
+        fr_norm_reference_col=fr_norm_reference_col,
+        fr_norm_denominator_mode=fr_norm_denominator_mode,
+        rate_norm_denom_by_cell=rate_norm_denom_by_cell,
+        show_sem_shading=show_sem_shading,
+        show_column_counts_in_titles=show_column_counts_in_titles,
+        x_ticks=x_ticks,
     )
     _plot_pooled_category_3col_on_axes(
         np.asarray(time_rel_secondary, dtype=float),
@@ -9976,6 +15773,7 @@ def plot_pooled_category_primary_secondary(
         ss_cs_row_ylim_max=ss_cs_row_ylim_max,
         show_ss_cs_legend=False,
         min_traversals_per_type=min_traversals_per_type,
+        min_trials_per_column=min_trials_per_column,
         x_label=x_label,
         center_line_x=center_line_x,
         align_all_peak_to_zero=align_all_peak_to_zero,
@@ -9986,6 +15784,11 @@ def plot_pooled_category_primary_secondary(
         ccw_direction_key=ccw_direction_key,
         explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
         direction_titles=direction_titles,
+        fr_norm_reference_col=fr_norm_reference_col,
+        fr_norm_denominator_mode=fr_norm_denominator_mode,
+        show_sem_shading=show_sem_shading,
+        show_column_counts_in_titles=show_column_counts_in_titles,
+        x_ticks=x_ticks,
     )
     fig.suptitle(f"{title}", y=0.999)
     try:
@@ -10208,10 +16011,52 @@ def _normalize_two_session_split_mode(split_mode: str | None) -> str:
         "time_window": "time_windows",
         "windows": "time_windows",
         "fixed_windows": "time_windows",
+        "prepost_plateau": "prepost_plateau",
+        "pre_post_plateau": "prepost_plateau",
+        "plateau": "prepost_plateau",
+        "plateau_split": "prepost_plateau",
     }
     if token not in aliases:
-        raise ValueError("split_mode must be 'recorded_sessions' or 'time_windows'.")
+        raise ValueError("split_mode must be 'recorded_sessions', 'time_windows', or 'prepost_plateau'.")
     return aliases[token]
+
+
+def _normalize_two_phase_labels(
+    phase_labels: tuple[str, str] | list[str] | None = None,
+    *,
+    split_mode: str = "recorded_sessions",
+) -> tuple[str, str]:
+    if phase_labels is None:
+        mode = _normalize_two_session_split_mode(split_mode)
+        if mode == "prepost_plateau":
+            return "Pre plateau", "Post plateau"
+        return "Session 1", "Session 2"
+    labels = tuple(str(v).strip() for v in phase_labels)
+    if len(labels) != 2 or any(len(v) == 0 for v in labels):
+        raise ValueError("phase_labels must contain exactly two non-empty labels.")
+    return labels[0], labels[1]
+
+
+def _two_phase_count_labels(phase_labels: tuple[str, str] | list[str] | None = None, *, split_mode: str = "recorded_sessions") -> tuple[str, str]:
+    labels = _normalize_two_phase_labels(phase_labels, split_mode=split_mode)
+    mode = _normalize_two_session_split_mode(split_mode)
+    if mode == "prepost_plateau" or labels == ("Pre plateau", "Post plateau"):
+        return "pre", "post"
+    return "S1", "S2"
+
+
+def _validate_plateau_split_min_traversals_per_phase(value: int | float | None) -> int:
+    min_val = 5 if value is None else int(value)
+    if min_val < 0:
+        raise ValueError("plateau_split_min_traversals_per_phase must be >= 0.")
+    return int(min_val)
+
+
+def _validate_plateau_split_excluded_traversals(value: int | float | None) -> int:
+    excl = 0 if value is None else int(value)
+    if excl < 0:
+        raise ValueError("plateau_split_excluded_traversals must be >= 0.")
+    return int(excl)
 
 
 def _validate_two_session_split_window_minutes(
@@ -10243,6 +16088,8 @@ def _two_session_split_metadata(
     *,
     split_mode: str,
     split_window_minutes: float | None,
+    plateau_split_min_traversals_per_phase: int | None = None,
+    plateau_split_excluded_traversals: int | None = None,
 ) -> dict[str, Any]:
     mode = _normalize_two_session_split_mode(split_mode)
     window_min = _validate_two_session_split_window_minutes(mode, split_window_minutes)
@@ -10255,6 +16102,19 @@ def _two_session_split_metadata(
             "window1_end_sec": float(window_sec),
             "window2_start_sec": float(window_sec),
             "window2_end_sec": float(window_sec * 2.0),
+            "plateau_split_min_traversals_per_phase": np.nan,
+            "plateau_split_excluded_traversals": np.nan,
+        }
+    if mode == "prepost_plateau":
+        return {
+            "split_mode": mode,
+            "split_window_minutes": np.nan,
+            "window1_start_sec": np.nan,
+            "window1_end_sec": np.nan,
+            "window2_start_sec": np.nan,
+            "window2_end_sec": np.nan,
+            "plateau_split_min_traversals_per_phase": int(_validate_plateau_split_min_traversals_per_phase(plateau_split_min_traversals_per_phase)),
+            "plateau_split_excluded_traversals": int(_validate_plateau_split_excluded_traversals(plateau_split_excluded_traversals)),
         }
     return {
         "split_mode": mode,
@@ -10263,6 +16123,8 @@ def _two_session_split_metadata(
         "window1_end_sec": np.nan,
         "window2_start_sec": np.nan,
         "window2_end_sec": np.nan,
+        "plateau_split_min_traversals_per_phase": np.nan,
+        "plateau_split_excluded_traversals": np.nan,
     }
 
 
@@ -10272,10 +16134,14 @@ def _export_matches_two_session_split(
     *,
     split_mode: str,
     split_window_minutes: float | None,
+    plateau_split_min_traversals_per_phase: int | None = None,
+    plateau_split_excluded_traversals: int | None = None,
 ) -> bool:
     expected = _two_session_split_metadata(
         split_mode=split_mode,
         split_window_minutes=split_window_minutes,
+        plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase,
+        plateau_split_excluded_traversals=plateau_split_excluded_traversals,
     )
 
     def _scalar_from_sources(key: str) -> Any:
@@ -10311,6 +16177,17 @@ def _export_matches_two_session_split(
                 return False
         elif (not np.isfinite(got_val)) or (not np.isclose(got_val, float(exp_val), atol=1e-9, rtol=0.0)):
             return False
+    if str(expected["split_mode"]) == "prepost_plateau":
+        for key in ("plateau_split_min_traversals_per_phase", "plateau_split_excluded_traversals"):
+            got_raw = _scalar_from_sources(key)
+            if got_raw is None:
+                return False
+            try:
+                got_val = int(float(got_raw))
+            except (TypeError, ValueError):
+                return False
+            if got_val != int(expected[key]):
+                return False
     return True
 
 
@@ -10403,6 +16280,62 @@ def _recompute_distance_direction_trial_summary(
     return out
 
 
+def _filter_distance_direction_rows_with_labels(
+    dir_data: dict[str, Any],
+    *,
+    keep: np.ndarray,
+    labels: np.ndarray,
+) -> dict[str, Any] | None:
+    n_rows_ref = _infer_distance_direction_trial_count(dir_data)
+    if n_rows_ref <= 0:
+        return _recompute_distance_direction_trial_summary(dict(dir_data), n_trials=0)
+
+    keep = np.asarray(keep, dtype=bool).reshape(-1)
+    labels = np.asarray(labels, dtype=int).reshape(-1)
+    if keep.size != int(n_rows_ref) or labels.size != int(n_rows_ref):
+        return None
+
+    trial_data_in = dir_data.get("trial_data", {})
+    trial_data_in = trial_data_in if isinstance(trial_data_in, dict) else {}
+    out = dict(dir_data)
+    rowwise_1d_keys = {"pf_entry_rel", "pf_exit_rel", "n_plateaus_per_trial", "traversal_types"}
+
+    for key, value in dir_data.items():
+        if key == "trial_data":
+            continue
+        if key == "plateau_trace_events_by_trial" and isinstance(value, (list, tuple)) and len(value) == int(n_rows_ref):
+            out[key] = [value[int(i)] for i in np.flatnonzero(keep)]
+            continue
+        try:
+            arr = np.asarray(value)
+        except Exception:
+            out[key] = value
+            continue
+        if arr.ndim == 2 and arr.shape[0] == int(n_rows_ref):
+            out[key] = arr[keep]
+        elif key in rowwise_1d_keys and arr.ndim == 1 and arr.size == int(n_rows_ref):
+            out[key] = arr[keep]
+        else:
+            out[key] = value
+
+    trial_data_out: dict[str, Any] = {}
+    for key, value in trial_data_in.items():
+        if key == "session_idx":
+            continue
+        try:
+            arr = np.asarray(value)
+        except Exception:
+            trial_data_out[key] = value
+            continue
+        if arr.ndim == 1 and arr.size == int(n_rows_ref):
+            trial_data_out[key] = arr[keep]
+        else:
+            trial_data_out[key] = value
+    trial_data_out["session_idx"] = np.asarray(labels[keep], dtype=int)
+    out["trial_data"] = trial_data_out
+    return _recompute_distance_direction_trial_summary(out, n_trials=int(np.sum(keep)))
+
+
 def _split_distance_direction_for_two_sessions(
     dir_data: dict[str, Any],
     *,
@@ -10432,39 +16365,115 @@ def _split_distance_direction_for_two_sessions(
     session_labels[finite_mask & (epoch_start_sec >= window_sec) & (epoch_start_sec < (2.0 * window_sec))] = 1
     keep = session_labels >= 0
 
-    out = dict(dir_data)
-    rowwise_1d_keys = {"pf_entry_rel", "pf_exit_rel", "n_plateaus_per_trial", "traversal_types"}
-    for key, value in dir_data.items():
-        if key == "trial_data":
-            continue
-        try:
-            arr = np.asarray(value)
-        except Exception:
-            out[key] = value
-            continue
-        if arr.ndim == 2 and arr.shape[0] == int(n_rows_ref):
-            out[key] = arr[keep]
-        elif key in rowwise_1d_keys and arr.ndim == 1 and arr.size == int(n_rows_ref):
-            out[key] = arr[keep]
-        else:
-            out[key] = value
+    return _filter_distance_direction_rows_with_labels(dir_data, keep=keep, labels=session_labels)
 
-    trial_data_out: dict[str, Any] = {}
-    for key, value in trial_data_in.items():
-        if key == "session_idx":
-            continue
-        try:
-            arr = np.asarray(value)
-        except Exception:
-            trial_data_out[key] = value
-            continue
-        if arr.ndim == 1 and arr.size == int(n_rows_ref):
-            trial_data_out[key] = arr[keep]
+
+def _prepost_plateau_split_spec_from_all_direction(
+    all_data: dict[str, Any],
+    *,
+    plateau_split_min_traversals_per_phase: int,
+    plateau_split_excluded_traversals: int,
+) -> dict[str, Any] | None:
+    n_rows_ref = _infer_distance_direction_trial_count(all_data)
+    if n_rows_ref <= 0:
+        return None
+    n_plateaus = np.asarray(all_data.get("n_plateaus_per_trial", []), dtype=float).reshape(-1)
+    if n_plateaus.ndim != 1 or n_plateaus.size != int(n_rows_ref):
+        return None
+    plateau_rows = np.flatnonzero(np.isfinite(n_plateaus) & (n_plateaus > 0))
+    if plateau_rows.size == 0:
+        return None
+    first_plateau_idx = int(plateau_rows[0])
+    post_start_idx = int(first_plateau_idx + int(plateau_split_excluded_traversals))
+    if post_start_idx >= int(n_rows_ref):
+        return None
+
+    pre_count = int(first_plateau_idx)
+    post_count = int(n_rows_ref - post_start_idx)
+    min_trav = int(plateau_split_min_traversals_per_phase)
+    if pre_count < min_trav or post_count < min_trav:
+        return None
+
+    trial_data = all_data.get("trial_data", {}) if isinstance(all_data, dict) else {}
+    trial_data = trial_data if isinstance(trial_data, dict) else {}
+    epoch_start_frames = np.asarray(trial_data.get("epoch_start_frames", []), dtype=float).reshape(-1)
+    if epoch_start_frames.ndim != 1 or epoch_start_frames.size != int(n_rows_ref):
+        return None
+    if (not np.isfinite(epoch_start_frames[first_plateau_idx])) or (not np.isfinite(epoch_start_frames[post_start_idx])):
+        return None
+
+    return {
+        "first_plateau_idx": int(first_plateau_idx),
+        "post_start_idx": int(post_start_idx),
+        "first_plateau_epoch_start_frame": float(epoch_start_frames[first_plateau_idx]),
+        "post_epoch_start_frame": float(epoch_start_frames[post_start_idx]),
+        "pre_count_all": int(pre_count),
+        "post_count_all": int(post_count),
+        "plateau_split_min_traversals_per_phase": int(min_trav),
+        "plateau_split_excluded_traversals": int(plateau_split_excluded_traversals),
+    }
+
+
+def _split_distance_direction_for_prepost_plateau(
+    dir_data: dict[str, Any],
+    *,
+    split_spec: dict[str, Any],
+) -> dict[str, Any] | None:
+    n_rows_ref = _infer_distance_direction_trial_count(dir_data)
+    if n_rows_ref <= 0:
+        return _recompute_distance_direction_trial_summary(dict(dir_data), n_trials=0)
+    trial_data = dir_data.get("trial_data", {}) if isinstance(dir_data, dict) else {}
+    trial_data = trial_data if isinstance(trial_data, dict) else {}
+    epoch_start_frames = np.asarray(trial_data.get("epoch_start_frames", []), dtype=float).reshape(-1)
+    if epoch_start_frames.ndim != 1 or epoch_start_frames.size != int(n_rows_ref):
+        return None
+
+    first_frame = float(split_spec["first_plateau_epoch_start_frame"])
+    post_frame = float(split_spec["post_epoch_start_frame"])
+    labels = np.full(int(n_rows_ref), -1, dtype=int)
+    finite = np.isfinite(epoch_start_frames)
+    labels[finite & (epoch_start_frames < first_frame)] = 0
+    labels[finite & (epoch_start_frames >= post_frame)] = 1
+    keep = labels >= 0
+    return _filter_distance_direction_rows_with_labels(dir_data, keep=keep, labels=labels)
+
+
+def _split_distance_centered_entry_for_prepost_plateau(
+    entry: dict[str, Any] | None,
+    *,
+    plateau_split_min_traversals_per_phase: int,
+    plateau_split_excluded_traversals: int,
+) -> dict[str, Any] | None:
+    if entry is None:
+        return None
+    data_in = entry.get("data", {})
+    if not isinstance(data_in, dict):
+        return None
+    all_data = data_in.get("all", {})
+    if not isinstance(all_data, dict):
+        return None
+
+    split_spec = _prepost_plateau_split_spec_from_all_direction(
+        all_data,
+        plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase,
+        plateau_split_excluded_traversals=plateau_split_excluded_traversals,
+    )
+    if split_spec is None:
+        return None
+
+    out = dict(entry)
+    data_out: dict[str, Any] = {}
+    for dir_key, dir_data in data_in.items():
+        if dir_key in {"all", "cw", "ccw"} and isinstance(dir_data, dict):
+            split_dir = _split_distance_direction_for_prepost_plateau(dir_data, split_spec=split_spec)
+            if split_dir is None:
+                return None
+            data_out[dir_key] = split_dir
         else:
-            trial_data_out[key] = value
-    trial_data_out["session_idx"] = np.asarray(session_labels[keep], dtype=int)
-    out["trial_data"] = trial_data_out
-    return _recompute_distance_direction_trial_summary(out, n_trials=int(np.sum(keep)))
+            data_out[dir_key] = dir_data
+    out["data"] = data_out
+    out["_prepost_plateau_split"] = dict(split_spec)
+    return out
 
 
 def _split_distance_centered_entry_for_two_sessions(
@@ -10472,10 +16481,18 @@ def _split_distance_centered_entry_for_two_sessions(
     *,
     split_mode: str,
     split_window_minutes: float | None,
+    plateau_split_min_traversals_per_phase: int = 5,
+    plateau_split_excluded_traversals: int = 0,
 ) -> dict[str, Any] | None:
     if entry is None:
         return None
     mode = _normalize_two_session_split_mode(split_mode)
+    if mode == "prepost_plateau":
+        return _split_distance_centered_entry_for_prepost_plateau(
+            entry,
+            plateau_split_min_traversals_per_phase=int(plateau_split_min_traversals_per_phase),
+            plateau_split_excluded_traversals=int(plateau_split_excluded_traversals),
+        )
     if mode != "time_windows":
         return entry
 
@@ -10505,6 +16522,8 @@ def _split_distance_centered_entries_for_two_sessions(
     *,
     split_mode: str,
     split_window_minutes: float | None,
+    plateau_split_min_traversals_per_phase: int = 5,
+    plateau_split_excluded_traversals: int = 0,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for entry in entries:
@@ -10512,10 +16531,327 @@ def _split_distance_centered_entries_for_two_sessions(
             entry,
             split_mode=split_mode,
             split_window_minutes=split_window_minutes,
+            plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase,
+            plateau_split_excluded_traversals=plateau_split_excluded_traversals,
         )
         if split_entry is not None:
             out.append(split_entry)
     return out
+
+
+def _plateau_trace_events_by_trial_from_entry(entry: dict[str, Any] | None) -> list[list[dict[str, Any]]]:
+    if not isinstance(entry, dict):
+        return []
+    data = entry.get("data", {})
+    if not isinstance(data, dict):
+        return []
+    all_data = data.get("all", {})
+    if not isinstance(all_data, dict):
+        return []
+    raw = all_data.get("plateau_trace_events_by_trial", [])
+    if isinstance(raw, np.ndarray) and raw.dtype == object:
+        raw = raw.tolist()
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[list[dict[str, Any]]] = []
+    for trial_events in raw:
+        if isinstance(trial_events, np.ndarray) and trial_events.dtype == object:
+            trial_events = trial_events.tolist()
+        if not isinstance(trial_events, (list, tuple)):
+            out.append([])
+            continue
+        cleaned: list[dict[str, Any]] = []
+        for event in trial_events:
+            if not isinstance(event, dict):
+                continue
+            x = np.asarray(event.get("x_ms", []), dtype=float).reshape(-1)
+            y = np.asarray(event.get("trace_spkh", []), dtype=float).reshape(-1)
+            if x.size == 0 or y.size == 0 or x.size != y.size:
+                continue
+            if not np.any(np.isfinite(x) & np.isfinite(y)):
+                continue
+            cleaned.append(
+                {
+                    **event,
+                    "x_ms": x,
+                    "trace_spkh": y,
+                }
+            )
+        out.append(cleaned)
+    return out
+
+
+def _plateau_trace_entry_has_events(entry: dict[str, Any] | None) -> bool:
+    return any(len(events) > 0 for events in _plateau_trace_events_by_trial_from_entry(entry))
+
+
+def _plateau_trace_entry_has_payload(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    data = entry.get("data", {})
+    if not isinstance(data, dict):
+        return False
+    all_data = data.get("all", {})
+    return isinstance(all_data, dict) and "plateau_trace_events_by_trial" in all_data
+
+
+def _compute_plateau_trace_xlim_for_entries(
+    entries: list[dict[str, Any] | None],
+    *,
+    fallback: tuple[float, float] = (-100.0, 250.0),
+) -> tuple[float, float]:
+    xs: list[np.ndarray] = []
+    for entry in entries:
+        for trial_events in _plateau_trace_events_by_trial_from_entry(entry):
+            for event in trial_events:
+                x = np.asarray(event.get("x_ms", []), dtype=float)
+                if x.size > 0 and np.any(np.isfinite(x)):
+                    xs.append(x[np.isfinite(x)])
+    if len(xs) == 0:
+        return float(fallback[0]), float(fallback[1])
+    cat = np.concatenate(xs)
+    x0 = float(np.nanmin(cat))
+    x1 = float(np.nanmax(cat))
+    x0 = min(x0, 0.0)
+    x1 = max(x1, 100.0)
+    if (not np.isfinite(x0)) or (not np.isfinite(x1)) or x1 <= x0:
+        return float(fallback[0]), float(fallback[1])
+    pad = max(5.0, 0.03 * (x1 - x0))
+    return float(x0 - pad), float(x1 + pad)
+
+
+def _flatten_plateau_trace_events_for_entry(entry: dict[str, Any] | None) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for trial_idx, trial_events in enumerate(_plateau_trace_events_by_trial_from_entry(entry)):
+        for event_idx, event in enumerate(trial_events):
+            x = np.asarray(event.get("x_ms", []), dtype=float).reshape(-1)
+            y = np.asarray(event.get("trace_spkh", []), dtype=float).reshape(-1)
+            if x.size == 0 or y.size == 0 or x.size != y.size:
+                continue
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not np.any(finite):
+                continue
+            plateau_start_ms = float(event.get("plateau_start_ms", 0.0))
+            plateau_end_ms = event.get("plateau_end_ms", np.nan)
+            try:
+                plateau_end_ms = float(plateau_end_ms)
+            except Exception:
+                plateau_end_ms = np.nan
+            events.append(
+                {
+                    "trial_idx": int(trial_idx),
+                    "event_idx": int(event_idx),
+                    "x_ms": x[finite],
+                    "trace_spkh": y[finite],
+                    "plateau_start_ms": plateau_start_ms,
+                    "plateau_end_ms": plateau_end_ms,
+                }
+            )
+    return events
+
+
+def _pack_plateau_trace_events_for_entry(
+    entry: dict[str, Any] | None,
+    *,
+    plateau_height_per_spkh: float = 0.15,
+    vertical_gap: float = 0.025,
+) -> tuple[list[dict[str, Any]], float]:
+    amp_scale = float(plateau_height_per_spkh)
+    if (not np.isfinite(amp_scale)) or amp_scale <= 0:
+        amp_scale = 0.15
+    gap = float(vertical_gap)
+    if (not np.isfinite(gap)) or gap < 0:
+        gap = 0.025
+    packed: list[dict[str, Any]] = []
+    next_top = 0.0
+    last_bottom = 0.0
+    for event in _flatten_plateau_trace_events_for_entry(entry):
+        x = np.asarray(event["x_ms"], dtype=float)
+        y = np.asarray(event["trace_spkh"], dtype=float)
+        y_min = float(np.nanmin(y))
+        y_max = float(np.nanmax(y))
+        if (not np.isfinite(y_min)) or (not np.isfinite(y_max)):
+            continue
+        baseline = next_top + y_max * amp_scale
+        y_plot = baseline - y * amp_scale
+        y_top = float(np.nanmin(y_plot))
+        y_bottom = float(np.nanmax(y_plot))
+        packed.append(
+            {
+                **event,
+                "y_plot": y_plot,
+                "y_top": y_top,
+                "y_bottom": y_bottom,
+            }
+        )
+        last_bottom = y_bottom
+        next_top = y_bottom + gap
+    return packed, float(last_bottom)
+
+
+def _compute_plateau_trace_ylim_for_entries(
+    entries: list[dict[str, Any] | None],
+    *,
+    include_scale_bars: bool = True,
+    plateau_height_per_spkh: float = 0.15,
+    vertical_gap: float = 0.025,
+) -> tuple[float, float]:
+    amp_scale = float(plateau_height_per_spkh)
+    if (not np.isfinite(amp_scale)) or amp_scale <= 0:
+        amp_scale = 0.15
+    top_lim = -0.025
+    bottom_values: list[float] = []
+    for entry in entries:
+        packed, last_bottom = _pack_plateau_trace_events_for_entry(
+            entry,
+            plateau_height_per_spkh=amp_scale,
+            vertical_gap=vertical_gap,
+        )
+        if len(packed) == 0:
+            bottom_values.append(1.0)
+            continue
+        bottom = max(1.0, float(last_bottom) + 0.06)
+        if bool(include_scale_bars):
+            bottom = max(bottom, float(last_bottom) + 0.08 + amp_scale + 0.12)
+        bottom_values.append(bottom)
+    bottom_lim = max(bottom_values) if bottom_values else 1.0
+    if (not np.isfinite(bottom_lim)) or bottom_lim <= top_lim:
+        bottom_lim = 1.0
+    return float(top_lim), float(bottom_lim)
+
+
+def _infer_entry_trial_count(entry: dict[str, Any] | None) -> int:
+    if not isinstance(entry, dict):
+        return 0
+    data = entry.get("data", {})
+    if not isinstance(data, dict):
+        return 0
+    all_data = data.get("all", {})
+    if not isinstance(all_data, dict):
+        return 0
+    for key in ("rate_stack", "theta_stack", "slow_stack", "plateau_stack"):
+        arr = all_data.get(key)
+        if arr is None:
+            continue
+        arr = np.asarray(arr)
+        if arr.ndim == 2:
+            return int(arr.shape[0])
+    try:
+        return int(all_data.get("n_trials", 0))
+    except Exception:
+        return 0
+
+
+def _plot_plateau_trace_events_column(
+    fig: Any,
+    entry: dict[str, Any],
+    bbox: tuple[float, float, float, float],
+    *,
+    xlim: tuple[float, float],
+    title: str | None = None,
+    show_scale_bars: bool = False,
+    shared_ylim: tuple[float, float] | None = None,
+    plateau_height_per_spkh: float = 0.15,
+    vertical_gap: float = 0.025,
+) -> Any:
+    ax = fig.add_axes(list(bbox))
+    ax.set_facecolor("white")
+    x0, x1 = float(xlim[0]), float(xlim[1])
+    if (not np.isfinite(x0)) or (not np.isfinite(x1)) or x1 <= x0:
+        x0, x1 = -100.0, 250.0
+    ax.set_xlim(x0, x1)
+    if shared_ylim is not None and len(shared_ylim) == 2:
+        top_lim, bottom_lim = float(shared_ylim[0]), float(shared_ylim[1])
+    else:
+        top_lim, bottom_lim = _compute_plateau_trace_ylim_for_entries(
+            [entry],
+            include_scale_bars=bool(show_scale_bars),
+            plateau_height_per_spkh=plateau_height_per_spkh,
+            vertical_gap=vertical_gap,
+        )
+    if (
+        (not np.isfinite(top_lim))
+        or (not np.isfinite(bottom_lim))
+        or bottom_lim <= top_lim
+    ):
+        top_lim, bottom_lim = -0.08, 1.0
+    ax.set_ylim(bottom_lim, top_lim)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    packed_events, last_plateau_bottom = _pack_plateau_trace_events_for_entry(
+        entry,
+        plateau_height_per_spkh=plateau_height_per_spkh,
+        vertical_gap=vertical_gap,
+    )
+    amp_scale = float(plateau_height_per_spkh)
+    if (not np.isfinite(amp_scale)) or amp_scale <= 0:
+        amp_scale = 0.15
+    for event in packed_events:
+        plateau_start_ms = float(event.get("plateau_start_ms", np.nan))
+        plateau_end_ms = float(event.get("plateau_end_ms", np.nan))
+        if (
+            (not np.isfinite(plateau_start_ms))
+            or (not np.isfinite(plateau_end_ms))
+            or plateau_end_ms <= plateau_start_ms
+        ):
+            continue
+        shade_x0 = max(float(x0), plateau_start_ms)
+        shade_x1 = min(float(x1), plateau_end_ms)
+        if shade_x1 <= shade_x0:
+            continue
+        y_top = float(event.get("y_top", np.nan))
+        y_bottom = float(event.get("y_bottom", np.nan))
+        if (not np.isfinite(y_top)) or (not np.isfinite(y_bottom)):
+            continue
+        y_mid = 0.5 * (y_top + y_bottom)
+        shade_height = max((y_bottom - y_top) + 0.05 * amp_scale, 0.75 * amp_scale)
+        shade_y0 = y_mid - 0.5 * shade_height
+        ax.add_patch(
+            Rectangle(
+                (shade_x0, shade_y0),
+                shade_x1 - shade_x0,
+                shade_height,
+                facecolor="#D62728",
+                edgecolor="none",
+                alpha=0.18,
+                linewidth=0.0,
+                zorder=0.5,
+            )
+        )
+    for event in packed_events:
+        ax.plot(
+            np.asarray(event["x_ms"], dtype=float),
+            np.asarray(event["y_plot"], dtype=float),
+            color="black",
+            alpha=0.95,
+            linewidth=0.35,
+            zorder=2.0,
+        )
+
+    if title:
+        ax.set_title(str(title), fontsize=5, fontname="Arial", pad=1.0)
+    if len(packed_events) == 0:
+        ax.text(0.5, 0.5, "No plateaus", transform=ax.transAxes, ha="center", va="center", fontsize=4, fontname="Arial")
+
+    if show_scale_bars and len(packed_events) > 0:
+        x_span = float(x1 - x0)
+        x_bar1 = x1 - 0.08 * x_span
+        x_bar0 = x_bar1 - 100.0
+        min_x_bar0 = x0 + 0.05 * x_span
+        if x_bar0 < min_x_bar0:
+            x_bar0 = min_x_bar0
+            x_bar1 = x_bar0 + 100.0
+        y_bar = float(last_plateau_bottom) + 0.08
+        if x_bar1 > x_bar0 and x_bar0 >= x0 and x_bar1 <= x1:
+            ax.plot([x_bar0, x_bar1], [y_bar, y_bar], color="black", linewidth=0.8, solid_capstyle="butt")
+            ax.text((x_bar0 + x_bar1) / 2, y_bar + 0.035, "100 ms", ha="center", va="top", fontsize=4, fontname="Arial")
+            x_v = x_bar0
+            ax.plot([x_v, x_v], [y_bar, y_bar + amp_scale], color="black", linewidth=0.8, solid_capstyle="butt")
+            ax.text(x_v - 0.03 * x_span, y_bar + 0.5 * amp_scale, "1 spkh", ha="right", va="center", fontsize=4, fontname="Arial")
+    return ax
 
 
 def generate_pf_distance_centered_component_heatmaps(
@@ -10543,6 +16879,8 @@ def generate_pf_distance_centered_component_heatmaps(
     show_session_gap_line: bool = True,
     auto_colorbar_vmax_from_pf1_all: bool = True,
     colorbar_std_multiplier: float = 3.0,
+    x_label: str = "Distance from PF peak (cm)",
+    output_prefix: str = "pf_centered",
     show_plot: bool = False,
 ) -> dict[str, Any]:
     figure_root = Path(figure_save_folder)
@@ -10616,11 +16954,12 @@ def generate_pf_distance_centered_component_heatmaps(
         smooth_plateau=smooth_plateau,
         plateau_vlim=plateau_vlim,
         avg_smooth_window=avg_smooth_window_bins,
-        x_label="Distance from PF peak (cm)",
+        x_label=str(x_label),
         center_line_x=0.0,
         show_session_gap_line=show_session_gap_line,
         auto_colorbar_vmax_from_pf1_all=auto_colorbar_vmax_from_pf1_all,
         colorbar_std_multiplier=colorbar_std_multiplier,
+        output_prefix=str(output_prefix),
         show_plot=show_plot,
     )
 
@@ -10631,6 +16970,7 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
     time_rel: np.ndarray,
     *,
     smooth_window: int = 0,
+    interpolate_nan: bool = True,
     fr_vmax_scale: float = 0.5,
     theta_vlim: tuple[float, float] = (0, 0.4),
     slow_vlim: tuple[float, float] = (-0.4, 0.4),
@@ -10651,6 +16991,8 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
     colorbar_vmax_override: dict[str, float] | None = None,
     avg_ylim_override: dict[str, tuple[float, float]] | None = None,
     fixed_heatmap_height: float | None = None,
+    fixed_subplot_width: float | None = None,
+    panel_bbox: tuple[float, float, float, float] | None = None,
     show_row_ylabel: bool = True,
     show_heatmap_yticks: bool = True,
     show_colorbar: bool = True,
@@ -10660,6 +17002,14 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
     panel_title_pad: float = 1.0,
     avg_ylim_focus_window: tuple[float, float] | None = None,
     apply_tight_layout: bool = True,
+    Plot_plateaus: bool = True,
+    plateau_column_bbox: tuple[float, float, float, float] | None = None,
+    plateau_trace_xlim: tuple[float, float] | None = None,
+    plateau_trace_ylim: tuple[float, float] | None = None,
+    plateau_height_per_spkh: float = 0.15,
+    show_plateau_scale_bars: bool = False,
+    plateau_column_title: str | None = None,
+    phase_labels: tuple[str, str] | list[str] | None = None,
 ) -> dict[str, tuple[float, float]]:
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import LinearSegmentedColormap, Normalize
@@ -10668,16 +17018,20 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
 
     cell_data = entry_data.get("data", {})
     all_data = cell_data.get("all", {})
+    phase_labels_use = _normalize_two_phase_labels(phase_labels)
     n_time = int(len(time_rel))
+    avg_display_mask = (time_rel >= xlim[0]) & (time_rel <= xlim[1])
+    if not np.any(avg_display_mask):
+        avg_display_mask = np.ones(n_time, dtype=bool)
     if avg_ylim_focus_window is None:
-        avg_ylim_mask = (time_rel >= xlim[0]) & (time_rel <= xlim[1])
+        avg_ylim_mask = avg_display_mask.copy()
     else:
         w0, w1 = float(avg_ylim_focus_window[0]), float(avg_ylim_focus_window[1])
         if w1 < w0:
             w0, w1 = w1, w0
         avg_ylim_mask = (time_rel >= w0) & (time_rel <= w1)
         if not np.any(avg_ylim_mask):
-            avg_ylim_mask = (time_rel >= xlim[0]) & (time_rel <= xlim[1])
+            avg_ylim_mask = avg_display_mask.copy()
 
     def _get_stack(key: str) -> np.ndarray | None:
         arr = all_data.get(key)
@@ -10686,6 +17040,8 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
         arr = np.asarray(arr, dtype=float)
         if arr.ndim != 2 or arr.shape[1] != n_time:
             return None
+        if bool(interpolate_nan) and key != "plateau_stack":
+            arr = _interpolate_nan_stack_rows(arr)
         if int(smooth_window) > 1:
             smoothed = np.full_like(arr, np.nan)
             for i in range(arr.shape[0]):
@@ -10793,6 +17149,14 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
         heatmap_h = int(n_trials) * float(trial_height)
 
     n_rows = len(row_defs)
+    exact_layout = (
+        panel_bbox is not None
+        and fixed_subplot_width is not None
+        and np.isfinite(float(fixed_subplot_width))
+        and float(fixed_subplot_width) > 0
+        and np.isfinite(float(heatmap_h))
+        and float(heatmap_h) > 0
+    )
     outer_gs = GridSpec(
         n_rows,
         2,
@@ -10807,6 +17171,7 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
     cbar_specs: dict[int, Any] = {}
     row_images: dict[int, Any] = {}
     sscs_colorbar_slot: dict[int, Any] = {}
+    fixed_cbar_positions: dict[int, tuple[float, float, float, float]] = {}
 
     for row_i, row_def in enumerate(row_defs):
         avg_keys = list(row_def["avg_keys"])
@@ -10846,12 +17211,63 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
         if row_def["key"] == "sscs":
             sscs_colorbar_slot[row_i] = inner_cb[0]
 
+    if exact_layout:
+        fig_w, fig_h = fig.get_size_inches()
+        panel_x, panel_y, panel_w, panel_h = [float(v) for v in panel_bbox]
+        layout_in = _compute_pf_centered_2session_panel_layout_inches(
+            avg_key_counts=[len(list(row_def["avg_keys"])) for row_def in row_defs],
+            heatmap_height=float(heatmap_h),
+            avg_height=float(avg_height),
+            subplot_width=float(fixed_subplot_width),
+            show_row_ylabel=bool(show_row_ylabel),
+            show_colorbar=bool(show_colorbar),
+            show_panel_title=bool(isinstance(panel_title, str) and panel_title.strip()),
+        )
+        left_in = panel_x * float(fig_w) + float(layout_in["left_margin"])
+        top_in = panel_y * float(fig_h) + panel_h * float(fig_h) - float(layout_in["top_margin"])
+        subplot_width_in = float(fixed_subplot_width)
+        inner_gap_in = float(layout_in["inner_gap"])
+        row_gap_in = float(layout_in["row_gap"])
+        cbar_x_in = left_in + subplot_width_in + float(layout_in["cbar_gap"])
+        cbar_w_in = float(layout_in["cbar_width"])
+        row_top_in = top_in
+        for row_i, row_def in enumerate(row_defs):
+            avg_keys = list(row_def["avg_keys"])
+            heat_y0_in = row_top_in - float(heatmap_h)
+            heat_axes[row_i].set_position([
+                left_in / float(fig_w),
+                heat_y0_in / float(fig_h),
+                subplot_width_in / float(fig_w),
+                float(heatmap_h) / float(fig_h),
+            ])
+            cursor_top_in = heat_y0_in - inner_gap_in
+            for avg_key in avg_keys:
+                avg_y0_in = cursor_top_in - float(avg_height)
+                avg_axes[row_i][avg_key].set_position([
+                    left_in / float(fig_w),
+                    avg_y0_in / float(fig_h),
+                    subplot_width_in / float(fig_w),
+                    float(avg_height) / float(fig_h),
+                ])
+                cursor_top_in = avg_y0_in - inner_gap_in
+            if bool(show_colorbar):
+                fixed_cbar_positions[row_i] = (
+                    cbar_x_in / float(fig_w),
+                    heat_y0_in / float(fig_h),
+                    cbar_w_in / float(fig_w),
+                    float(heatmap_h) / float(fig_h),
+                )
+            row_height_in = float(heatmap_h) + len(avg_keys) * (float(avg_height) + inner_gap_in)
+            row_top_in -= row_height_in + row_gap_in
+
     ss_rgb = np.array([2, 108, 128]) / 255.0
     cs_rgb = np.array([238, 155, 0]) / 255.0
     line_colors = {"rate": "#555555", "ss": "#026C80", "cs": "#EE9B00", "theta": "blue", "slow": "red"}
     avg_ranges: dict[str, tuple[float, float]] = {}
     avg_min: dict[str, float] = {"rate": np.inf, "ss": np.inf, "cs": np.inf, "theta": np.inf, "slow": np.inf}
     avg_max: dict[str, float] = {"rate": -np.inf, "ss": -np.inf, "cs": -np.inf, "theta": -np.inf, "slow": -np.inf}
+    avg_mean_min: dict[str, float] = {"rate": np.inf, "ss": np.inf, "cs": np.inf, "theta": np.inf, "slow": np.inf}
+    avg_mean_max: dict[str, float] = {"rate": -np.inf, "ss": -np.inf, "cs": -np.inf, "theta": -np.inf, "slow": -np.inf}
     rate_legend_added = False
 
     def _plot_session_mean_sem(ax: Any, metric_key: str) -> None:
@@ -10883,6 +17299,10 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
             sem_tr = np.asarray(sem_tr, dtype=float) if sem_tr is not None else np.full_like(mean_tr, np.nan)
             ax.plot(time_rel, mean_tr, color=color, linewidth=0.8, linestyle=ls)
             ax.fill_between(time_rel, mean_tr - sem_tr, mean_tr + sem_tr, color=color, alpha=0.15)
+            mean_vis = mean_tr[avg_display_mask]
+            if np.any(np.isfinite(mean_vis)):
+                avg_mean_min[metric_key] = min(avg_mean_min[metric_key], float(np.nanmin(mean_vis)))
+                avg_mean_max[metric_key] = max(avg_mean_max[metric_key], float(np.nanmax(mean_vis)))
             vis_lo = (mean_tr - sem_tr)[avg_ylim_mask]
             vis_hi = (mean_tr + sem_tr)[avg_ylim_mask]
             if np.any(np.isfinite(vis_lo)):
@@ -10961,6 +17381,8 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
                     aspect="auto",
                     origin="upper",
                     extent=[time_rel[0], time_rel[-1], actual_trials + 0.5, 0.5],
+                    interpolation="nearest",
+                    resample=False,
                 )
                 gap_y = _session_gap_y(actual_trials)
                 if gap_y is not None:
@@ -10990,6 +17412,8 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
                     cmap=cmap_obj,
                     vmin=float(row_def["vmin"]),
                     vmax=float(row_def["vmax"]),
+                    interpolation="nearest",
+                    resample=False,
                 )
                 if bool(merge_plateau) and key == "rate" and plateau_stack is not None and plateau_stack.size > 0 and np.any(plateau_stack != 0):
                     p_abs = np.abs(plateau_stack)
@@ -11003,6 +17427,8 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
                         aspect="auto",
                         origin="upper",
                         extent=[time_rel[0], time_rel[-1], actual_trials + 0.5, 0.5],
+                        interpolation="nearest",
+                        resample=False,
                     )
                 gap_y = _session_gap_y(actual_trials)
                 if gap_y is not None:
@@ -11036,9 +17462,9 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
                 handles: list[Line2D] = []
                 s1_named, s2_named = _resolve_two_session_label_values(sess_vals)
                 if s1_named is not None and np.any(sess_vals == int(s1_named)):
-                    handles.append(Line2D([0], [0], color="#555555", linewidth=0.8, linestyle="-", label="Session 1"))
+                    handles.append(Line2D([0], [0], color="#555555", linewidth=0.8, linestyle="-", label=str(phase_labels_use[0])))
                 if s2_named is not None and np.any(sess_vals == int(s2_named)):
-                    handles.append(Line2D([0], [0], color="#555555", linewidth=0.8, linestyle="--", label="Session 2"))
+                    handles.append(Line2D([0], [0], color="#555555", linewidth=0.8, linestyle="--", label=str(phase_labels_use[1])))
                 ax_avg.legend(
                     handles=handles,
                     fontsize=4,
@@ -11058,6 +17484,7 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
                 ax_avg.tick_params(labelsize=5, labelleft=bool(show_row_ylabel))
             else:
                 ax_avg.tick_params(labelsize=5)
+            ax_avg.yaxis.set_major_formatter(FuncFormatter(_format_avg_axis_ticklabel))
             ax_avg.spines["top"].set_visible(False)
             ax_avg.spines["right"].set_visible(False)
 
@@ -11069,22 +17496,45 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
                 y0 = float(yp[0])
                 y1 = float(yp[1])
         if y0 is None or y1 is None:
+            candidates_lo: list[float] = []
+            candidates_hi: list[float] = []
             if np.isfinite(avg_min.get(metric, np.inf)) and np.isfinite(avg_max.get(metric, -np.inf)):
-                y0 = float(avg_min[metric])
-                y1 = float(avg_max[metric])
+                candidates_lo.append(float(avg_min[metric]))
+                candidates_hi.append(float(avg_max[metric]))
+            if np.isfinite(avg_mean_min.get(metric, np.inf)) and np.isfinite(avg_mean_max.get(metric, -np.inf)):
+                candidates_lo.append(float(avg_mean_min[metric]))
+                candidates_hi.append(float(avg_mean_max[metric]))
+            if len(candidates_lo) > 0 and len(candidates_hi) > 0:
+                y0 = float(min(candidates_lo))
+                y1 = float(max(candidates_hi))
                 if np.isclose(y0, y1):
                     eps = 1e-6 if np.isfinite(y0) else 1.0
                     y0 = float(y0 - eps)
                     y1 = float(y1 + eps)
         if y0 is None or y1 is None or (not np.isfinite(y0)) or (not np.isfinite(y1)):
             continue
+        mean_y0 = avg_mean_min.get(metric, np.inf)
+        mean_y1 = avg_mean_max.get(metric, -np.inf)
+        if np.isfinite(mean_y0):
+            y0 = min(float(y0), float(mean_y0))
+        if np.isfinite(mean_y1):
+            y1 = max(float(y1), float(mean_y1))
         if metric in ("rate", "ss", "cs"):
             y0 = min(float(y0), 0.0)
         elif metric == "theta":
-            # Force theta avg baseline to zero while keeping dynamic upper bound.
-            y0 = 0.0
+            # Keep the preferred zero baseline for theta, but do not clip the mean if it dips slightly below zero.
+            y0 = min(float(y0), 0.0)
             if (not np.isfinite(y1)) or y1 <= y0:
                 y1 = y0 + 1e-6
+        if y1 <= y0:
+            y1 = y0 + 1e-6
+        pad_ref = max(float(y1 - y0), abs(float(y0)), abs(float(y1)), 1.0)
+        pad = max(1e-6, 0.02 * pad_ref)
+        if metric in ("rate", "ss", "cs", "theta") and y0 >= 0:
+            y1 = float(y1) + pad
+        else:
+            y0 = float(y0) - pad
+            y1 = float(y1) + pad
         avg_ranges[metric] = (y0, y1)
         for row_i, row_def in enumerate(row_defs):
             for avg_key, ax_avg in avg_axes[row_i].items():
@@ -11116,14 +17566,54 @@ def _plot_single_cell_heatmap_on_figure_2sessions(
             cb_cs = fig.colorbar(sm_cs, cax=ax_cs_cb)
             cb_cs.ax.tick_params(labelsize=4)
             cb_cs.set_label("CS", fontsize=4, rotation=0, labelpad=8)
+            if exact_layout and row_i in fixed_cbar_positions:
+                x0, y0, w0, h0 = fixed_cbar_positions[row_i]
+                cb_gap_in = 0.06
+                cb_gap = cb_gap_in / float(fig.get_size_inches()[1])
+                cb_half_h = max(0.0, (h0 - cb_gap) / 2.0)
+                ax_ss_cb.set_position([x0, y0 + cb_half_h + cb_gap, w0, cb_half_h])
+                ax_cs_cb.set_position([x0, y0, w0, cb_half_h])
         elif row_i in row_images:
             ax_cb = fig.add_subplot(cbar_specs[row_i])
             cbar = fig.colorbar(row_images[row_i], cax=ax_cb)
             cbar.ax.tick_params(labelsize=4)
+            if exact_layout and row_i in fixed_cbar_positions:
+                ax_cb.set_position(list(fixed_cbar_positions[row_i]))
         else:
             fig.add_subplot(cbar_specs[row_i]).axis("off")
 
-    if apply_tight_layout:
+    if bool(Plot_plateaus):
+        has_plateau_events = _plateau_trace_entry_has_events(entry_data)
+        if plateau_column_bbox is not None or has_plateau_events:
+            bbox_use = plateau_column_bbox
+            if bbox_use is None:
+                axes_for_bbox = list(heat_axes.values())
+                for avg_map in avg_axes.values():
+                    axes_for_bbox.extend(list(avg_map.values()))
+                if axes_for_bbox:
+                    x_right = max(ax.get_position().x1 for ax in axes_for_bbox)
+                    y0 = min(ax.get_position().y0 for ax in axes_for_bbox)
+                    y1 = max(ax.get_position().y1 for ax in axes_for_bbox)
+                    width = max(0.04, min(0.12, (1.0 - x_right) * 0.75))
+                    bbox_use = (x_right + 0.01, y0, width, y1 - y0)
+            if bbox_use is not None:
+                xlim_use = (
+                    tuple(float(v) for v in plateau_trace_xlim)
+                    if plateau_trace_xlim is not None and len(plateau_trace_xlim) == 2
+                    else _compute_plateau_trace_xlim_for_entries([entry_data])
+                )
+                _plot_plateau_trace_events_column(
+                    fig,
+                    entry_data,
+                    bbox_use,
+                    xlim=xlim_use,
+                    title=plateau_column_title,
+                    show_scale_bars=bool(show_plateau_scale_bars),
+                    shared_ylim=plateau_trace_ylim,
+                    plateau_height_per_spkh=plateau_height_per_spkh,
+                )
+
+    if apply_tight_layout and (not exact_layout):
         try:
             tight_fn = getattr(fig, "tight_layout", None)
             if callable(tight_fn):
@@ -11140,6 +17630,7 @@ def _compute_dual_pf_fr_colorbar_vmax_from_session_means(
     *,
     smooth_window: int = 0,
     avg_smooth_window: int = 0,
+    interpolate_nan: bool = True,
 ) -> dict[str, float]:
     """Colorbar vmax for FR stacks from session-split mean traces across PF1/PF2."""
     n_time = int(len(time_rel))
@@ -11150,6 +17641,8 @@ def _compute_dual_pf_fr_colorbar_vmax_from_session_means(
     }
 
     def _smooth_stack(stack: np.ndarray) -> np.ndarray:
+        if bool(interpolate_nan):
+            stack = _interpolate_nan_stack_rows(stack)
         if int(smooth_window) <= 1:
             return stack
         out = np.full_like(stack, np.nan)
@@ -11212,6 +17705,7 @@ def _compute_shared_avg_ylim_for_metrics_2sessions(
     *,
     smooth_window: int = 0,
     avg_smooth_window: int = 0,
+    interpolate_nan: bool = True,
     avg_ylim_focus_window: tuple[float, float] | None = None,
     xlim: tuple[float, float] | None = None,
 ) -> dict[str, tuple[float, float]]:
@@ -11233,6 +17727,8 @@ def _compute_shared_avg_ylim_for_metrics_2sessions(
         focus_mask_slow = np.ones(n_time, dtype=bool)
 
     def _smooth_stack(stack: np.ndarray) -> np.ndarray:
+        if bool(interpolate_nan):
+            stack = _interpolate_nan_stack_rows(stack)
         if int(smooth_window) <= 1:
             return stack
         out = np.full_like(stack, np.nan)
@@ -11311,11 +17807,15 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
     smooth_window: int = 0,
     out_path: str | Path | None = None,
     show_plot: bool = True,
+    interpolate_nan: bool = True,
     fr_vmax_scale: float = 0.6,
+    rate_colorbar_vmax: float | None = None,
+    subplot_width: float | None = None,
     theta_vlim: tuple[float, float] = (0, 0.5),
     slow_vlim: tuple[float, float] = (-0.4, 0.4),
     fig_width: float = 3.8,
     trial_height: float = 0.02,
+    heatmap_height: float | None = None,
     xlim: tuple[float, float] = (-4, 4),
     merge_ss_cs: bool = True,
     merge_plateau: bool = True,
@@ -11328,7 +17828,27 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
     show_session_gap_line: bool = True,
     disable_pf2_avg_ylim_sync: bool = False,
     avg_ylim_focus_window: tuple[float, float] | None = None,
+    Plot_plateaus: bool = True,
+    plateau_height_per_spkh: float = 0.15,
+    phase_labels: tuple[str, str] | list[str] | None = None,
 ) -> plt.Figure:
+    plateau_height_per_spkh = float(plateau_height_per_spkh)
+    if (not np.isfinite(plateau_height_per_spkh)) or plateau_height_per_spkh <= 0:
+        raise ValueError("plateau_height_per_spkh must be a finite number > 0.")
+    phase_labels_use = _normalize_two_phase_labels(phase_labels)
+    if rate_colorbar_vmax is not None:
+        rate_colorbar_vmax = float(rate_colorbar_vmax)
+        if (not np.isfinite(rate_colorbar_vmax)) or rate_colorbar_vmax <= 0:
+            raise ValueError("rate_colorbar_vmax must be a finite number > 0.")
+    if subplot_width is not None:
+        subplot_width = float(subplot_width)
+        if (not np.isfinite(subplot_width)) or subplot_width <= 0:
+            raise ValueError("subplot_width must be a finite number > 0.")
+    if heatmap_height is not None:
+        heatmap_height = float(heatmap_height)
+        if (not np.isfinite(heatmap_height)) or heatmap_height <= 0:
+            raise ValueError("heatmap_height must be a finite number > 0.")
+
     def _pf_specific_xlabel(base_label: str, pf_rank: int) -> str:
         base = str(base_label)
         if "PF1 peak" in base or "PF2 peak" in base:
@@ -11339,27 +17859,95 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
             return f"Distance from PF{pf_rank} peak (cm)"
         return f"{base} (PF{pf_rank})"
 
+    def _apply_rate_colorbar_override(colorbar_vmax_override: dict[str, float]) -> dict[str, float]:
+        colorbar_vmax_use = dict(colorbar_vmax_override)
+        if rate_colorbar_vmax is not None:
+            colorbar_vmax_use["rate"] = float(rate_colorbar_vmax)
+        return colorbar_vmax_use
+
     time_rel = np.asarray(time_rel, dtype=float)
+    exact_layout = subplot_width is not None
+    plot_plateau_columns = bool(Plot_plateaus) and (
+        _plateau_trace_entry_has_events(entry_primary)
+        or _plateau_trace_entry_has_events(entry_secondary)
+    )
+    plateau_gap_in = 0.08
+    plateau_col_width_in = (
+        max(0.28, min(0.55, 0.70 * float(subplot_width)))
+        if exact_layout and subplot_width is not None
+        else 0.35
+    )
+    plateau_trace_xlim = _compute_plateau_trace_xlim_for_entries([entry_primary, entry_secondary])
+    plateau_trace_ylim = _compute_plateau_trace_ylim_for_entries(
+        [entry_primary, entry_secondary],
+        include_scale_bars=True,
+        plateau_height_per_spkh=plateau_height_per_spkh,
+    )
+    primary_has_plateaus = _plateau_trace_entry_has_events(entry_primary)
+    secondary_has_plateaus = _plateau_trace_entry_has_events(entry_secondary)
+    primary_show_plateau_scale = bool(primary_has_plateaus or not secondary_has_plateaus)
+    secondary_show_plateau_scale = bool((not primary_has_plateaus) and secondary_has_plateaus)
     if entry_secondary is None:
+        fixed_heatmap_height_use = (
+            float(heatmap_height)
+            if heatmap_height is not None
+            else None
+        )
+        if exact_layout and fixed_heatmap_height_use is None:
+            fixed_heatmap_height_use = (
+                _compute_single_heatmap_max_trials(entry_primary, time_rel, direction_keys=("all", "cw", "ccw"))
+                * float(trial_height)
+            )
         fig_h = _estimate_single_heatmap_figure_height(
             entry_primary,
             time_rel,
             trial_height=trial_height,
             avg_height=avg_height,
             merge_ss_cs=merge_ss_cs,
+            fixed_heatmap_height=fixed_heatmap_height_use,
         )
-        fig = plt.figure(figsize=(fig_width, fig_h))
+        if exact_layout:
+            n_rows = 4 if bool(merge_ss_cs) else 5
+            avg_key_counts = [1] * n_rows
+            if bool(merge_ss_cs):
+                avg_key_counts[1] = 2
+            panel_layout = _compute_pf_centered_2session_panel_layout_inches(
+                avg_key_counts=avg_key_counts,
+                heatmap_height=float(fixed_heatmap_height_use),
+                avg_height=float(avg_height),
+                subplot_width=float(subplot_width),
+                show_row_ylabel=True,
+                show_colorbar=True,
+                show_panel_title=False,
+            )
+            panel_width = float(panel_layout["panel_width"])
+            panel_height = float(panel_layout["panel_height"])
+            fig_w = panel_width + ((plateau_gap_in + plateau_col_width_in) if plot_plateau_columns else 0.0)
+            fig = plt.figure(figsize=(fig_w, panel_height))
+            panel_bbox_single = (0.0, 0.0, panel_width / fig_w, 1.0)
+            plateau_bbox_single = (
+                ((panel_width + plateau_gap_in) / fig_w, 0.0, plateau_col_width_in / fig_w, 1.0)
+                if plot_plateau_columns
+                else None
+            )
+        else:
+            fig = plt.figure(figsize=(fig_width, fig_h))
+            panel_bbox_single = None
+            plateau_bbox_single = None
         colorbar_vmax_override = _compute_dual_pf_fr_colorbar_vmax_from_session_means(
             entry_primary,
             None,
             time_rel,
             smooth_window=int(smooth_window),
             avg_smooth_window=int(avg_smooth_window),
+            interpolate_nan=bool(interpolate_nan),
         )
+        colorbar_vmax_override = _apply_rate_colorbar_override(colorbar_vmax_override)
         _plot_single_cell_heatmap_on_figure_2sessions(
             fig,
             entry_primary,
             time_rel,
+            interpolate_nan=interpolate_nan,
             smooth_window=smooth_window,
             fr_vmax_scale=fr_vmax_scale,
             theta_vlim=theta_vlim,
@@ -11383,7 +17971,18 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
             show_rate_session_legend=True,
             panel_title=None,
             avg_ylim_focus_window=avg_ylim_focus_window,
-            apply_tight_layout=True,
+            fixed_heatmap_height=fixed_heatmap_height_use,
+            fixed_subplot_width=subplot_width,
+            panel_bbox=(panel_bbox_single if exact_layout else None),
+            apply_tight_layout=(not exact_layout),
+            Plot_plateaus=bool(Plot_plateaus),
+            plateau_column_bbox=plateau_bbox_single,
+            plateau_trace_xlim=plateau_trace_xlim,
+            plateau_trace_ylim=plateau_trace_ylim,
+            plateau_height_per_spkh=plateau_height_per_spkh,
+            show_plateau_scale_bars=True,
+            plateau_column_title="Plateaus",
+            phase_labels=phase_labels_use,
         )
         if out_path is not None:
             fig.savefig(out_path, dpi=300)
@@ -11397,6 +17996,7 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
         entry_primary,
         time_rel,
         smooth_window=int(smooth_window),
+        interpolate_nan=bool(interpolate_nan),
     )
     colorbar_vmax_override = _compute_dual_pf_fr_colorbar_vmax_from_session_means(
         entry_primary,
@@ -11404,37 +18004,103 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
         time_rel,
         smooth_window=int(smooth_window),
         avg_smooth_window=int(avg_smooth_window),
+        interpolate_nan=bool(interpolate_nan),
     )
+    colorbar_vmax_override = _apply_rate_colorbar_override(colorbar_vmax_override)
     theta_slow_shared = _compute_shared_avg_ylim_for_metrics_2sessions(
         entry_primary,
         entry_secondary,
         time_rel,
         smooth_window=int(smooth_window),
         avg_smooth_window=int(avg_smooth_window),
+        interpolate_nan=bool(interpolate_nan),
         avg_ylim_focus_window=avg_ylim_focus_window,
         xlim=xlim,
     )
 
-    max_trials_primary = _compute_single_heatmap_max_trials(entry_primary, time_rel)
-    max_trials_secondary = _compute_single_heatmap_max_trials(entry_secondary, time_rel)
-    fixed_heatmap_height = max(max_trials_primary, max_trials_secondary) * float(trial_height)
-    h1 = _estimate_single_heatmap_figure_height(
-        entry_primary, time_rel, trial_height=trial_height, avg_height=avg_height, merge_ss_cs=merge_ss_cs
-    )
-    h2 = _estimate_single_heatmap_figure_height(
-        entry_secondary, time_rel, trial_height=trial_height, avg_height=avg_height, merge_ss_cs=merge_ss_cs
-    )
-
-    fig = plt.figure(figsize=(fig_width * 2 + 0.45, max(h1, h2)))
-    subfigs = fig.subfigures(1, 2, wspace=0.04)
-    subfigs = list(np.ravel(subfigs))
+    if heatmap_height is not None:
+        fixed_heatmap_height = float(heatmap_height)
+    else:
+        max_trials_primary = _compute_single_heatmap_max_trials(entry_primary, time_rel)
+        max_trials_secondary = _compute_single_heatmap_max_trials(entry_secondary, time_rel)
+        fixed_heatmap_height = max(max_trials_primary, max_trials_secondary) * float(trial_height)
+    if exact_layout:
+        n_rows = 4 if bool(merge_ss_cs) else 5
+        avg_key_counts = [1] * n_rows
+        if bool(merge_ss_cs):
+            avg_key_counts[1] = 2
+        left_layout = _compute_pf_centered_2session_panel_layout_inches(
+            avg_key_counts=avg_key_counts,
+            heatmap_height=float(fixed_heatmap_height),
+            avg_height=float(avg_height),
+            subplot_width=float(subplot_width),
+            show_row_ylabel=True,
+            show_colorbar=False,
+            show_panel_title=True,
+        )
+        right_layout = _compute_pf_centered_2session_panel_layout_inches(
+            avg_key_counts=avg_key_counts,
+            heatmap_height=float(fixed_heatmap_height),
+            avg_height=float(avg_height),
+            subplot_width=float(subplot_width),
+            show_row_ylabel=False,
+            show_colorbar=True,
+            show_panel_title=True,
+        )
+        panel_gap = 0.18
+        left_panel_width = float(left_layout["panel_width"])
+        right_panel_width = float(right_layout["panel_width"])
+        left_total_width = left_panel_width + ((plateau_gap_in + plateau_col_width_in) if plot_plateau_columns else 0.0)
+        right_total_width = right_panel_width + ((plateau_gap_in + plateau_col_width_in) if plot_plateau_columns else 0.0)
+        fig_w = float(left_total_width) + float(panel_gap) + float(right_total_width)
+        fig_h = max(float(left_layout["panel_height"]), float(right_layout["panel_height"]))
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        left_bbox = (0.0, 0.0, left_panel_width / fig_w, 1.0)
+        left_plateau_bbox = (
+            ((left_panel_width + plateau_gap_in) / fig_w, 0.0, plateau_col_width_in / fig_w, 1.0)
+            if plot_plateau_columns
+            else None
+        )
+        right_x0 = (float(left_total_width) + float(panel_gap)) / fig_w
+        right_bbox = (
+            right_x0,
+            0.0,
+            right_panel_width / fig_w,
+            1.0,
+        )
+        right_plateau_bbox = (
+            (
+                (float(left_total_width) + float(panel_gap) + right_panel_width + plateau_gap_in) / fig_w,
+                0.0,
+                plateau_col_width_in / fig_w,
+                1.0,
+            )
+            if plot_plateau_columns
+            else None
+        )
+        subfigs = None
+    else:
+        h1 = _estimate_single_heatmap_figure_height(
+            entry_primary, time_rel, trial_height=trial_height, avg_height=avg_height, merge_ss_cs=merge_ss_cs
+        )
+        h2 = _estimate_single_heatmap_figure_height(
+            entry_secondary, time_rel, trial_height=trial_height, avg_height=avg_height, merge_ss_cs=merge_ss_cs
+        )
+        fig = plt.figure(figsize=(fig_width * 2 + 0.45 + (0.9 if plot_plateau_columns else 0.0), max(h1, h2)))
+        subfigs = fig.subfigures(1, 2, wspace=0.04)
+        subfigs = list(np.ravel(subfigs))
+        left_bbox = None
+        right_bbox = None
+        left_plateau_bbox = None
+        right_plateau_bbox = None
     x_label_pf1 = _pf_specific_xlabel(x_label, 1)
     x_label_pf2 = _pf_specific_xlabel(x_label, 2)
 
     pf1_avg_ylim = _plot_single_cell_heatmap_on_figure_2sessions(
-        subfigs[0],
+        (fig if exact_layout else subfigs[0]),
         entry_primary,
         time_rel,
+        interpolate_nan=interpolate_nan,
         smooth_window=smooth_window,
         fr_vmax_scale=fr_vmax_scale,
         theta_vlim=theta_vlim,
@@ -11454,6 +18120,8 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
         colorbar_vmax_override=colorbar_vmax_override,
         avg_ylim_override=(theta_slow_shared if len(theta_slow_shared) > 0 else None),
         fixed_heatmap_height=fixed_heatmap_height,
+        fixed_subplot_width=subplot_width,
+        panel_bbox=left_bbox,
         show_row_ylabel=True,
         show_heatmap_yticks=True,
         show_colorbar=False,
@@ -11462,12 +18130,21 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
         panel_title="PF1",
         panel_title_pad=1.0,
         avg_ylim_focus_window=avg_ylim_focus_window,
-        apply_tight_layout=True,
+        apply_tight_layout=(not exact_layout),
+        Plot_plateaus=bool(Plot_plateaus),
+        plateau_column_bbox=left_plateau_bbox,
+        plateau_trace_xlim=plateau_trace_xlim,
+        plateau_trace_ylim=plateau_trace_ylim,
+        plateau_height_per_spkh=plateau_height_per_spkh,
+        show_plateau_scale_bars=primary_show_plateau_scale,
+        plateau_column_title="PF1 plateaus",
+        phase_labels=phase_labels_use,
     )
     _plot_single_cell_heatmap_on_figure_2sessions(
-        subfigs[1],
+        (fig if exact_layout else subfigs[1]),
         entry_secondary,
         time_rel,
+        interpolate_nan=interpolate_nan,
         smooth_window=smooth_window,
         fr_vmax_scale=fr_vmax_scale,
         theta_vlim=theta_vlim,
@@ -11496,6 +18173,8 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
             else None
         ),
         fixed_heatmap_height=fixed_heatmap_height,
+        fixed_subplot_width=subplot_width,
+        panel_bbox=right_bbox,
         show_row_ylabel=False,
         show_heatmap_yticks=True,
         show_colorbar=True,
@@ -11504,7 +18183,15 @@ def plot_pf_centered_dual_component_heatmap_2sessions(
         panel_title="PF2",
         panel_title_pad=1.0,
         avg_ylim_focus_window=avg_ylim_focus_window,
-        apply_tight_layout=True,
+        apply_tight_layout=(not exact_layout),
+        Plot_plateaus=bool(Plot_plateaus),
+        plateau_column_bbox=right_plateau_bbox,
+        plateau_trace_xlim=plateau_trace_xlim,
+        plateau_trace_ylim=plateau_trace_ylim,
+        plateau_height_per_spkh=plateau_height_per_spkh,
+        show_plateau_scale_bars=secondary_show_plateau_scale,
+        plateau_column_title="PF2 plateaus",
+        phase_labels=phase_labels_use,
     )
 
     if out_path is not None:
@@ -11521,12 +18208,17 @@ def generate_pf_centered_component_heatmaps_2sessions(
     *,
     figure_save_folder: str | Path,
     clear_output: bool = True,
+    interpolate_nan: bool = True,
     smooth_window: int = 300,
     fr_vmax_scale: float = 0.6,
+    rate_colorbar_vmax: float | None = None,
+    avg_height: float = 0.3,
+    subplot_width: float | None = None,
     theta_vlim: tuple[float, float] = (0, 0.5),
     slow_vlim: tuple[float, float] = (-0.4, 0.4),
     fig_width: float = 3.8,
     trial_height: float = 0.02,
+    heatmap_height: float | None = None,
     xlim: tuple[float, float] = (-4, 4),
     merge_ss_cs: bool = True,
     merge_plateau: bool = True,
@@ -11538,14 +18230,22 @@ def generate_pf_centered_component_heatmaps_2sessions(
     show_session_gap_line: bool = True,
     disable_pf2_avg_ylim_sync: bool = False,
     avg_ylim_focus_window: tuple[float, float] | None = None,
+    output_prefix: str = "pf_centered_2sessions",
     show_plot: bool = False,
+    Plot_plateaus: bool = True,
+    plateau_height_per_spkh: float = 0.15,
+    phase_labels: tuple[str, str] | list[str] | None = None,
 ) -> dict[str, Any]:
+    plateau_height_per_spkh = float(plateau_height_per_spkh)
+    if (not np.isfinite(plateau_height_per_spkh)) or plateau_height_per_spkh <= 0:
+        raise ValueError("plateau_height_per_spkh must be a finite number > 0.")
+    phase_labels_use = _normalize_two_phase_labels(phase_labels)
     figure_root = Path(figure_save_folder)
     figure_root.mkdir(parents=True, exist_ok=True)
     print(f"PF-centered (2 sessions) heatmaps root folder: {figure_root}")
     categories = _ordered_dataset_categories(dataset)
     cat_to_dir = {
-        cat: figure_root / _category_output_dir_name(prefix="pf_centered_2sessions", category=cat, suffix="_heatmaps")
+        cat: figure_root / _category_output_dir_name(prefix=str(output_prefix), category=cat, suffix="_heatmaps")
         for cat in categories
     }
     summary: dict[str, Any] = {}
@@ -11568,6 +18268,9 @@ def generate_pf_centered_component_heatmaps_2sessions(
         n_saved = 0
         n_dual = 0
         n_pf2_only = 0
+        n_plateau_trace_payload_files = 0
+        n_plateau_trace_event_files = 0
+        n_plateau_trace_missing_payload_files = 0
         for i, key in enumerate(all_keys, start=1):
             entry1 = pri_by_key.get(key)
             entry2 = sec_by_key.get(key)
@@ -11583,6 +18286,14 @@ def generate_pf_centered_component_heatmaps_2sessions(
             if entry_main is None:
                 continue
             out_path = out_dir / f"{entry_main['session']}_Cell{int(entry_main['cell_idx']) + 1}_heatmap_2sessions.svg"
+            entries_for_plateau_check = [e for e in (entry1, entry2) if e is not None]
+            if bool(Plot_plateaus):
+                if any(_plateau_trace_entry_has_payload(e) for e in entries_for_plateau_check):
+                    n_plateau_trace_payload_files += 1
+                else:
+                    n_plateau_trace_missing_payload_files += 1
+                if any(_plateau_trace_entry_has_events(e) for e in entries_for_plateau_check):
+                    n_plateau_trace_event_files += 1
             plot_pf_centered_dual_component_heatmap_2sessions(
                 entry_primary=entry_main,
                 entry_secondary=entry_secondary,
@@ -11590,11 +18301,16 @@ def generate_pf_centered_component_heatmaps_2sessions(
                 smooth_window=smooth_window,
                 out_path=out_path,
                 show_plot=show_plot,
+                interpolate_nan=interpolate_nan,
                 fr_vmax_scale=fr_vmax_scale,
+                rate_colorbar_vmax=rate_colorbar_vmax,
+                avg_height=avg_height,
+                subplot_width=subplot_width,
                 theta_vlim=theta_vlim,
                 slow_vlim=slow_vlim,
                 fig_width=fig_width,
                 trial_height=trial_height,
+                heatmap_height=heatmap_height,
                 xlim=xlim,
                 merge_ss_cs=merge_ss_cs,
                 merge_plateau=merge_plateau,
@@ -11606,6 +18322,9 @@ def generate_pf_centered_component_heatmaps_2sessions(
                 show_session_gap_line=show_session_gap_line,
                 disable_pf2_avg_ylim_sync=disable_pf2_avg_ylim_sync,
                 avg_ylim_focus_window=avg_ylim_focus_window,
+                Plot_plateaus=bool(Plot_plateaus),
+                plateau_height_per_spkh=plateau_height_per_spkh,
+                phase_labels=phase_labels_use,
             )
             n_saved += 1
             if entry1 is not None and entry2 is not None:
@@ -11620,8 +18339,19 @@ def generate_pf_centered_component_heatmaps_2sessions(
             "n_pf2_only_entries": int(n_pf2_only),
             "n_saved_files": n_saved,
             "n_dual_pf_files": n_dual,
+            "Plot_plateaus": bool(Plot_plateaus),
+            "plateau_height_per_spkh": float(plateau_height_per_spkh),
+            "phase_labels": tuple(phase_labels_use),
+            "n_plateau_trace_payload_files": int(n_plateau_trace_payload_files),
+            "n_plateau_trace_event_files": int(n_plateau_trace_event_files),
+            "n_plateau_trace_missing_payload_files": int(n_plateau_trace_missing_payload_files),
             "mode": "all_direction_heatmap_with_session_split_averages",
         }
+        if bool(Plot_plateaus) and n_plateau_trace_missing_payload_files > 0 and n_plateau_trace_payload_files == 0:
+            print(
+                f"[{category}] Plateau trace columns requested, but no entries contain "
+                "'plateau_trace_events_by_trial'. Regenerate distance_centered_dataset to populate them."
+            )
     return summary
 
 
@@ -11630,12 +18360,17 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
     *,
     figure_save_folder: str | Path,
     clear_output: bool = True,
+    interpolate_nan: bool = True,
     smooth_window: float = 1.0,
     fr_vmax_scale: float = 0.6,
+    rate_colorbar_vmax: float | None = None,
+    avg_height: float = 0.3,
+    subplot_width: float | None = None,
     theta_vlim: tuple[float, float] = (0, 0.5),
     slow_vlim: tuple[float, float] = (-0.4, 0.4),
     fig_width: float = 3.8,
     trial_height: float = 0.02,
+    heatmap_height: float | None = None,
     xlim: tuple[float, float] | None = None,
     merge_ss_cs: bool = True,
     merge_plateau: bool = True,
@@ -11655,16 +18390,36 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
     average_export_subdir: str = "pf_distance_centered_2sessions_average_exports",
     split_mode: str = "recorded_sessions",
     split_window_minutes: float | None = None,
+    plateau_split_min_traversals_per_phase: int = 5,
+    plateau_split_excluded_traversals: int = 0,
+    phase_labels: tuple[str, str] | list[str] | None = None,
     print_peak_shift_bins: bool = False,
+    x_label: str = "Distance from PF peak (cm)",
+    output_prefix: str = "pf_centered_2sessions",
     show_plot: bool = False,
+    Plot_plateaus: bool = True,
+    plateau_height_per_spkh: float = 0.15,
 ) -> dict[str, Any]:
     import csv
 
+    plateau_height_per_spkh = float(plateau_height_per_spkh)
+    if (not np.isfinite(plateau_height_per_spkh)) or plateau_height_per_spkh <= 0:
+        raise ValueError("plateau_height_per_spkh must be a finite number > 0.")
+
     split_mode_norm = _normalize_two_session_split_mode(split_mode)
     split_window_minutes_use = _validate_two_session_split_window_minutes(split_mode_norm, split_window_minutes)
+    plateau_split_min_traversals_per_phase_use = _validate_plateau_split_min_traversals_per_phase(
+        plateau_split_min_traversals_per_phase
+    )
+    plateau_split_excluded_traversals_use = _validate_plateau_split_excluded_traversals(
+        plateau_split_excluded_traversals
+    )
+    phase_labels_use = _normalize_two_phase_labels(phase_labels, split_mode=split_mode_norm)
     split_meta = _two_session_split_metadata(
         split_mode=split_mode_norm,
         split_window_minutes=split_window_minutes_use,
+        plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase_use,
+        plateau_split_excluded_traversals=plateau_split_excluded_traversals_use,
     )
 
     figure_root = Path(figure_save_folder)
@@ -11693,6 +18448,8 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
             list(dataset.get(cat_name, {}).get(pf_rank, {}).get("entries", [])),
             split_mode=split_mode_norm,
             split_window_minutes=split_window_minutes_use,
+            plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase_use,
+            plateau_split_excluded_traversals=plateau_split_excluded_traversals_use,
         )
         original_entries = list(entries)
         if not bool(align_all_peak_to_zero) or rel.size == 0:
@@ -11780,24 +18537,33 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
         dataset=shifted_dataset,
         figure_save_folder=figure_root,
         clear_output=clear_output,
+        interpolate_nan=interpolate_nan,
         smooth_window=smooth_window_bins,
         fr_vmax_scale=fr_vmax_scale,
+        rate_colorbar_vmax=rate_colorbar_vmax,
+        avg_height=avg_height,
+        subplot_width=subplot_width,
         theta_vlim=theta_vlim,
         slow_vlim=slow_vlim,
         fig_width=fig_width,
         trial_height=trial_height,
+        heatmap_height=heatmap_height,
         xlim=xlim_use,
         merge_ss_cs=merge_ss_cs,
         merge_plateau=merge_plateau,
         smooth_plateau=smooth_plateau,
         plateau_vlim=plateau_vlim,
         avg_smooth_window=avg_smooth_window_bins,
-        x_label="Distance from PF peak (cm)",
+        x_label=str(x_label),
         center_line_x=0.0,
         show_session_gap_line=show_session_gap_line,
         disable_pf2_avg_ylim_sync=disable_pf2_avg_ylim_sync,
         avg_ylim_focus_window=avg_ylim_focus_window,
+        output_prefix=str(output_prefix),
         show_plot=show_plot,
+        Plot_plateaus=bool(Plot_plateaus),
+        plateau_height_per_spkh=plateau_height_per_spkh,
+        phase_labels=phase_labels_use,
     )
     for cat_name in categories:
         if cat_name in summary and isinstance(summary[cat_name], dict):
@@ -11805,6 +18571,10 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
             summary[cat_name]["split_window_minutes"] = (
                 None if not np.isfinite(float(split_meta["split_window_minutes"])) else float(split_meta["split_window_minutes"])
             )
+            summary[cat_name]["phase_labels"] = tuple(phase_labels_use)
+            if split_mode_norm == "prepost_plateau":
+                summary[cat_name]["plateau_split_min_traversals_per_phase"] = int(plateau_split_min_traversals_per_phase_use)
+                summary[cat_name]["plateau_split_excluded_traversals"] = int(plateau_split_excluded_traversals_use)
 
     if bool(save_average_exports):
         export_root = figure_root / str(average_export_subdir)
@@ -11942,6 +18712,10 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
                         "window1_end_sec",
                         "window2_start_sec",
                         "window2_end_sec",
+                        "phase1_label",
+                        "phase2_label",
+                        "plateau_split_min_traversals_per_phase",
+                        "plateau_split_excluded_traversals",
                         "shift_pf1_cm",
                         "shift_pf2_cm",
                         "n_trials_pf1_s1",
@@ -11979,6 +18753,10 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
                         "window1_end_sec": float(split_meta["window1_end_sec"]),
                         "window2_start_sec": float(split_meta["window2_start_sec"]),
                         "window2_end_sec": float(split_meta["window2_end_sec"]),
+                        "phase1_label": str(phase_labels_use[0]),
+                        "phase2_label": str(phase_labels_use[1]),
+                        "plateau_split_min_traversals_per_phase": float(split_meta["plateau_split_min_traversals_per_phase"]),
+                        "plateau_split_excluded_traversals": float(split_meta["plateau_split_excluded_traversals"]),
                         "distance_rel_pf1": np.asarray(cp["rel1"], dtype=float),
                         "distance_rel_pf2": np.asarray(cp["rel2"], dtype=float),
                         "shift_pf1_cm": float(shift_pf1),
@@ -12041,6 +18819,10 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
                             float(split_meta["window1_end_sec"]) if np.isfinite(float(split_meta["window1_end_sec"])) else np.nan,
                             float(split_meta["window2_start_sec"]) if np.isfinite(float(split_meta["window2_start_sec"])) else np.nan,
                             float(split_meta["window2_end_sec"]) if np.isfinite(float(split_meta["window2_end_sec"])) else np.nan,
+                            str(phase_labels_use[0]),
+                            str(phase_labels_use[1]),
+                            float(split_meta["plateau_split_min_traversals_per_phase"]) if np.isfinite(float(split_meta["plateau_split_min_traversals_per_phase"])) else np.nan,
+                            float(split_meta["plateau_split_excluded_traversals"]) if np.isfinite(float(split_meta["plateau_split_excluded_traversals"])) else np.nan,
                             float(shift_pf1) if np.isfinite(shift_pf1) else np.nan,
                             float(shift_pf2) if np.isfinite(shift_pf2) else np.nan,
                             int(n_pf1_s1),
@@ -12063,6 +18845,10 @@ def generate_pf_distance_centered_component_heatmaps_2sessions(
                 summary[cat]["split_window_minutes"] = (
                     None if not np.isfinite(float(split_meta["split_window_minutes"])) else float(split_meta["split_window_minutes"])
                 )
+                summary[cat]["phase_labels"] = tuple(phase_labels_use)
+                if split_mode_norm == "prepost_plateau":
+                    summary[cat]["plateau_split_min_traversals_per_phase"] = int(plateau_split_min_traversals_per_phase_use)
+                    summary[cat]["plateau_split_excluded_traversals"] = int(plateau_split_excluded_traversals_use)
 
     return summary
 
@@ -12178,6 +18964,10 @@ def _filter_direction_data_by_avg_mode(
                 else:
                     td_out[td_key] = td_val
             out["trial_data"] = td_out
+            continue
+
+        if key == "plateau_trace_events_by_trial" and isinstance(value, (list, tuple)) and len(value) == int(mask.size):
+            out[key] = [value[int(i)] for i in np.flatnonzero(mask)]
             continue
 
         try:
@@ -12321,10 +19111,12 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
     clear_output: bool = True,
     smooth_window: float = 1.0,
     fr_vmax_scale: float = 0.6,
+    rate_colorbar_vmax: float | None = None,
     theta_vlim: tuple[float, float] = (0, 0.5),
     slow_vlim: tuple[float, float] = (-0.4, 0.4),
     fig_width: float = 3.0,
     trial_height: float = 0.02,
+    heatmap_height: float | None = None,
     xlim: tuple[float, float] | None = None,
     merge_ss_cs: bool = True,
     merge_plateau: bool = True,
@@ -12342,10 +19134,13 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
     max_peak_adjust_cm_pf2: float | None = None,
     peak_align_reference_session: str | int | None = "session1",
     show_session_gap_line: bool = True,
+    disable_pf2_avg_ylim_sync: bool = False,
     avg_mode: str = "combined",
     save_average_exports: bool = True,
     average_export_subdir: str = "pf_distance_centered_2directions_average_exports",
     print_peak_shift_bins: bool = False,
+    x_label: str = "Distance from PF peak (cm)",
+    output_prefix: str = "pf_centered_2directions",
     show_plot: bool = False,
 ) -> dict[str, Any]:
     import csv
@@ -12359,6 +19154,15 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
     if avg_smooth_window is None:
         avg_smooth_window = smooth_window
     avg_smooth_window_bins = _distance_smooth_cm_to_bins(distance_bin_cm, avg_smooth_window)
+    if rate_colorbar_vmax is not None:
+        rate_colorbar_vmax = float(rate_colorbar_vmax)
+        if (not np.isfinite(rate_colorbar_vmax)) or rate_colorbar_vmax <= 0:
+            raise ValueError("rate_colorbar_vmax must be a finite number > 0.")
+    fixed_heatmap_height = None
+    if heatmap_height is not None:
+        fixed_heatmap_height = float(heatmap_height)
+        if (not np.isfinite(fixed_heatmap_height)) or fixed_heatmap_height <= 0:
+            raise ValueError("heatmap_height must be a finite number > 0.")
 
     def _window_from_cap(cap_cm: float | None) -> tuple[float, float]:
         if cap_cm is None:
@@ -12462,7 +19266,7 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
 
     figure_root.mkdir(parents=True, exist_ok=True)
     cat_to_dir = {
-        cat: figure_root / _category_output_dir_name(prefix="pf_centered_2directions", category=cat, suffix="_heatmaps")
+        cat: figure_root / _category_output_dir_name(prefix=str(output_prefix), category=cat, suffix="_heatmaps")
         for cat in categories
     }
     summary: dict[str, Any] = {}
@@ -12506,6 +19310,9 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
                 avg_smooth_window=int(avg_smooth_window_bins),
                 avg_mode=mode_norm,
             )
+            if rate_colorbar_vmax is not None:
+                colorbar_vmax_override = dict(colorbar_vmax_override)
+                colorbar_vmax_override["rate"] = float(rate_colorbar_vmax)
             plot_pf_centered_dual_component_heatmap(
                 entry_primary=entry_main,
                 entry_secondary=entry_secondary,
@@ -12525,7 +19332,7 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
                 plateau_vlim=plateau_vlim,
                 avg_height=avg_height,
                 avg_smooth_window=avg_smooth_window_bins,
-                x_label="Distance from PF peak (cm)",
+                x_label=str(x_label),
                 center_line_x=0.0,
                 show_session_gap_line=show_session_gap_line,
                 auto_colorbar_vmax_from_pf1_all=False,
@@ -12540,7 +19347,8 @@ def generate_pf_distance_centered_component_heatmaps_2directions(
                 heatmap_wspace=0.20,
                 avg_theta_ylim=avg_theta_ylim,
                 avg_slow_ylim=avg_slow_ylim,
-                fixed_heatmap_height=0.5,
+                disable_pf2_avg_ylim_sync=disable_pf2_avg_ylim_sync,
+                fixed_heatmap_height=(float(fixed_heatmap_height) if fixed_heatmap_height is not None else 0.5),
                 fixed_subplot_width=float(subplot_width),
             )
             n_saved += 1
@@ -12807,6 +19615,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset(
     max_peak_adjust_cm: float | None = None,
     max_peak_adjust_cm_pf1: float | None = None,
     max_peak_adjust_cm_pf2: float | None = None,
+    x_label: str = "Distance (cm)",
     show_plot: bool = True,
 ) -> plt.Figure | None:
     cat = _normalize_pf_category_name(category)
@@ -12896,7 +19705,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset(
         ax.set_xlabel("")
     pref_bottom_axes = [ax for ax in bottom_axes if int(ax.get_subplotspec().colspan.start) in {1, 4}]
     for ax in pref_bottom_axes:
-        ax.set_xlabel("Distance (cm)", labelpad=2.0)
+        ax.set_xlabel(str(x_label), labelpad=2.0)
     if out_path is not None:
         fig.savefig(out_path, dpi=300)
     if show_plot:
@@ -13035,7 +19844,9 @@ def _plot_pooled_category_3col_sessions_on_axes(
     merge_ss_cs_subplots: bool = False,
     require_both_sessions_for_pf: bool = False,
     fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
     show_sem_shading: bool = True,
+    session_column_titles: tuple[str, str] | list[str] | None = None,
 ) -> dict[str, int]:
     min_trav = int(min_traversals_per_type)
     if min_trav < 0:
@@ -13047,14 +19858,17 @@ def _plot_pooled_category_3col_sessions_on_axes(
         align_mask = np.ones_like(time_rel, dtype=bool)
 
     metric_keys = ["rate_stack", "ss_rate_stack", "cs_rate_stack", "theta_stack", "slow_stack"]
+    session_column_titles_use = _normalize_two_phase_labels(session_column_titles)
     col_specs: list[tuple[str, int | str | None, str]] = [
         ("all", None, "combined"),
-        ("session1", "session1", "Session 1"),
-        ("session2", "session2", "Session 2"),
+        ("session1", "session1", str(session_column_titles_use[0])),
+        ("session2", "session2", str(session_column_titles_use[1])),
     ]
     valid_norm_cols = {k for k, _, _ in col_specs}
     if str(fr_norm_reference_col) not in valid_norm_cols:
         raise ValueError(f"fr_norm_reference_col must be one of {sorted(valid_norm_cols)}.")
+    denom_mode = _normalize_fr_norm_denominator_mode(fr_norm_denominator_mode)
+    denom_source_counts: dict[str, int] = {"zero": 0, "peak_fallback": 0, "invalid": 0}
 
     def _mean_sem(arr: np.ndarray | None) -> tuple[np.ndarray | None, np.ndarray | None]:
         if arr is None or arr.size == 0:
@@ -13116,16 +19930,29 @@ def _plot_pooled_category_3col_sessions_on_axes(
                 continue
 
         rate_zero_by_col: dict[str, float] = {}
+        rate_denom_by_col: dict[str, float] = {}
+        rate_denom_source_by_col: dict[str, str] = {}
         for k, _, _ in col_specs:
             trk = traces[k].get("rate_stack")
             rate_zero_by_col[k] = float(trk[zero_idx]) if trk is not None and np.size(trk) > zero_idx else np.nan
+            denom_val, denom_source = _fr_norm_denominator_from_trace(
+                trk,
+                zero_idx,
+                mode=denom_mode,
+            )
+            rate_denom_by_col[k] = float(denom_val) if np.isfinite(denom_val) else np.nan
+            rate_denom_source_by_col[k] = str(denom_source)
         all_zero = float(rate_zero_by_col.get("all", np.nan))
+        ref_denom_source = str(rate_denom_source_by_col.get(str(fr_norm_reference_col), "invalid"))
+        denom_source_counts[ref_denom_source] = int(denom_source_counts.get(ref_denom_source, 0)) + 1
         records.append(
             {
                 "traces": traces,
                 "n_trials_by_col": dict(n_trials_by_col),
                 "all_rate_zero": all_zero,
                 "rate_zero_by_col": dict(rate_zero_by_col),
+                "rate_denom_by_col": dict(rate_denom_by_col),
+                "rate_denom_source_by_col": dict(rate_denom_source_by_col),
                 "session": session,
                 "cell_idx": cell_idx,
             }
@@ -13145,6 +19972,11 @@ def _plot_pooled_category_3col_sessions_on_axes(
             and int(rec.get("n_trials_by_col", {}).get("session2", 0)) >= both_req
         ]
 
+    denom_source_counts = {"zero": 0, "peak_fallback": 0, "invalid": 0}
+    for rec in records:
+        denom_source = str(rec.get("rate_denom_source_by_col", {}).get(str(fr_norm_reference_col), "invalid"))
+        denom_source_counts[denom_source] = int(denom_source_counts.get(denom_source, 0)) + 1
+
     def _collect_stack(col_key: str, metric_key: str, *, normalize_with_all: bool = False) -> np.ndarray | None:
         arrs: list[np.ndarray] = []
         for rec in records:
@@ -13159,7 +19991,7 @@ def _plot_pooled_category_3col_sessions_on_axes(
             if tr.ndim != 1 or tr.size != n_time:
                 continue
             if normalize_with_all:
-                denom = float(rec.get("rate_zero_by_col", {}).get(str(fr_norm_reference_col), rec.get("all_rate_zero", np.nan)))
+                denom = float(rec.get("rate_denom_by_col", {}).get(str(fr_norm_reference_col), rec.get("all_rate_zero", np.nan)))
                 if rate_norm_denom_by_cell is not None:
                     override = rate_norm_denom_by_cell.get((rec["session"], int(rec["cell_idx"])))
                     if override is not None and np.isfinite(override) and override != 0:
@@ -13228,11 +20060,23 @@ def _plot_pooled_category_3col_sessions_on_axes(
             if any(mk == "slow_stack" for mk, _ in row_spec["metrics"]):
                 ax.axhline(0, color="black", linewidth=0.4, linestyle="--", alpha=0.6)
             if row_i == 0:
-                ax.set_title(f"{title_prefix}{col_title}", fontsize=6)
+                ax.set_title("", fontsize=6)
 
     if set_row_labels:
         for row_i, row_spec in enumerate(row_specs):
             axes[row_i, 0].set_ylabel(str(row_spec["label"]))
+    for col, (col_key, _, col_title) in enumerate(col_specs):
+        axes[0, col].set_title(
+            f"{title_prefix}{col_title}\n" f"n={int(n_cells_by_col.get(col_key, 0))}",
+            fontsize=6,
+        )
+    label = str(title_prefix).strip() or "PF"
+    print(
+        f"{label} FR norm denominator mode={denom_mode}: "
+        f"zero={int(denom_source_counts.get('zero', 0))}, "
+        f"peak fallback={int(denom_source_counts.get('peak_fallback', 0))}, "
+        f"invalid={int(denom_source_counts.get('invalid', 0))}"
+    )
     for col in range(3):
         axes[n_rows - 1, col].set_xlabel(x_label)
 
@@ -13320,7 +20164,9 @@ def plot_pooled_category_primary_secondary_2sessions(
     merge_ss_cs_subplots: bool = False,
     require_both_sessions_for_pf: bool = False,
     fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
     show_sem_shading: bool = True,
+    phase_labels: tuple[str, str] | list[str] | None = None,
     show_plot: bool = True,
     close_on_return: bool = True,
 ) -> plt.Figure | None:
@@ -13328,6 +20174,8 @@ def plot_pooled_category_primary_secondary_2sessions(
         print(f"No primary PF data to plot for {title}")
         return None
 
+    phase_labels_use = _normalize_two_phase_labels(phase_labels)
+    count_labels = _two_phase_count_labels(phase_labels_use)
     has_secondary = time_rel_secondary is not None and entries_secondary is not None and len(entries_secondary) > 0
     n_rows = 4 if bool(merge_ss_cs_subplots) else 5
     if not has_secondary:
@@ -13358,11 +20206,14 @@ def plot_pooled_category_primary_secondary_2sessions(
             merge_ss_cs_subplots=merge_ss_cs_subplots,
             require_both_sessions_for_pf=require_both_sessions_for_pf,
             fr_norm_reference_col=fr_norm_reference_col,
+            fr_norm_denominator_mode=fr_norm_denominator_mode,
             show_sem_shading=show_sem_shading,
+            session_column_titles=phase_labels_use,
         )
         print(
             f"[{title}] n (PF1): combined={int(n_cells_single.get('all', 0))}, "
-            f"S1={int(n_cells_single.get('session1', 0))}, S2={int(n_cells_single.get('session2', 0))}"
+            f"{count_labels[0]}={int(n_cells_single.get('session1', 0))}, "
+            f"{count_labels[1]}={int(n_cells_single.get('session2', 0))}"
         )
         fig.suptitle(f"{title}", y=0.995)
         try:
@@ -13400,9 +20251,14 @@ def plot_pooled_category_primary_secondary_2sessions(
             smooth_window=smooth_window,
             avg_smooth_window=(smooth_window if avg_smooth_window is None else avg_smooth_window),
         )
-        if all_tr is not None and all_tr.size > zero_idx:
-            denom_map[(session, cell_idx, "all")] = float(all_tr[zero_idx])
-            denom_map[(session, cell_idx)] = float(all_tr[zero_idx])
+        denom_val, _ = _fr_norm_denominator_from_trace(
+            all_tr,
+            zero_idx,
+            mode=fr_norm_denominator_mode,
+        )
+        if np.isfinite(denom_val) and not np.isclose(float(denom_val), 0.0):
+            denom_map[(session, cell_idx, "all")] = float(denom_val)
+            denom_map[(session, cell_idx)] = float(denom_val)
 
     fig_h = float(figsize_per_block[1]) * 1.25
     fig, axes = plt.subplots(
@@ -13438,7 +20294,9 @@ def plot_pooled_category_primary_secondary_2sessions(
         merge_ss_cs_subplots=merge_ss_cs_subplots,
         require_both_sessions_for_pf=require_both_sessions_for_pf,
         fr_norm_reference_col=fr_norm_reference_col,
+        fr_norm_denominator_mode=fr_norm_denominator_mode,
         show_sem_shading=show_sem_shading,
+        session_column_titles=phase_labels_use,
     )
     n_cells_secondary = _plot_pooled_category_3col_sessions_on_axes(
         np.asarray(time_rel_secondary, dtype=float),
@@ -13467,15 +20325,19 @@ def plot_pooled_category_primary_secondary_2sessions(
         merge_ss_cs_subplots=merge_ss_cs_subplots,
         require_both_sessions_for_pf=require_both_sessions_for_pf,
         fr_norm_reference_col=fr_norm_reference_col,
+        fr_norm_denominator_mode=fr_norm_denominator_mode,
         show_sem_shading=show_sem_shading,
+        session_column_titles=phase_labels_use,
     )
     print(
         f"[{title}] n (PF1): combined={int(n_cells_primary.get('all', 0))}, "
-        f"S1={int(n_cells_primary.get('session1', 0))}, S2={int(n_cells_primary.get('session2', 0))}"
+        f"{count_labels[0]}={int(n_cells_primary.get('session1', 0))}, "
+        f"{count_labels[1]}={int(n_cells_primary.get('session2', 0))}"
     )
     print(
         f"[{title}] n (PF2): combined={int(n_cells_secondary.get('all', 0))}, "
-        f"S1={int(n_cells_secondary.get('session1', 0))}, S2={int(n_cells_secondary.get('session2', 0))}"
+        f"{count_labels[0]}={int(n_cells_secondary.get('session1', 0))}, "
+        f"{count_labels[1]}={int(n_cells_secondary.get('session2', 0))}"
     )
     fig.suptitle(f"{title}", y=0.995)
     try:
@@ -13526,15 +20388,28 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2sessions(
     merge_ss_cs_subplots: bool = True,
     require_both_sessions_for_pf: bool = True,
     fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
     show_sem_shading: bool = True,
     split_mode: str = "recorded_sessions",
     split_window_minutes: float | None = None,
+    plateau_split_min_traversals_per_phase: int = 5,
+    plateau_split_excluded_traversals: int = 0,
+    phase_labels: tuple[str, str] | list[str] | None = None,
+    x_label_pf1: str = "Distance from PF1 peak (cm)",
+    x_label_pf2: str = "Distance from PF2 peak (cm)",
     show_plot: bool = True,
 ) -> plt.Figure | None:
     import csv
 
     split_mode_norm = _normalize_two_session_split_mode(split_mode)
     split_window_minutes_use = _validate_two_session_split_window_minutes(split_mode_norm, split_window_minutes)
+    plateau_split_min_traversals_per_phase_use = _validate_plateau_split_min_traversals_per_phase(
+        plateau_split_min_traversals_per_phase
+    )
+    plateau_split_excluded_traversals_use = _validate_plateau_split_excluded_traversals(
+        plateau_split_excluded_traversals
+    )
+    phase_labels_use = _normalize_two_phase_labels(phase_labels, split_mode=split_mode_norm)
     cat = _normalize_pf_category_name(category)
     cat_data = dataset.get(cat, {})
     primary = cat_data.get(1, {})
@@ -13715,6 +20590,8 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2sessions(
                         npz,
                         split_mode=split_mode_norm,
                         split_window_minutes=split_window_minutes_use,
+                        plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase_use,
+                        plateau_split_excluded_traversals=plateau_split_excluded_traversals_use,
                     ):
                         try:
                             npz.close()
@@ -13756,22 +20633,30 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2sessions(
                 primary_entries,
                 split_mode=split_mode_norm,
                 split_window_minutes=split_window_minutes_use,
+                plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase_use,
+                plateau_split_excluded_traversals=plateau_split_excluded_traversals_use,
             )
             secondary_entries = _split_distance_centered_entries_for_two_sessions(
                 secondary_entries,
                 split_mode=split_mode_norm,
                 split_window_minutes=split_window_minutes_use,
+                plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase_use,
+                plateau_split_excluded_traversals=plateau_split_excluded_traversals_use,
             )
     else:
         primary_entries = _split_distance_centered_entries_for_two_sessions(
             primary_entries,
             split_mode=split_mode_norm,
             split_window_minutes=split_window_minutes_use,
+            plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase_use,
+            plateau_split_excluded_traversals=plateau_split_excluded_traversals_use,
         )
         secondary_entries = _split_distance_centered_entries_for_two_sessions(
             secondary_entries,
             split_mode=split_mode_norm,
             split_window_minutes=split_window_minutes_use,
+            plateau_split_min_traversals_per_phase=plateau_split_min_traversals_per_phase_use,
+            plateau_split_excluded_traversals=plateau_split_excluded_traversals_use,
         )
     if bool(align_all_peak_to_zero) and primary_rel.size > 0:
         primary_entries = [
@@ -13820,8 +20705,8 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2sessions(
             else 0
         ),
         min_trials_per_column=min_trials_per_column,
-        x_label_pf1="Distance from PF1 peak (cm)",
-        x_label_pf2="Distance from PF2 peak (cm)",
+        x_label_pf1=str(x_label_pf1),
+        x_label_pf2=str(x_label_pf2),
         center_line_x=0.0,
         align_all_peak_to_zero=False,
         peak_align_window=pf1_window,
@@ -13829,7 +20714,9 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2sessions(
         merge_ss_cs_subplots=merge_ss_cs_subplots,
         require_both_sessions_for_pf=require_both_sessions_for_pf,
         fr_norm_reference_col=fr_norm_reference_col,
+        fr_norm_denominator_mode=fr_norm_denominator_mode,
         show_sem_shading=show_sem_shading,
+        phase_labels=phase_labels_use,
         show_plot=False,
         close_on_return=False,
     )
@@ -13843,6 +20730,163 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2sessions(
     else:
         plt.close(fig)
     return fig
+
+
+def build_direction_average_fr_norm_denominator_map(
+    average_export_dir: str | Path,
+    category: str,
+    *,
+    pf_rank_for_denominator: int = 1,
+    stage: str = "post",
+    avg_mode: str = "combined",
+    fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
+    direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
+    explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
+) -> dict[str, Any]:
+    """Build per-cell FR normalization denominators from direction average exports.
+
+    The returned map is keyed by ``(animal_id, cell_idx)`` and
+    ``(animal_id, cell_idx, "all")`` so it can be passed directly as
+    ``rate_norm_denom_by_cell`` to the pooled direction plotting helpers.
+    """
+    import csv
+
+    export_root = Path(average_export_dir)
+    cat = _normalize_pf_category_name(category)
+    mode_norm = _normalize_direction_avg_mode(avg_mode)
+    stage_norm = str(stage).strip().lower()
+    if stage_norm not in {"pre", "post"}:
+        raise ValueError("stage must be 'pre' or 'post'.")
+    dir_keys, _ = _normalize_direction_triplet(direction_keys=direction_keys, direction_titles=None)
+    all_key, cw_key, ccw_key = str(dir_keys[0]), str(dir_keys[1]), str(dir_keys[2])
+    pf_rank = int(pf_rank_for_denominator)
+    if pf_rank < 1:
+        raise ValueError("pf_rank_for_denominator must be >= 1.")
+
+    ref_norm = str(fr_norm_reference_col).strip().lower()
+    ref_aliases = {
+        "all": "all",
+        "combined": "all",
+        "pref": "preferred",
+        "preferred": "preferred",
+        "nonpref": "nonpreferred",
+        "non-pref": "nonpreferred",
+        "nonpreferred": "nonpreferred",
+        "non-preferred": "nonpreferred",
+    }
+    if ref_norm not in ref_aliases:
+        raise ValueError("fr_norm_reference_col must be one of: 'all', 'preferred', or 'nonpreferred'.")
+    ref_norm = ref_aliases[ref_norm]
+    denom_mode = _normalize_fr_norm_denominator_mode(fr_norm_denominator_mode)
+
+    index_csv = export_root / cat / "session_averages_pre_post_index.csv"
+    denom_by_cell: dict[tuple[str, int] | tuple[str, int, str], float] = {}
+    skipped_rows: list[dict[str, Any]] = []
+    summary = {
+        "category": cat,
+        "index_csv": str(index_csv),
+        "rows": 0,
+        "denominator_cells": 0,
+        "skipped": 0,
+        "stage": stage_norm,
+        "avg_mode": mode_norm,
+        "pf_rank_for_denominator": pf_rank,
+        "fr_norm_reference_col": ref_norm,
+        "fr_norm_denominator_mode": denom_mode,
+    }
+    if not index_csv.exists():
+        summary["missing_index"] = True
+        return {"denom_by_cell": denom_by_cell, "summary": summary, "skipped_rows": skipped_rows}
+
+    def _row_int(row: dict[str, Any], key: str, default: int = -1) -> int:
+        try:
+            value = row.get(key, default)
+            if value is None or value == "":
+                return int(default)
+            return int(float(value))
+        except Exception:
+            return int(default)
+
+    def _trace_from_npz(npz_obj: Any, key: str) -> np.ndarray | None:
+        if key not in npz_obj:
+            return None
+        arr = np.asarray(npz_obj[key], dtype=float).reshape(-1)
+        if arr.ndim != 1 or arr.size == 0:
+            return None
+        return arr
+
+    with index_csv.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    summary["rows"] = int(len(rows))
+
+    for row in rows:
+        animal_id = str(row.get("animal_id", ""))
+        cell_idx = _row_int(row, "cell_idx", -1)
+        if not animal_id or cell_idx < 0:
+            skipped_rows.append({"animal_id": animal_id, "cell_idx": cell_idx, "reason": "invalid cell key"})
+            continue
+        npz_path = Path(str(row.get("npz_path", "")))
+        if not npz_path.is_absolute():
+            npz_path = index_csv.parent / npz_path
+        if not npz_path.exists():
+            skipped_rows.append({"animal_id": animal_id, "cell_idx": cell_idx, "reason": "missing npz", "npz_path": str(npz_path)})
+            continue
+        try:
+            with np.load(npz_path, allow_pickle=True) as npz:
+                rel = _trace_from_npz(npz, f"distance_rel_pf{pf_rank}")
+                if rel is None:
+                    skipped_rows.append({"animal_id": animal_id, "cell_idx": cell_idx, "reason": "missing distance axis"})
+                    continue
+                zero_idx = int(np.argmin(np.abs(rel)))
+                all_trace = _trace_from_npz(npz, f"{stage_norm}_pf{pf_rank}_{all_key}_{mode_norm}_all_spike")
+                cw_trace = _trace_from_npz(npz, f"{stage_norm}_pf{pf_rank}_{cw_key}_{mode_norm}_all_spike")
+                ccw_trace = _trace_from_npz(npz, f"{stage_norm}_pf{pf_rank}_{ccw_key}_{mode_norm}_all_spike")
+                if explicit_preferred_nonpreferred_keys is not None:
+                    pref_nonpref = tuple(explicit_preferred_nonpreferred_keys)
+                    if len(pref_nonpref) != 2:
+                        raise ValueError("explicit_preferred_nonpreferred_keys must contain exactly two keys.")
+                    pref_key = str(pref_nonpref[0]).strip()
+                    nonpref_key = str(pref_nonpref[1]).strip()
+                else:
+                    preferred = _infer_preferred_direction_from_rate_traces(cw_trace, ccw_trace)
+                    if preferred == "cw":
+                        pref_key, nonpref_key = cw_key, ccw_key
+                    elif preferred == "ccw":
+                        pref_key, nonpref_key = ccw_key, cw_key
+                    else:
+                        pref_key, nonpref_key = None, None
+                if ref_norm == "all":
+                    ref_key = all_key
+                    ref_trace = all_trace
+                elif ref_norm == "preferred":
+                    ref_key = pref_key
+                    ref_trace = _trace_from_npz(npz, f"{stage_norm}_pf{pf_rank}_{ref_key}_{mode_norm}_all_spike") if ref_key else None
+                else:
+                    ref_key = nonpref_key
+                    ref_trace = _trace_from_npz(npz, f"{stage_norm}_pf{pf_rank}_{ref_key}_{mode_norm}_all_spike") if ref_key else None
+                denom_val, denom_source = _fr_norm_denominator_from_trace(ref_trace, zero_idx, mode=denom_mode)
+        except Exception as exc:
+            skipped_rows.append({"animal_id": animal_id, "cell_idx": cell_idx, "reason": f"load/calculation failed: {exc}", "npz_path": str(npz_path)})
+            continue
+        if not np.isfinite(denom_val) or np.isclose(float(denom_val), 0.0):
+            skipped_rows.append(
+                {
+                    "animal_id": animal_id,
+                    "cell_idx": cell_idx,
+                    "reason": "invalid denominator",
+                    "denominator_source": str(denom_source),
+                    "reference_direction": ref_key,
+                }
+            )
+            continue
+        denom = float(denom_val)
+        denom_by_cell[(animal_id, int(cell_idx))] = denom
+        denom_by_cell[(animal_id, int(cell_idx), "all")] = denom
+
+    summary["denominator_cells"] = int(len({(k[0], k[1]) for k in denom_by_cell if len(k) >= 2}))
+    summary["skipped"] = int(len(skipped_rows))
+    return {"denom_by_cell": denom_by_cell, "summary": summary, "skipped_rows": skipped_rows}
 
 
 def plot_pf_distance_centered_category_primary_secondary_from_dataset_2directions(
@@ -13866,6 +20910,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
     fr_row_ylim_max: float | None = 1.2,
     ss_cs_row_ylim_max: float | None = None,
     min_traversals_per_type: int = 5,
+    min_trials_per_column: int | None = None,
     align_all_peak_to_zero: bool = True,
     peak_align_window: tuple[float, float] = (-5.0, 5.0),
     max_peak_adjust_cm: float | None = None,
@@ -13877,9 +20922,15 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
     avg_mode: str = "combined",
     enforce_min_traversals_on_saved_exports: bool = False,
     show_sem_shading: bool = True,
+    show_column_counts_in_titles: bool = False,
     direction_keys: tuple[str, str, str] | list[str] = ("all", "cw", "ccw"),
     direction_titles: tuple[str, str, str] | list[str] = ("All", "Pref", "Non-pref"),
     explicit_preferred_nonpreferred_keys: tuple[str, str] | list[str] | None = None,
+    fr_norm_reference_col: str = "all",
+    fr_norm_denominator_mode: str = "zero",
+    rate_norm_denom_by_cell: dict[tuple[str, int] | tuple[str, int, str], float] | None = None,
+    x_label: str = "Distance (cm)",
+    x_ticks: tuple[float, ...] | list[float] | np.ndarray | None = None,
     show_plot: bool = True,
 ) -> plt.Figure | None:
     import csv
@@ -14115,6 +21166,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
             if (not bool(use_saved_average_exports) or bool(enforce_min_traversals_on_saved_exports))
             else 0
         ),
+        min_trials_per_column=min_trials_per_column,
         x_label="",
         center_line_x=0.0,
         align_all_peak_to_zero=False,
@@ -14128,6 +21180,11 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
         ccw_direction_key=str(dir_keys[2]),
         explicit_preferred_nonpreferred_keys=explicit_preferred_nonpreferred_keys,
         direction_titles=dir_titles,
+        fr_norm_reference_col=fr_norm_reference_col,
+        fr_norm_denominator_mode=fr_norm_denominator_mode,
+        rate_norm_denom_by_cell=rate_norm_denom_by_cell,
+        x_ticks=x_ticks,
+        show_column_counts_in_titles=show_column_counts_in_titles,
     )
     if fig is None:
         return None
@@ -14137,7 +21194,7 @@ def plot_pf_distance_centered_category_primary_secondary_from_dataset_2direction
         ax.set_xlabel("")
     pref_bottom_axes = [ax for ax in bottom_axes if int(ax.get_subplotspec().colspan.start) in {1, 4}]
     for ax in pref_bottom_axes:
-        ax.set_xlabel("Distance (cm)", labelpad=2.0)
+        ax.set_xlabel(str(x_label), labelpad=2.0)
     if out_path is not None:
         fig.savefig(out_path, dpi=300)
     if show_plot:
@@ -14799,6 +21856,8 @@ def plot_pf_distance_centered_pref_nonpref_stats(
     figure_save_folder: str | Path | None = None,
     five_panel_figsize: tuple[float, float] | None = None,
     two_subplot_figsize: tuple[float, float] | None = None,
+    stat_label_overrides: dict[str, str] | None = None,
+    output_prefix: str = "pf_distance_centered_pref_nonpref",
     show_plot: bool = True,
     save_csv: bool = True,
 ) -> dict[str, str]:
@@ -14817,15 +21876,19 @@ def plot_pf_distance_centered_pref_nonpref_stats(
 
     payload = dict(stats_results)
     payload["per_cell_stability"] = per_cell_df
+    label_overrides = {
+        "peak_ratio_s2_s1": "Peak ratio (Non-pref/Pref)",
+        "peak_abs_sym_diff": "|(Non-pref-Pref)/(Non-pref+Pref)|",
+    }
+    if isinstance(stat_label_overrides, dict):
+        label_overrides.update({str(k): str(v) for k, v in stat_label_overrides.items()})
+    prefix = str(output_prefix)
 
     base = plot_pf_distance_centered_session_stability(
         payload,
         figure_save_folder=figure_root,
         figsize=(None if five_panel_figsize is None else tuple(five_panel_figsize)),
-        stat_label_overrides={
-            "peak_ratio_s2_s1": "Peak ratio (Non-pref/Pref)",
-            "peak_abs_sym_diff": "|(Non-pref-Pref)/(Non-pref+Pref)|",
-        },
+        stat_label_overrides=label_overrides,
         show_plot=False,
         save_csv=save_csv,
     )
@@ -14834,9 +21897,9 @@ def plot_pf_distance_centered_pref_nonpref_stats(
 
     out: dict[str, str] = {}
     dst_map = {
-        "figure": figure_root / "pf_distance_centered_pref_nonpref_summary_5panels.svg",
-        "per_cell_csv": figure_root / "pf_distance_centered_pref_nonpref_per_cell.csv",
-        "stats_csv": figure_root / "pf_distance_centered_pref_nonpref_stats.csv",
+        "figure": figure_root / f"{prefix}_summary_5panels.svg",
+        "per_cell_csv": figure_root / f"{prefix}_per_cell.csv",
+        "stats_csv": figure_root / f"{prefix}_stats.csv",
     }
     src_fig = base.get("figure_paths", {}).get("combined")
     src_per_cell = base.get("per_cell_csv")
@@ -14856,7 +21919,7 @@ def plot_pf_distance_centered_pref_nonpref_stats(
             out[key] = str(dst)
 
     # Secondary 2-subplot figure based on columns 5 and 4.
-    panel_out_name = "pf_distance_centered_pref_nonpref_summary_ss_cs_2subplots.svg"
+    panel_out_name = f"{prefix}_summary_ss_cs_2subplots.svg"
     panel_summary = plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
         payload,
         figure_save_folder=figure_root,
@@ -14876,10 +21939,7 @@ def plot_pf_distance_centered_pref_nonpref_stats(
             payload,
             figure_save_folder=figure_root,
             figsize=(None if five_panel_figsize is None else tuple(five_panel_figsize)),
-            stat_label_overrides={
-                "peak_ratio_s2_s1": "Peak ratio (Non-pref/Pref)",
-                "peak_abs_sym_diff": "|(Non-pref-Pref)/(Non-pref+Pref)|",
-            },
+            stat_label_overrides=label_overrides,
             show_plot=True,
             save_csv=False,
         )
@@ -15363,6 +22423,9 @@ def compute_pf_distance_centered_session_stability(
 
     Metrics per cell:
       - r (Pearson correlation between S1 and S2 tuning curves)
+      - spearman_r (Spearman rank correlation between S1 and S2 tuning curves)
+      - cosine_similarity between S1 and S2 tuning curves
+        * For theta, subtract each session trace mean before cosine.
       - delta_peak_x_cm (peak location shift: S2 - S1)
       - auc_ratio (AUC_S2 / AUC_S1)
         * For slow Vm: use positive-only AUC over slow_auc_window_cm.
@@ -15437,6 +22500,56 @@ def compute_pf_distance_centered_session_stability(
         if np.isclose(std_b, 0.0):
             return np.nan, "flat_trace_session2", n_valid
         return float(np.corrcoef(av, bv)[0, 1]), None, n_valid
+
+    def _spearman_r_with_reason(a: np.ndarray, b: np.ndarray) -> tuple[float, str | None, int]:
+        valid = np.isfinite(a) & np.isfinite(b)
+        n_valid = int(np.sum(valid))
+        if n_valid < 2:
+            return np.nan, "insufficient_overlap_bins", n_valid
+        av = np.asarray(a[valid], dtype=float)
+        bv = np.asarray(b[valid], dtype=float)
+        std_a = float(np.nanstd(av))
+        std_b = float(np.nanstd(bv))
+        if np.isclose(std_a, 0.0) and np.isclose(std_b, 0.0):
+            return np.nan, "flat_trace_both_sessions", n_valid
+        if np.isclose(std_a, 0.0):
+            return np.nan, "flat_trace_session1", n_valid
+        if np.isclose(std_b, 0.0):
+            return np.nan, "flat_trace_session2", n_valid
+        res = scipy_stats.spearmanr(av, bv, nan_policy="omit")
+        rho = float(res.statistic)
+        if not np.isfinite(rho):
+            return np.nan, "spearman_nan", n_valid
+        return rho, None, n_valid
+
+    def _cosine_similarity_with_reason(
+        a: np.ndarray,
+        b: np.ndarray,
+        *,
+        center: bool = False,
+    ) -> tuple[float, str | None, int]:
+        valid = np.isfinite(a) & np.isfinite(b)
+        n_valid = int(np.sum(valid))
+        if n_valid < 2:
+            return np.nan, "insufficient_overlap_bins", n_valid
+        av = np.asarray(a[valid], dtype=float)
+        bv = np.asarray(b[valid], dtype=float)
+        if bool(center):
+            mean_a = float(np.nanmean(av))
+            mean_b = float(np.nanmean(bv))
+            if (not np.isfinite(mean_a)) or (not np.isfinite(mean_b)):
+                return np.nan, "invalid_centering_mean", n_valid
+            av = av - mean_a
+            bv = bv - mean_b
+        norm_a = float(np.linalg.norm(av))
+        norm_b = float(np.linalg.norm(bv))
+        if np.isclose(norm_a, 0.0) and np.isclose(norm_b, 0.0):
+            return np.nan, "zero_norm_both_sessions", n_valid
+        if np.isclose(norm_a, 0.0):
+            return 0.0, "zero_norm_session1_set_to_zero", n_valid
+        if np.isclose(norm_b, 0.0):
+            return 0.0, "zero_norm_session2_set_to_zero", n_valid
+        return float(np.dot(av, bv) / (norm_a * norm_b)), None, n_valid
 
     def _peak_x_with_reason(trace: np.ndarray, x: np.ndarray) -> tuple[float, str | None]:
         if trace.ndim != 1 or x.ndim != 1 or trace.size != x.size:
@@ -15611,6 +22724,13 @@ def compute_pf_distance_centered_session_stability(
                                             continue
                                         r_val_raw, r_reason, n_overlap_bins = _pearson_r_with_reason(tr1, tr2)
                                         r_val, r_set_to_zero = _apply_r_nan_policy(r_val_raw)
+                                        spearman_val_raw, spearman_reason, n_spearman_bins = _spearman_r_with_reason(tr1, tr2)
+                                        spearman_val, spearman_set_to_zero = _apply_r_nan_policy(spearman_val_raw)
+                                        cosine_similarity, cosine_reason, n_cosine_bins = _cosine_similarity_with_reason(
+                                            tr1,
+                                            tr2,
+                                            center=(str(metric_name) == "theta"),
+                                        )
                                         p1, p1_reason = _peak_x_with_reason(tr1, x)
                                         p2, p2_reason = _peak_x_with_reason(tr2, x)
                                         dpeak = float(p2 - p1) if (np.isfinite(p1) and np.isfinite(p2)) else np.nan
@@ -15632,6 +22752,9 @@ def compute_pf_distance_centered_session_stability(
                                                 "n_trials_s1": int(n1),
                                                 "n_trials_s2": int(n2),
                                                 "r": float(r_val) if np.isfinite(r_val) else np.nan,
+                                                "spearman_r": float(spearman_val) if np.isfinite(spearman_val) else np.nan,
+                                                "cosine_similarity": float(cosine_similarity) if np.isfinite(cosine_similarity) else np.nan,
+                                                "cosine_mean_centered": bool(str(metric_name) == "theta"),
                                                 "delta_peak_x_cm": float(dpeak) if np.isfinite(dpeak) else np.nan,
                                                 "auc_ratio": float(auc_ratio) if np.isfinite(auc_ratio) else np.nan,
                                                 "peak_s1": float(peak_s1) if np.isfinite(peak_s1) else np.nan,
@@ -15640,7 +22763,7 @@ def compute_pf_distance_centered_session_stability(
                                                 "peak_abs_sym_diff": float(peak_abs_sym_diff) if np.isfinite(peak_abs_sym_diff) else np.nan,
                                             }
                                         )
-                                        if bool(r_set_to_zero) or (not np.isfinite(dpeak)) or (not np.isfinite(auc_ratio)) or (not np.isfinite(peak_ratio)) or (not np.isfinite(peak_abs_sym_diff)):
+                                        if bool(r_set_to_zero) or bool(spearman_set_to_zero) or (not np.isfinite(cosine_similarity)) or (not np.isfinite(dpeak)) or (not np.isfinite(auc_ratio)) or (not np.isfinite(peak_ratio)) or (not np.isfinite(peak_abs_sym_diff)):
                                             nan_rows.append(
                                                 {
                                                     "group": str(group),
@@ -15653,11 +22776,27 @@ def compute_pf_distance_centered_session_stability(
                                                     "n_trials_s1": int(n1),
                                                     "n_trials_s2": int(n2),
                                                     "n_overlap_bins_for_r": int(n_overlap_bins),
+                                                    "n_overlap_bins_for_spearman": int(n_spearman_bins),
+                                                    "n_overlap_bins_for_cosine": int(n_cosine_bins),
                                                     "n_auc_bins": int(n_auc_bins),
                                                     "n_peak_bins": int(n_peak_bins),
                                                     "r_is_nan": bool(not np.isfinite(r_val_raw)),
                                                     "r_set_to_zero": bool(r_set_to_zero),
                                                     "r_nan_reason": (str(r_reason) if ((not np.isfinite(r_val_raw)) and r_reason is not None) else ""),
+                                                    "spearman_r_is_nan": bool(not np.isfinite(spearman_val_raw)),
+                                                    "spearman_r_set_to_zero": bool(spearman_set_to_zero),
+                                                    "spearman_r_nan_reason": (
+                                                        str(spearman_reason)
+                                                        if ((not np.isfinite(spearman_val_raw)) and spearman_reason is not None)
+                                                        else ""
+                                                    ),
+                                                    "cosine_similarity_is_nan": bool(not np.isfinite(cosine_similarity)),
+                                                    "cosine_mean_centered": bool(str(metric_name) == "theta"),
+                                                    "cosine_similarity_nan_reason": (
+                                                        str(cosine_reason)
+                                                        if ((not np.isfinite(cosine_similarity)) and cosine_reason is not None)
+                                                        else ""
+                                                    ),
                                                     "peak_shift_is_nan": bool(not np.isfinite(dpeak)),
                                                     "peak_shift_nan_reason": (
                                                         "session1:" + str(p1_reason) if ((not np.isfinite(p1)) and p1_reason is not None) else ""
@@ -15747,6 +22886,13 @@ def compute_pf_distance_centered_session_stability(
                     tr2 = np.asarray(tr2, dtype=float)
                     r_val_raw, r_reason, n_overlap_bins = _pearson_r_with_reason(tr1, tr2)
                     r_val, r_set_to_zero = _apply_r_nan_policy(r_val_raw)
+                    spearman_val_raw, spearman_reason, n_spearman_bins = _spearman_r_with_reason(tr1, tr2)
+                    spearman_val, spearman_set_to_zero = _apply_r_nan_policy(spearman_val_raw)
+                    cosine_similarity, cosine_reason, n_cosine_bins = _cosine_similarity_with_reason(
+                        tr1,
+                        tr2,
+                        center=(str(metric_name) == "theta"),
+                    )
                     p1, p1_reason = _peak_x_with_reason(tr1, x)
                     p2, p2_reason = _peak_x_with_reason(tr2, x)
                     dpeak = float(p2 - p1) if (np.isfinite(p1) and np.isfinite(p2)) else np.nan
@@ -15768,6 +22914,9 @@ def compute_pf_distance_centered_session_stability(
                             "n_trials_s1": int(n1),
                             "n_trials_s2": int(n2),
                             "r": float(r_val) if np.isfinite(r_val) else np.nan,
+                            "spearman_r": float(spearman_val) if np.isfinite(spearman_val) else np.nan,
+                            "cosine_similarity": float(cosine_similarity) if np.isfinite(cosine_similarity) else np.nan,
+                            "cosine_mean_centered": bool(str(metric_name) == "theta"),
                             "delta_peak_x_cm": float(dpeak) if np.isfinite(dpeak) else np.nan,
                             "auc_ratio": float(auc_ratio) if np.isfinite(auc_ratio) else np.nan,
                             "peak_s1": float(peak_s1) if np.isfinite(peak_s1) else np.nan,
@@ -15776,7 +22925,7 @@ def compute_pf_distance_centered_session_stability(
                             "peak_abs_sym_diff": float(peak_abs_sym_diff) if np.isfinite(peak_abs_sym_diff) else np.nan,
                         }
                     )
-                    if bool(r_set_to_zero) or (not np.isfinite(dpeak)) or (not np.isfinite(auc_ratio)) or (not np.isfinite(peak_ratio)) or (not np.isfinite(peak_abs_sym_diff)):
+                    if bool(r_set_to_zero) or bool(spearman_set_to_zero) or (not np.isfinite(cosine_similarity)) or (not np.isfinite(dpeak)) or (not np.isfinite(auc_ratio)) or (not np.isfinite(peak_ratio)) or (not np.isfinite(peak_abs_sym_diff)):
                         nan_rows.append(
                             {
                                 "group": str(group),
@@ -15789,11 +22938,27 @@ def compute_pf_distance_centered_session_stability(
                                 "n_trials_s1": int(n1),
                                 "n_trials_s2": int(n2),
                                 "n_overlap_bins_for_r": int(n_overlap_bins),
+                                "n_overlap_bins_for_spearman": int(n_spearman_bins),
+                                "n_overlap_bins_for_cosine": int(n_cosine_bins),
                                 "n_auc_bins": int(n_auc_bins),
                                 "n_peak_bins": int(n_peak_bins),
                                 "r_is_nan": bool(not np.isfinite(r_val_raw)),
                                 "r_set_to_zero": bool(r_set_to_zero),
                                 "r_nan_reason": (str(r_reason) if ((not np.isfinite(r_val_raw)) and r_reason is not None) else ""),
+                                "spearman_r_is_nan": bool(not np.isfinite(spearman_val_raw)),
+                                "spearman_r_set_to_zero": bool(spearman_set_to_zero),
+                                "spearman_r_nan_reason": (
+                                    str(spearman_reason)
+                                    if ((not np.isfinite(spearman_val_raw)) and spearman_reason is not None)
+                                    else ""
+                                ),
+                                "cosine_similarity_is_nan": bool(not np.isfinite(cosine_similarity)),
+                                "cosine_mean_centered": bool(str(metric_name) == "theta"),
+                                "cosine_similarity_nan_reason": (
+                                    str(cosine_reason)
+                                    if ((not np.isfinite(cosine_similarity)) and cosine_reason is not None)
+                                    else ""
+                                ),
                                 "peak_shift_is_nan": bool(not np.isfinite(dpeak)),
                                 "peak_shift_nan_reason": (
                                     "session1:" + str(p1_reason) if ((not np.isfinite(p1)) and p1_reason is not None) else ""
@@ -15829,6 +22994,12 @@ def compute_pf_distance_centered_session_stability(
                     parts.append(f"r:{str(rr.get('r_nan_reason', ''))}")
                 if bool(rr.get("r_set_to_zero", False)):
                     parts.append("r_set_to_zero")
+                if bool(rr.get("spearman_r_is_nan", False)):
+                    parts.append(f"spearman:{str(rr.get('spearman_r_nan_reason', ''))}")
+                if bool(rr.get("spearman_r_set_to_zero", False)):
+                    parts.append("spearman_set_to_zero")
+                if bool(rr.get("cosine_similarity_is_nan", False)):
+                    parts.append(f"cosine:{str(rr.get('cosine_similarity_nan_reason', ''))}")
                 if bool(rr.get("peak_shift_is_nan", False)):
                     parts.append(f"peak_shift:{str(rr.get('peak_shift_nan_reason', ''))}")
                 if bool(rr.get("auc_ratio_is_nan", False)):
@@ -15845,7 +23016,11 @@ def compute_pf_distance_centered_session_stability(
                 print(
                     f"  group={rr.get('group', '')}, metric={rr.get('metric', '')}, "
                     f"cell={cell_lbl}, n_s1={int(rr.get('n_trials_s1', 0))}, n_s2={int(rr.get('n_trials_s2', 0))}, "
-                    f"overlap_bins={int(rr.get('n_overlap_bins_for_r', 0))}, auc_bins={int(rr.get('n_auc_bins', 0))}, peak_bins={int(rr.get('n_peak_bins', 0))}, "
+                    f"overlap_bins={int(rr.get('n_overlap_bins_for_r', 0))}, "
+                    f"spearman_bins={int(rr.get('n_overlap_bins_for_spearman', 0))}, "
+                    f"cosine_bins={int(rr.get('n_overlap_bins_for_cosine', 0))}, "
+                    f"auc_bins={int(rr.get('n_auc_bins', 0))}, "
+                    f"peak_bins={int(rr.get('n_peak_bins', 0))}, "
                     f"reasons={'; '.join(parts)}"
                 )
     return {
@@ -15866,6 +23041,7 @@ def compute_pf_distance_centered_session_stability(
         "auc_window_cm": None if auc_window_cm is None else (float(auc_window_cm[0]), float(auc_window_cm[1])),
         "slow_auc_window_cm": (float(slow_auc_window_cm[0]), float(slow_auc_window_cm[1])),
         "peak_window_cm": (float(peak_window_cm[0]), float(peak_window_cm[1])),
+        "theta_cosine_mean_centered": True,
     }
 
 
@@ -15882,7 +23058,7 @@ def plot_pf_distance_centered_session_stability(
     """
     Plot session-stability summary as one combined figure.
     Rows: metrics [all_spike, ss, cs, theta, slow]
-    Cols: [r, peak_shift_cm, auc_ratio, peak_ratio_s2_s1, peak_abs_sym_diff]
+    Cols: [r, spearman_r, cosine_similarity, peak_shift_cm, auc_ratio, peak_ratio_s2_s1, peak_abs_sym_diff]
     Groups per subplot: [CS+ PF1, CS+ PF2, CS- PF1] except CS row (no CS- PF1).
     """
     import pandas as pd
@@ -15914,13 +23090,19 @@ def plot_pf_distance_centered_session_stability(
         "theta": "blue",
         "slow": "red",
     }
-    stat_specs = [
-        ("r", "r"),
-        ("delta_peak_x_cm", "Peak shift (cm)"),
-        ("auc_ratio", "AUC ratio"),
-        ("peak_ratio_s2_s1", "Peak ratio (S2/S1)"),
-        ("peak_abs_sym_diff", "|(S2-S1)/(S2+S1)|"),
-    ]
+    stat_specs = [("r", "r")]
+    if "spearman_r" in set(pd.DataFrame(df).columns):
+        stat_specs.append(("spearman_r", "Spearman"))
+    if "cosine_similarity" in set(pd.DataFrame(df).columns):
+        stat_specs.append(("cosine_similarity", "Cosine"))
+    stat_specs.extend(
+        [
+            ("delta_peak_x_cm", "Peak shift (cm)"),
+            ("auc_ratio", "AUC ratio"),
+            ("peak_ratio_s2_s1", "Peak ratio (S2/S1)"),
+            ("peak_abs_sym_diff", "|(S2-S1)/(S2+S1)|"),
+        ]
+    )
     if isinstance(stat_label_overrides, dict) and len(stat_label_overrides) > 0:
         stat_specs = [(k, str(stat_label_overrides.get(k, lbl))) for (k, lbl) in stat_specs]
     group_order = ["CSplus_PF1", "CSplus_PF2", "CSminus_PF1"]
@@ -16009,7 +23191,7 @@ def plot_pf_distance_centered_session_stability(
 
     if figsize is None:
         fig_h = max(float(row_height) * len(valid_metrics), 1.8)
-        fig_w = 4.5
+        fig_w = 5.4
     else:
         fig_w = float(figsize[0])
         fig_h = float(figsize[1])
@@ -16028,7 +23210,10 @@ def plot_pf_distance_centered_session_stability(
             # Category backgrounds: CS+ PLC (first two groups), CS- PLC (third group).
             ax.axvspan(-0.5, 1.5, color="#FFF3E0", alpha=0.3, zorder=0)
             ax.axvspan(1.5, 2.5, color="#E3F2FD", alpha=0.3, zorder=0)
-            sub_stat = sub[["animal_id", "cell_idx", "group", stat_key]].copy()
+            if stat_key in set(sub.columns):
+                sub_stat = sub[["animal_id", "cell_idx", "group", stat_key]].copy()
+            else:
+                sub_stat = pd.DataFrame(columns=["animal_id", "cell_idx", "group", stat_key])
             sub_stat["_plot_val"] = np.asarray(sub_stat[stat_key], dtype=float)
             if stat_key == "delta_peak_x_cm":
                 sub_stat["_plot_val"] = np.abs(sub_stat["_plot_val"])
@@ -16134,7 +23319,7 @@ def plot_pf_distance_centered_session_stability(
                 y_top = base + h + 0.10 * span
             ax.set_ylim(y_min - 0.08 * span, y_top)
 
-            if stat_key == "r":
+            if stat_key in {"r", "spearman_r", "cosine_similarity"}:
                 ax.axhline(0, color="black", linestyle="--", linewidth=0.5, alpha=0.6)
             elif stat_key == "delta_peak_x_cm":
                 ax.axhline(0, color="black", linestyle="--", linewidth=0.5, alpha=0.6)
@@ -16184,29 +23369,546 @@ def plot_pf_distance_centered_session_stability(
     }
 
 
-def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
+def _time_centered_dataset_as_distance_alias(time_centered_dataset: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy that exposes `time_rel` blocks through distance-centered keys."""
+    dataset = copy.deepcopy(time_centered_dataset)
+    metadata = dataset.setdefault("metadata", {})
+    time_window = metadata.get("time_window_sec", metadata.get("distance_window_cm", 4.0))
+    time_bin = metadata.get("time_bin_sec", metadata.get("distance_bin_cm", np.nan))
+
+    if not np.isfinite(float(time_bin)) or float(time_bin) <= 0:
+        for cat_name in _ordered_dataset_categories(dataset):
+            for pf_rank in (1, 2):
+                rel = np.asarray(dataset.get(cat_name, {}).get(pf_rank, {}).get("time_rel", []), dtype=float)
+                if rel.size > 1:
+                    diffs = np.diff(rel)
+                    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+                    if diffs.size > 0:
+                        time_bin = float(np.nanmedian(diffs))
+                        break
+            if np.isfinite(float(time_bin)) and float(time_bin) > 0:
+                break
+    if not np.isfinite(float(time_bin)) or float(time_bin) <= 0:
+        time_bin = 1.0
+
+    metadata["axis_kind"] = "time"
+    metadata["distance_window_cm"] = float(time_window)
+    metadata["distance_bin_cm"] = float(time_bin)
+    metadata["time_window_sec"] = float(time_window)
+    metadata["time_bin_sec"] = float(time_bin)
+
+    def _alias_axis(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if "time_rel" in obj:
+                rel = np.asarray(obj["time_rel"], dtype=float)
+                obj["distance_rel"] = rel
+            elif "distance_rel" in obj and "time_rel" not in obj:
+                obj["time_rel"] = np.asarray(obj["distance_rel"], dtype=float)
+            for value in list(obj.values()):
+                _alias_axis(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                _alias_axis(value)
+
+    _alias_axis(dataset)
+    return dataset
+
+
+def _time_centered_xlim(dataset: dict[str, Any], xlim: tuple[float, float] | None) -> tuple[float, float] | None:
+    if xlim is not None:
+        return xlim
+    meta = dataset.get("metadata", {}) if isinstance(dataset, dict) else {}
+    window = float(meta.get("time_window_sec", 4.0))
+    if np.isfinite(window) and window > 0:
+        return (-window, window)
+    return (-4.0, 4.0)
+
+
+def _add_time_axis_stat_aliases(results: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(results, dict):
+        return results
+    results = dict(results)
+    df = results.get("per_cell_stability", None)
+    if df is not None and hasattr(df, "copy"):
+        df_out = df.copy()
+        if "delta_peak_x_cm" in set(df_out.columns) and "delta_peak_x_sec" not in set(df_out.columns):
+            df_out["delta_peak_x_sec"] = df_out["delta_peak_x_cm"]
+        results["per_cell_stability"] = df_out
+        if "per_cell_selectivity" in results:
+            results["per_cell_selectivity"] = df_out
+    results["axis_kind"] = "time"
+    return results
+
+
+def generate_pf_time_centered_component_heatmaps(
+    dataset: dict[str, Any],
+    *,
+    figure_save_folder: str | Path,
+    xlim: tuple[float, float] | None = None,
+    align_all_peak_to_zero: bool = False,
+    peak_align_window: tuple[float, float] = (-1.0, 1.0),
+    max_peak_adjust_sec: float | None = None,
+    max_peak_adjust_sec_pf1: float | None = None,
+    max_peak_adjust_sec_pf2: float | None = None,
+    x_label: str = "Time from closest PF frame (s)",
+    output_prefix: str = "pf_time_centered",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    alias_dataset = _time_centered_dataset_as_distance_alias(dataset)
+    return generate_pf_distance_centered_component_heatmaps(
+        alias_dataset,
+        figure_save_folder=figure_save_folder,
+        xlim=_time_centered_xlim(dataset, xlim),
+        align_all_peak_to_zero=align_all_peak_to_zero,
+        peak_align_window=peak_align_window,
+        max_peak_adjust_cm=max_peak_adjust_sec,
+        max_peak_adjust_cm_pf1=max_peak_adjust_sec_pf1,
+        max_peak_adjust_cm_pf2=max_peak_adjust_sec_pf2,
+        x_label=x_label,
+        output_prefix=output_prefix,
+        **kwargs,
+    )
+
+
+def generate_pf_time_centered_component_heatmaps_2sessions(
+    dataset: dict[str, Any],
+    *,
+    figure_save_folder: str | Path,
+    xlim: tuple[float, float] | None = None,
+    align_all_peak_to_zero: bool = False,
+    peak_align_window: tuple[float, float] = (-1.0, 1.0),
+    max_peak_adjust_sec: float | None = None,
+    max_peak_adjust_sec_pf1: float | None = None,
+    max_peak_adjust_sec_pf2: float | None = None,
+    avg_ylim_focus_window: tuple[float, float] | None = (-1.0, 1.0),
+    average_export_subdir: str = "pf_time_centered_2sessions_average_exports",
+    x_label: str = "Time from closest PF frame (s)",
+    output_prefix: str = "pf_time_centered_2sessions",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    alias_dataset = _time_centered_dataset_as_distance_alias(dataset)
+    return generate_pf_distance_centered_component_heatmaps_2sessions(
+        alias_dataset,
+        figure_save_folder=figure_save_folder,
+        xlim=_time_centered_xlim(dataset, xlim),
+        align_all_peak_to_zero=align_all_peak_to_zero,
+        peak_align_window=peak_align_window,
+        max_peak_adjust_cm=max_peak_adjust_sec,
+        max_peak_adjust_cm_pf1=max_peak_adjust_sec_pf1,
+        max_peak_adjust_cm_pf2=max_peak_adjust_sec_pf2,
+        avg_ylim_focus_window=avg_ylim_focus_window,
+        average_export_subdir=average_export_subdir,
+        x_label=x_label,
+        output_prefix=output_prefix,
+        **kwargs,
+    )
+
+
+def generate_pf_time_centered_component_heatmaps_2directions(
+    dataset: dict[str, Any],
+    *,
+    figure_save_folder: str | Path,
+    xlim: tuple[float, float] | None = None,
+    align_all_peak_to_zero: bool = False,
+    peak_align_window: tuple[float, float] = (-1.0, 1.0),
+    max_peak_adjust_sec: float | None = None,
+    max_peak_adjust_sec_pf1: float | None = None,
+    max_peak_adjust_sec_pf2: float | None = None,
+    average_export_subdir: str = "pf_time_centered_2directions_average_exports",
+    x_label: str = "Time from closest PF frame (s)",
+    output_prefix: str = "pf_time_centered_2directions",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    alias_dataset = _time_centered_dataset_as_distance_alias(dataset)
+    return generate_pf_distance_centered_component_heatmaps_2directions(
+        alias_dataset,
+        figure_save_folder=figure_save_folder,
+        xlim=_time_centered_xlim(dataset, xlim),
+        align_all_peak_to_zero=align_all_peak_to_zero,
+        peak_align_window=peak_align_window,
+        max_peak_adjust_cm=max_peak_adjust_sec,
+        max_peak_adjust_cm_pf1=max_peak_adjust_sec_pf1,
+        max_peak_adjust_cm_pf2=max_peak_adjust_sec_pf2,
+        average_export_subdir=average_export_subdir,
+        x_label=x_label,
+        output_prefix=output_prefix,
+        **kwargs,
+    )
+
+
+def plot_pf_time_centered_category_primary_secondary_from_dataset(
+    dataset: dict[str, Any],
+    category: str,
+    *,
+    title: str,
+    out_path: str | Path,
+    xlim: tuple[float, float] | None = None,
+    align_all_peak_to_zero: bool = False,
+    peak_align_window: tuple[float, float] = (-1.0, 1.0),
+    max_peak_adjust_sec: float | None = None,
+    max_peak_adjust_sec_pf1: float | None = None,
+    max_peak_adjust_sec_pf2: float | None = None,
+    x_label: str = "Time (s)",
+    **kwargs: Any,
+) -> plt.Figure | None:
+    alias_dataset = _time_centered_dataset_as_distance_alias(dataset)
+    return plot_pf_distance_centered_category_primary_secondary_from_dataset(
+        alias_dataset,
+        category=category,
+        title=title,
+        out_path=out_path,
+        xlim=_time_centered_xlim(dataset, xlim),
+        align_all_peak_to_zero=align_all_peak_to_zero,
+        peak_align_window=peak_align_window,
+        max_peak_adjust_cm=max_peak_adjust_sec,
+        max_peak_adjust_cm_pf1=max_peak_adjust_sec_pf1,
+        max_peak_adjust_cm_pf2=max_peak_adjust_sec_pf2,
+        x_label=x_label,
+        **kwargs,
+    )
+
+
+def plot_pf_time_centered_category_primary_secondary_from_dataset_2sessions(
+    dataset: dict[str, Any],
+    category: str,
+    *,
+    title: str,
+    out_path: str | Path,
+    xlim: tuple[float, float] | None = None,
+    align_all_peak_to_zero: bool = False,
+    peak_align_window: tuple[float, float] = (-1.0, 1.0),
+    max_peak_adjust_sec: float | None = None,
+    max_peak_adjust_sec_pf1: float | None = None,
+    max_peak_adjust_sec_pf2: float | None = None,
+    average_export_dir: str | Path | None = None,
+    x_label_pf1: str = "Time from PF1 closest frame (s)",
+    x_label_pf2: str = "Time from PF2 closest frame (s)",
+    **kwargs: Any,
+) -> plt.Figure | None:
+    alias_dataset = _time_centered_dataset_as_distance_alias(dataset)
+    export_dir = average_export_dir
+    if export_dir is None:
+        export_dir = Path(out_path).resolve().parent / "pf_time_centered_2sessions_average_exports"
+    return plot_pf_distance_centered_category_primary_secondary_from_dataset_2sessions(
+        alias_dataset,
+        category=category,
+        title=title,
+        out_path=out_path,
+        xlim=_time_centered_xlim(dataset, xlim),
+        align_all_peak_to_zero=align_all_peak_to_zero,
+        peak_align_window=peak_align_window,
+        max_peak_adjust_cm=max_peak_adjust_sec,
+        max_peak_adjust_cm_pf1=max_peak_adjust_sec_pf1,
+        max_peak_adjust_cm_pf2=max_peak_adjust_sec_pf2,
+        average_export_dir=export_dir,
+        x_label_pf1=x_label_pf1,
+        x_label_pf2=x_label_pf2,
+        **kwargs,
+    )
+
+
+def plot_pf_time_centered_category_primary_secondary_from_dataset_2directions(
+    dataset: dict[str, Any],
+    category: str,
+    *,
+    title: str,
+    out_path: str | Path,
+    xlim: tuple[float, float] | None = None,
+    align_all_peak_to_zero: bool = False,
+    peak_align_window: tuple[float, float] = (-1.0, 1.0),
+    max_peak_adjust_sec: float | None = None,
+    max_peak_adjust_sec_pf1: float | None = None,
+    max_peak_adjust_sec_pf2: float | None = None,
+    average_export_dir: str | Path | None = None,
+    x_label: str = "Time (s)",
+    **kwargs: Any,
+) -> plt.Figure | None:
+    alias_dataset = _time_centered_dataset_as_distance_alias(dataset)
+    export_dir = average_export_dir
+    if export_dir is None:
+        export_dir = Path(out_path).resolve().parent / "pf_time_centered_2directions_average_exports"
+    return plot_pf_distance_centered_category_primary_secondary_from_dataset_2directions(
+        alias_dataset,
+        category=category,
+        title=title,
+        out_path=out_path,
+        xlim=_time_centered_xlim(dataset, xlim),
+        align_all_peak_to_zero=align_all_peak_to_zero,
+        peak_align_window=peak_align_window,
+        max_peak_adjust_cm=max_peak_adjust_sec,
+        max_peak_adjust_cm_pf1=max_peak_adjust_sec_pf1,
+        max_peak_adjust_cm_pf2=max_peak_adjust_sec_pf2,
+        average_export_dir=export_dir,
+        x_label=x_label,
+        **kwargs,
+    )
+
+
+def compute_pf_time_centered_session_stability(
+    time_centered_dataset: dict[str, Any],
+    *,
+    smooth_window_sec: float | None = None,
+    auc_window_sec: tuple[float, float] | None = None,
+    slow_auc_window_sec: tuple[float, float] = (-4.0, 4.0),
+    peak_window_sec: tuple[float, float] = (-4.0, 4.0),
+    average_export_dir: str | Path | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    alias_dataset = _time_centered_dataset_as_distance_alias(time_centered_dataset)
+    results = compute_pf_distance_centered_session_stability(
+        alias_dataset,
+        smooth_window_cm=smooth_window_sec,
+        auc_window_cm=auc_window_sec,
+        slow_auc_window_cm=slow_auc_window_sec,
+        peak_window_cm=peak_window_sec,
+        average_export_dir=average_export_dir,
+        **kwargs,
+    )
+    results = _add_time_axis_stat_aliases(results)
+    results["smooth_window_sec"] = smooth_window_sec
+    results["auc_window_sec"] = auc_window_sec
+    results["slow_auc_window_sec"] = slow_auc_window_sec
+    results["peak_window_sec"] = peak_window_sec
+    return results
+
+
+def plot_pf_time_centered_session_stability(
     stability_results: dict[str, Any],
     *,
     figure_save_folder: str | Path | None = None,
-    out_name: str = "pf_distance_centered_abs_norm_fr_change_ss_cs.svg",
-    figsize: tuple[float, float] = (3.0, 4.0),
-    abs_delta_ylabel: str = "|(S2-S1)/(S2+S1)|",
-    ratio_ylabel: str = "S2/S1",
+    stat_label_overrides: dict[str, str] | None = None,
     show_plot: bool = True,
+    save_csv: bool = True,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    labels = {"delta_peak_x_cm": "Peak shift (s)"}
+    if isinstance(stat_label_overrides, dict):
+        labels.update({str(k): str(v) for k, v in stat_label_overrides.items()})
+    base = plot_pf_distance_centered_session_stability(
+        stability_results,
+        figure_save_folder=figure_save_folder,
+        stat_label_overrides=labels,
+        show_plot=show_plot,
+        save_csv=save_csv,
+        **kwargs,
+    )
+    if not base:
+        return {}
+    figure_root = Path(figure_save_folder) if figure_save_folder is not None else Path("figures") / "CKII_pooled"
+    out = copy.deepcopy(base)
+    src_fig = base.get("figure_paths", {}).get("combined")
+    if src_fig is not None and Path(str(src_fig)).exists():
+        dst = figure_root / "pf_time_centered_stability_combined.svg"
+        shutil.copy2(src_fig, dst)
+        out["figure_paths"] = {"combined": str(dst)}
+    for key, name in (
+        ("per_cell_csv", "pf_time_centered_stability_per_cell.csv"),
+        ("stats_csv", "pf_time_centered_stability_stats.csv"),
+    ):
+        src = base.get(key)
+        if src is not None and Path(str(src)).exists():
+            dst = figure_root / name
+            shutil.copy2(src, dst)
+            out[key] = str(dst)
+    return out
+
+
+def compute_pf_time_centered_pref_nonpref_stats(
+    time_centered_dataset: dict[str, Any],
+    *,
+    smooth_window_sec: float | None = 0.0,
+    auc_window_sec: tuple[float, float] | None = None,
+    slow_auc_window_sec: tuple[float, float] = (-4.0, 4.0),
+    peak_window_sec: tuple[float, float] = (-4.0, 4.0),
+    average_export_dir: str | Path | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    alias_dataset = _time_centered_dataset_as_distance_alias(time_centered_dataset)
+    results = compute_pf_distance_centered_pref_nonpref_stats(
+        alias_dataset,
+        smooth_window_cm=smooth_window_sec,
+        auc_window_cm=auc_window_sec,
+        slow_auc_window_cm=slow_auc_window_sec,
+        peak_window_cm=peak_window_sec,
+        average_export_dir=average_export_dir,
+        **kwargs,
+    )
+    results = _add_time_axis_stat_aliases(results)
+    results["smooth_window_sec"] = smooth_window_sec
+    results["auc_window_sec"] = auc_window_sec
+    results["slow_auc_window_sec"] = slow_auc_window_sec
+    results["peak_window_sec"] = peak_window_sec
+    return results
+
+
+def plot_pf_time_centered_pref_nonpref_stats(
+    stats_results: dict[str, Any],
+    *,
+    figure_save_folder: str | Path | None = None,
+    stat_label_overrides: dict[str, str] | None = None,
+    output_prefix: str = "pf_time_centered_pref_nonpref",
+    **kwargs: Any,
+) -> dict[str, str]:
+    labels = {"delta_peak_x_cm": "Peak shift (s)"}
+    if isinstance(stat_label_overrides, dict):
+        labels.update({str(k): str(v) for k, v in stat_label_overrides.items()})
+    return plot_pf_distance_centered_pref_nonpref_stats(
+        stats_results,
+        figure_save_folder=figure_save_folder,
+        stat_label_overrides=labels,
+        output_prefix=output_prefix,
+        **kwargs,
+    )
+
+
+def _distance_centered_trace_fwhm(
+    trace: np.ndarray,
+    x: np.ndarray,
+    *,
+    min_peak_rate_hz: float | None = None,
+) -> tuple[float, str | None]:
+    trace = np.asarray(trace, dtype=float).reshape(-1)
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if trace.ndim != 1 or x.ndim != 1 or trace.size != x.size:
+        return np.nan, "shape_mismatch"
+    valid = np.isfinite(trace) & np.isfinite(x)
+    if int(np.sum(valid)) < 3:
+        return np.nan, "insufficient_finite_bins"
+    trace_use = np.where(valid, trace, np.nan)
+    if not np.any(np.isfinite(trace_use)):
+        return np.nan, "all_nan_trace"
+    peak_idx = int(np.nanargmax(trace_use))
+    peak_val = float(trace_use[peak_idx])
+    if (not np.isfinite(peak_val)) or peak_val <= 0:
+        return np.nan, "nonpositive_or_invalid_peak"
+    if min_peak_rate_hz is not None and peak_val < float(min_peak_rate_hz):
+        return np.nan, "peak_rate_below_threshold"
+    half = 0.5 * peak_val
+    if not np.isfinite(half):
+        return np.nan, "invalid_halfmax"
+
+    left_in = int(peak_idx)
+    while left_in - 1 >= 0:
+        prev_idx = int(left_in - 1)
+        if (not np.isfinite(trace_use[prev_idx])) or (not np.isfinite(x[prev_idx])) or trace_use[prev_idx] < half:
+            break
+        left_in = prev_idx
+
+    right_in = int(peak_idx)
+    while right_in + 1 < trace_use.size:
+        next_idx = int(right_in + 1)
+        if (not np.isfinite(trace_use[next_idx])) or (not np.isfinite(x[next_idx])) or trace_use[next_idx] < half:
+            break
+        right_in = next_idx
+
+    left_out = int(left_in - 1)
+    while left_out >= 0 and ((not np.isfinite(trace_use[left_out])) or (not np.isfinite(x[left_out]))):
+        left_out -= 1
+    if left_out < 0:
+        return np.nan, "missing_left_halfmax_crossing"
+
+    right_out = int(right_in + 1)
+    while right_out < trace_use.size and ((not np.isfinite(trace_use[right_out])) or (not np.isfinite(x[right_out]))):
+        right_out += 1
+    if right_out >= trace_use.size:
+        return np.nan, "missing_right_halfmax_crossing"
+
+    y_left_out = float(trace_use[left_out])
+    y_left_in = float(trace_use[left_in])
+    y_right_in = float(trace_use[right_in])
+    y_right_out = float(trace_use[right_out])
+    if y_left_out > half or y_right_out > half:
+        return np.nan, "unbracketed_halfmax_crossing"
+
+    def _interp_x(x0: float, y0: float, x1: float, y1: float, target: float) -> float:
+        if (not np.isfinite(x0)) or (not np.isfinite(x1)) or (not np.isfinite(y0)) or (not np.isfinite(y1)):
+            return np.nan
+        if np.isclose(y1, y0):
+            return float(x1)
+        return float(x0 + (target - y0) * (x1 - x0) / (y1 - y0))
+
+    x_left = _interp_x(float(x[left_out]), y_left_out, float(x[left_in]), y_left_in, float(half))
+    x_right = _interp_x(float(x[right_in]), y_right_in, float(x[right_out]), y_right_out, float(half))
+    if (not np.isfinite(x_left)) or (not np.isfinite(x_right)):
+        return np.nan, "invalid_interpolated_crossing"
+    width = float(x_right - x_left)
+    if (not np.isfinite(width)) or width < 0:
+        return np.nan, "invalid_width"
+    return width, None
+
+
+def plot_pf_distance_centered_pf1_pf2_fwhm_all_spikes_slow_vm(
+    distance_centered_dataset: dict[str, Any],
+    save_path: str | Path,
+    fig_width: float = 8.5,
+    fig_height: float = 5.8,
+    min_traversals_per_type: int = 5,
+    smooth_window_cm: float | None = 0.0,
+    all_direction_key: str = "all",
+    min_peak_all_spike_hz: float | None = None,
+    min_peak_ss_hz: float | None = None,
+    min_peak_cs_hz: float | None = None,
+    min_peak_theta: float | None = None,
+    min_peak_slow_vm: float | None = None,
+    show_only_significant: bool = False,
     save_csv: bool = True,
 ) -> dict[str, Any]:
     """
-    Plot two stacked summary panels from session-stability columns:
-      - Top: peak_abs_sym_diff (5th column)
-      - Bottom: peak_ratio_s2_s1 (4th column)
+    Compare PF1 vs PF2 FWHM for all-spike, SS, CS, theta, and slow-Vm tuning curves.
 
-    Each panel shows:
-      - SS PF1 vs CS PF1 (paired, connected lines)
-      - SS PF2 vs CS PF2 (paired, connected lines)
-      - SS PF1 vs SS PF2 (paired test, no connected lines)
-      - CS PF1 vs CS PF2 (paired test, no connected lines)
+    Widths are computed on the pooled traversal direction (`data[all_direction_key]`)
+    for CS+ and CS- place cells only.
     """
     import pandas as pd
+
+    if distance_centered_dataset is None:
+        raise ValueError("distance_centered_dataset cannot be None.")
+    min_traversals = int(min_traversals_per_type)
+    if min_traversals < 0:
+        raise ValueError("min_traversals_per_type must be >= 0.")
+    all_key = str(all_direction_key).strip()
+    if len(all_key) == 0:
+        raise ValueError("all_direction_key cannot be empty.")
+
+    distance_bin_cm = float(distance_centered_dataset.get("metadata", {}).get("distance_bin_cm", 1.0))
+    smooth_bins = _distance_smooth_cm_to_bins(distance_bin_cm, smooth_window_cm)
+    if smooth_bins is None:
+        smooth_bins = 0
+    smooth_bins = int(smooth_bins)
+    if smooth_bins < 0:
+        raise ValueError("smooth_window_cm must be >= 0 or None.")
+
+    def _smooth_trace(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=float).reshape(-1)
+        if smooth_bins > 1:
+            return _smooth_boxcar(arr, smooth_bins)
+        return arr
+
+    def _trace_from_dir(dir_data: dict[str, Any], mean_key: str, stack_key: str, n_bins: int) -> tuple[np.ndarray, int]:
+        n_bins = int(n_bins)
+        trace = np.asarray(dir_data.get(mean_key, []), dtype=float).reshape(-1)
+        if trace.size == n_bins:
+            n_trials = int(dir_data.get("n_trials", 0) or 0)
+            if n_trials <= 0:
+                stack_for_count = np.asarray(dir_data.get(stack_key, []), dtype=float)
+                if stack_for_count.ndim == 2 and stack_for_count.shape[1] == n_bins:
+                    n_trials = int(stack_for_count.shape[0])
+            return _smooth_trace(trace), int(n_trials)
+
+        stack = np.asarray(dir_data.get(stack_key, []), dtype=float)
+        if stack.ndim == 2 and stack.shape[1] == n_bins:
+            n_trials = int(dir_data.get("n_trials", 0) or stack.shape[0])
+            if int(stack.shape[0]) <= 0:
+                return np.full(n_bins, np.nan, dtype=float), int(n_trials)
+            stack_use = np.asarray(stack, dtype=float)
+            if smooth_bins > 1:
+                stack_smooth = np.full_like(stack_use, np.nan)
+                for i in range(stack_use.shape[0]):
+                    stack_smooth[i] = _smooth_boxcar(stack_use[i], smooth_bins)
+                stack_use = stack_smooth
+            return np.asarray(np.nanmean(stack_use, axis=0), dtype=float), int(n_trials)
+
+        return np.full(n_bins, np.nan, dtype=float), int(dir_data.get("n_trials", 0) or 0)
 
     def _paired_test_auto_small_n(vals_a: np.ndarray, vals_b: np.ndarray) -> tuple[float, float, str, int, float]:
         vals_a = np.asarray(vals_a, dtype=float)
@@ -16265,6 +23967,1815 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
 
     def _add_sig_bracket(ax: Any, x1: float, x2: float, y: float, h: float, txt: str) -> None:
         ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=0.6, clip_on=False)
+        ax.text((x1 + x2) / 2.0, y + h, txt, ha="center", va="bottom", fontsize=5)
+
+    metric_specs = {
+        "all_spike": {
+            "label": "All spikes",
+            "mean_key": "rate_mean",
+            "stack_key": "rate_stack",
+            "color": "#555555",
+            "min_peak": min_peak_all_spike_hz,
+        },
+        "ss": {
+            "label": "SS",
+            "mean_key": "ss_rate_mean",
+            "stack_key": "ss_rate_stack",
+            "color": "#026C80",
+            "min_peak": min_peak_ss_hz,
+        },
+        "cs": {
+            "label": "CS",
+            "mean_key": "cs_rate_mean",
+            "stack_key": "cs_rate_stack",
+            "color": "#EE9B00",
+            "min_peak": min_peak_cs_hz,
+        },
+        "theta": {
+            "label": "Theta",
+            "mean_key": "theta_mean",
+            "stack_key": "theta_stack",
+            "color": "blue",
+            "min_peak": min_peak_theta,
+        },
+        "slow_vm": {
+            "label": "Slow Vm",
+            "mean_key": "slow_mean",
+            "stack_key": "slow_stack",
+            "color": "red",
+            "min_peak": min_peak_slow_vm,
+        },
+    }
+    metric_order = ("all_spike", "ss", "cs", "theta", "slow_vm")
+    rows: list[dict[str, Any]] = []
+    skipped_counts: dict[str, int] = {
+        "missing_block": 0,
+        "missing_data": 0,
+        "low_traversals": 0,
+        "invalid_trace": 0,
+    }
+
+    for category in ("CSplus", "CSminus"):
+        for pf_rank in (1, 2):
+            block = distance_centered_dataset.get(category, {}).get(int(pf_rank), {})
+            entries = list(block.get("entries", [])) if isinstance(block, dict) else []
+            block_x = np.asarray(block.get("distance_rel", []), dtype=float).reshape(-1) if isinstance(block, dict) else np.array([], dtype=float)
+            if len(entries) == 0:
+                skipped_counts["missing_block"] += 1
+            for entry in entries:
+                data = entry.get("data", {}) if isinstance(entry, dict) else {}
+                dir_data = data.get(all_key, {}) if isinstance(data, dict) else {}
+                if not isinstance(dir_data, dict):
+                    skipped_counts["missing_data"] += 1
+                    continue
+                x_rel = np.asarray(
+                    dir_data.get(
+                        "distance_rel",
+                        data.get("distance_rel", data.get("time_rel", block_x)),
+                    ),
+                    dtype=float,
+                ).reshape(-1)
+                if x_rel.size == 0:
+                    x_rel = block_x
+                if x_rel.ndim != 1 or x_rel.size == 0:
+                    skipped_counts["missing_data"] += 1
+                    continue
+                n_bins = int(x_rel.size)
+                animal_id = str(entry.get("session", entry.get("animal_id", "")))
+                try:
+                    cell_idx = int(entry.get("cell_idx", -1))
+                except (TypeError, ValueError):
+                    cell_idx = -1
+                cell_num = int(cell_idx) + 1 if cell_idx >= 0 else np.nan
+                group = "CSplus_PF1" if category == "CSplus" and int(pf_rank) == 1 else (
+                    "CSplus_PF2" if category == "CSplus" else f"CSminus_PF{int(pf_rank)}"
+                )
+
+                for metric_name, cfg in metric_specs.items():
+                    trace, n_trials = _trace_from_dir(
+                        dir_data,
+                        str(cfg["mean_key"]),
+                        str(cfg["stack_key"]),
+                        n_bins,
+                    )
+                    if n_trials < min_traversals:
+                        skipped_counts["low_traversals"] += 1
+                        width = np.nan
+                        reason = "low_traversals"
+                    elif trace.size != n_bins:
+                        skipped_counts["invalid_trace"] += 1
+                        width = np.nan
+                        reason = "shape_mismatch"
+                    else:
+                        if metric_name == "theta":
+                            theta_mean = float(np.nanmean(trace)) if np.any(np.isfinite(trace)) else np.nan
+                            if np.isfinite(theta_mean):
+                                trace = np.asarray(trace, dtype=float) - theta_mean
+                        min_peak = cfg.get("min_peak")
+                        width, reason = _distance_centered_trace_fwhm(
+                            trace,
+                            x_rel,
+                            min_peak_rate_hz=(None if min_peak is None else float(min_peak)),
+                        )
+                        if not np.isfinite(width):
+                            skipped_counts["invalid_trace"] += 1
+                    rows.append(
+                        {
+                            "category": str(category),
+                            "group": str(group),
+                            "pf_rank": int(pf_rank),
+                            "animal_id": str(animal_id),
+                            "cell_idx": int(cell_idx),
+                            "cell_num": int(cell_num) if cell_idx >= 0 else np.nan,
+                            "metric": str(metric_name),
+                            "metric_label": str(cfg["label"]),
+                            "n_trials": int(n_trials),
+                            "fwhm_cm": float(width) if np.isfinite(width) else np.nan,
+                            "fwhm_nan_reason": str(reason) if reason is not None else "",
+                            "all_direction_key": str(all_key),
+                        }
+                    )
+
+    per_cell_df = pd.DataFrame(rows)
+    stats_rows: list[dict[str, Any]] = []
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    per_cell_csv = save_path.with_name(save_path.stem + "_per_cell.csv")
+    stats_csv = save_path.with_name(save_path.stem + "_stats.csv")
+
+    fig = plt.figure(figsize=(float(fig_width), float(fig_height)))
+    gs = fig.add_gridspec(3, 10, height_ratios=[1.0, 0.82, 0.82])
+    top_axes = [fig.add_subplot(gs[0, (2 * i):(2 * i + 2)]) for i in range(5)]
+    all_slow_axes = [fig.add_subplot(gs[1, 1:4]), fig.add_subplot(gs[1, 6:9])]
+    ss_cs_axes = [fig.add_subplot(gs[2, 1:4]), fig.add_subplot(gs[2, 6:9])]
+    category_labels = {"CSplus": "CS+", "CSminus": "CS-"}
+    positions = {
+        ("CSplus", 1): 0.0,
+        ("CSplus", 2): 1.0,
+        ("CSminus", 1): 2.25,
+        ("CSminus", 2): 3.25,
+    }
+
+    def _draw_metric_panel(ax: Any, metric_name: str, title: str, color: str) -> None:
+        if per_cell_df.empty:
+            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center", fontsize=6)
+            ax.set_title(title, fontsize=6)
+            ax.set_ylabel("FWHM (cm)", fontsize=6)
+            return
+        metric_df = per_cell_df[per_cell_df["metric"] == str(metric_name)].copy()
+        paired_by_category: dict[str, pd.DataFrame] = {}
+        groups: list[np.ndarray] = []
+        labels: list[str] = []
+        pos_vals: list[float] = []
+        for category in ("CSplus", "CSminus"):
+            sub = metric_df[metric_df["category"] == category][["animal_id", "cell_idx", "pf_rank", "fwhm_cm"]].copy()
+            if len(sub) == 0:
+                piv = pd.DataFrame(columns=[1, 2])
+            else:
+                piv = sub.pivot_table(index=["animal_id", "cell_idx"], columns="pf_rank", values="fwhm_cm", aggfunc="first")
+                if 1 not in piv.columns:
+                    piv[1] = np.nan
+                if 2 not in piv.columns:
+                    piv[2] = np.nan
+                piv = piv[np.isfinite(piv[1]) & np.isfinite(piv[2])].copy()
+            paired_by_category[category] = piv
+            for pf_rank in (1, 2):
+                vals = np.asarray(piv[pf_rank], dtype=float) if pf_rank in piv.columns else np.array([], dtype=float)
+                groups.append(vals[np.isfinite(vals)])
+                labels.append(f"{category_labels[category]} PF{int(pf_rank)}\n(n={int(np.sum(np.isfinite(vals)))})")
+                pos_vals.append(float(positions[(category, pf_rank)]))
+
+        if not any(g.size > 0 for g in groups):
+            ax.text(0.5, 0.5, "No paired data", transform=ax.transAxes, ha="center", va="center", fontsize=6)
+            ax.set_title(title, fontsize=6)
+            ax.set_ylabel("FWHM (cm)", fontsize=6)
+            ax.set_xticks(pos_vals)
+            ax.set_xticklabels(labels, fontsize=5)
+            ax.set_xlim(-0.5, 3.75)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            return
+
+        ax.axvspan(-0.5, 1.5, color="#FFF3E0", alpha=0.3, zorder=0)
+        ax.axvspan(1.75, 3.75, color="#E3F2FD", alpha=0.35, zorder=0)
+        bp = ax.boxplot(
+            groups,
+            positions=np.asarray(pos_vals, dtype=float),
+            widths=0.45,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box in bp["boxes"]:
+            box.set_facecolor(color)
+            box.set_alpha(0.25)
+        for pos, vals in zip(pos_vals, groups):
+            if vals.size == 0:
+                continue
+            xs = _swarm_x(vals, float(pos), width=0.10)
+            ax.scatter(xs, vals, s=8, color=color, alpha=0.9, linewidths=0, zorder=2)
+
+        stat_records = []
+        for category in ("CSplus", "CSminus"):
+            piv = paired_by_category[category]
+            x1 = float(positions[(category, 1)])
+            x2 = float(positions[(category, 2)])
+            if 1 in piv.columns and 2 in piv.columns:
+                for _, row in piv.iterrows():
+                    v1 = float(row[1])
+                    v2 = float(row[2])
+                    if np.isfinite(v1) and np.isfinite(v2):
+                        ax.plot([x1, x2], [v1, v2], color="#C8C8C8", linewidth=0.45, alpha=0.7, zorder=1)
+                vals1 = np.asarray(piv[1], dtype=float)
+                vals2 = np.asarray(piv[2], dtype=float)
+            else:
+                vals1 = np.array([], dtype=float)
+                vals2 = np.array([], dtype=float)
+            p_val, stat_val, test_name, n_valid, shapiro_p = _paired_test_auto_small_n(vals2, vals1)
+            stat_records.append((category, x1, x2, p_val, stat_val, test_name, n_valid, shapiro_p, vals1, vals2))
+            stats_rows.append(
+                {
+                    "metric": str(metric_name),
+                    "metric_label": str(title),
+                    "category": str(category),
+                    "comparison": "PF2_vs_PF1",
+                    "n": int(n_valid),
+                    "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                    "statistic": float(stat_val) if np.isfinite(stat_val) else np.nan,
+                    "test": str(test_name),
+                    "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+                    "pf1_mean": float(np.nanmean(vals1[np.isfinite(vals1)])) if np.any(np.isfinite(vals1)) else np.nan,
+                    "pf2_mean": float(np.nanmean(vals2[np.isfinite(vals2)])) if np.any(np.isfinite(vals2)) else np.nan,
+                }
+            )
+
+        vals_all = np.concatenate([g for g in groups if g.size > 0])
+        y_min = float(np.nanmin(vals_all)) if np.any(np.isfinite(vals_all)) else 0.0
+        y_max = float(np.nanmax(vals_all)) if np.any(np.isfinite(vals_all)) else 1.0
+        span = y_max - y_min
+        if (not np.isfinite(span)) or span <= 0:
+            span = max(abs(y_max), 1.0) * 0.3
+        base = y_max + 0.08 * span
+        step = 0.16 * span
+        h = 0.03 * span
+        n_brackets = 0
+        for category, x1, x2, p_val, *_ in stat_records:
+            if bool(show_only_significant) and ((not np.isfinite(p_val)) or p_val >= 0.05):
+                continue
+            _add_sig_bracket(ax, x1, x2, base + n_brackets * step, h, _sig_label(p_val))
+            n_brackets += 1
+        ylim_top = base + max(n_brackets - 1, 0) * step + 2 * h + 0.12 * span
+        ax.set_ylim(y_min - 0.08 * span, ylim_top)
+        ax.set_title(title, fontsize=6)
+        ax.set_ylabel("FWHM (cm)", fontsize=6)
+        ax.set_xticks(np.asarray(pos_vals, dtype=float))
+        ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=5)
+        ax.set_xlim(-0.5, 3.75)
+        ax.tick_params(labelsize=5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        for category, _, _, p_val, stat_val, test_name, n_valid, shapiro_p, _, _ in stat_records:
+            print(
+                f"{title} {category_labels.get(category, category)} PF2 vs PF1: "
+                f"n={n_valid}, test={test_name}, shapiro_p={shapiro_p:.3g}, "
+                f"stat={stat_val:.3g}, p={p_val:.3g}, sig={_sig_label(p_val)}"
+            )
+
+    def _draw_category_metric_pair_panel(
+        ax: Any,
+        category: str,
+        metric_left: str,
+        metric_right: str,
+        title: str,
+    ) -> None:
+        if per_cell_df.empty:
+            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center", fontsize=6)
+            ax.set_title(title, fontsize=6)
+            ax.set_ylabel("FWHM (cm)", fontsize=6)
+            return
+        metric_left = str(metric_left)
+        metric_right = str(metric_right)
+        if metric_left not in metric_specs or metric_right not in metric_specs:
+            raise ValueError(f"Unknown metrics for paired panel: {metric_left!r}, {metric_right!r}")
+
+        cat_df = per_cell_df[
+            (per_cell_df["category"] == str(category))
+            & (per_cell_df["metric"].isin([metric_left, metric_right]))
+        ][["animal_id", "cell_idx", "pf_rank", "metric", "fwhm_cm"]].copy()
+        paired_by_pf: dict[int, pd.DataFrame] = {}
+        groups: list[np.ndarray] = []
+        labels: list[str] = []
+        pos_vals: list[float] = []
+        color_vals: list[str] = []
+        x_pos = {
+            (1, metric_left): 0.0,
+            (1, metric_right): 1.0,
+            (2, metric_left): 2.25,
+            (2, metric_right): 3.25,
+        }
+        label_map = {name: str(metric_specs[name]["label"]) for name in (metric_left, metric_right)}
+        color_map = {name: str(metric_specs[name]["color"]) for name in (metric_left, metric_right)}
+
+        for pf_rank in (1, 2):
+            sub = cat_df[cat_df["pf_rank"] == int(pf_rank)].copy()
+            if len(sub) == 0:
+                piv = pd.DataFrame(columns=[metric_left, metric_right])
+            else:
+                piv = sub.pivot_table(index=["animal_id", "cell_idx"], columns="metric", values="fwhm_cm", aggfunc="first")
+                for metric_name in (metric_left, metric_right):
+                    if metric_name not in piv.columns:
+                        piv[metric_name] = np.nan
+                piv = piv[np.isfinite(piv[metric_left]) & np.isfinite(piv[metric_right])].copy()
+            paired_by_pf[int(pf_rank)] = piv
+            for metric_name in (metric_left, metric_right):
+                vals = np.asarray(piv[metric_name], dtype=float) if metric_name in piv.columns else np.array([], dtype=float)
+                vals = vals[np.isfinite(vals)]
+                groups.append(vals)
+                labels.append(f"PF{int(pf_rank)}\n{label_map[metric_name]}\n(n={int(vals.size)})")
+                pos_vals.append(float(x_pos[(int(pf_rank), metric_name)]))
+                color_vals.append(str(color_map[metric_name]))
+
+        if not any(g.size > 0 for g in groups):
+            ax.text(0.5, 0.5, "No paired data", transform=ax.transAxes, ha="center", va="center", fontsize=6)
+            ax.set_title(title, fontsize=6)
+            ax.set_ylabel("FWHM (cm)", fontsize=6)
+            ax.set_xticks(pos_vals)
+            ax.set_xticklabels(labels, fontsize=5)
+            ax.set_xlim(-0.5, 3.75)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            return
+
+        ax.axvspan(-0.5, 1.5, color="#FFB3E6", alpha=0.2, zorder=0)
+        ax.axvspan(1.75, 3.75, color="#BFEFFF", alpha=0.2, zorder=0)
+        bp = ax.boxplot(
+            groups,
+            positions=np.asarray(pos_vals, dtype=float),
+            widths=0.45,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box, color in zip(bp["boxes"], color_vals):
+            box.set_facecolor(color)
+            box.set_alpha(0.25)
+        for pos, vals, color in zip(pos_vals, groups, color_vals):
+            if vals.size == 0:
+                continue
+            xs = _swarm_x(vals, float(pos), width=0.10)
+            ax.scatter(xs, vals, s=8, color=color, alpha=0.9, linewidths=0, zorder=2)
+
+        stat_records = []
+        for pf_rank in (1, 2):
+            piv = paired_by_pf[int(pf_rank)]
+            x1 = float(x_pos[(int(pf_rank), metric_left)])
+            x2 = float(x_pos[(int(pf_rank), metric_right)])
+            if metric_left in piv.columns and metric_right in piv.columns:
+                for _, row in piv.iterrows():
+                    v1 = float(row[metric_left])
+                    v2 = float(row[metric_right])
+                    if np.isfinite(v1) and np.isfinite(v2):
+                        ax.plot([x1, x2], [v1, v2], color="#C8C8C8", linewidth=0.45, alpha=0.7, zorder=1)
+                vals_left = np.asarray(piv[metric_left], dtype=float)
+                vals_right = np.asarray(piv[metric_right], dtype=float)
+            else:
+                vals_left = np.array([], dtype=float)
+                vals_right = np.array([], dtype=float)
+            p_val, stat_val, test_name, n_valid, shapiro_p = _paired_test_auto_small_n(vals_right, vals_left)
+            stat_records.append((pf_rank, x1, x2, p_val, stat_val, test_name, n_valid, shapiro_p, vals_left, vals_right))
+            stats_rows.append(
+                {
+                    "metric": f"{metric_left}_vs_{metric_right}",
+                    "metric_label": f"{metric_specs[metric_left]['label']} vs {metric_specs[metric_right]['label']} FWHM",
+                    "category": str(category),
+                    "comparison": f"PF{int(pf_rank)}_{metric_right}_vs_{metric_left}",
+                    "pf_rank": int(pf_rank),
+                    "left_metric": str(metric_left),
+                    "right_metric": str(metric_right),
+                    "n": int(n_valid),
+                    "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                    "statistic": float(stat_val) if np.isfinite(stat_val) else np.nan,
+                    "test": str(test_name),
+                    "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+                    "left_mean": float(np.nanmean(vals_left[np.isfinite(vals_left)])) if np.any(np.isfinite(vals_left)) else np.nan,
+                    "right_mean": float(np.nanmean(vals_right[np.isfinite(vals_right)])) if np.any(np.isfinite(vals_right)) else np.nan,
+                }
+            )
+
+        vals_all_plot = np.concatenate([g for g in groups if g.size > 0])
+        y_min = float(np.nanmin(vals_all_plot)) if np.any(np.isfinite(vals_all_plot)) else 0.0
+        y_max = float(np.nanmax(vals_all_plot)) if np.any(np.isfinite(vals_all_plot)) else 1.0
+        span = y_max - y_min
+        if (not np.isfinite(span)) or span <= 0:
+            span = max(abs(y_max), 1.0) * 0.3
+        base = y_max + 0.08 * span
+        step = 0.16 * span
+        h = 0.03 * span
+        n_brackets = 0
+        for pf_rank, x1, x2, p_val, *_ in stat_records:
+            if bool(show_only_significant) and ((not np.isfinite(p_val)) or p_val >= 0.05):
+                continue
+            _add_sig_bracket(ax, x1, x2, base + n_brackets * step, h, _sig_label(p_val))
+            n_brackets += 1
+        ylim_top = base + max(n_brackets - 1, 0) * step + 2 * h + 0.12 * span
+        ax.set_ylim(y_min - 0.08 * span, ylim_top)
+        ax.set_title(title, fontsize=6)
+        ax.set_ylabel("FWHM (cm)", fontsize=6)
+        ax.set_xticks(np.asarray(pos_vals, dtype=float))
+        ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=5)
+        ax.set_xlim(-0.5, 3.75)
+        ax.tick_params(labelsize=5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        for pf_rank, _, _, p_val, stat_val, test_name, n_valid, shapiro_p, _, _ in stat_records:
+            print(
+                f"{title} PF{int(pf_rank)} {metric_specs[metric_right]['label']} vs {metric_specs[metric_left]['label']}: "
+                f"n={n_valid}, test={test_name}, shapiro_p={shapiro_p:.3g}, "
+                f"stat={stat_val:.3g}, p={p_val:.3g}, sig={_sig_label(p_val)}"
+            )
+
+    for col_i, metric_name in enumerate(metric_order):
+        _draw_metric_panel(
+            top_axes[col_i],
+            metric_name,
+            f"{metric_specs[metric_name]['label']} FWHM",
+            str(metric_specs[metric_name]["color"]),
+        )
+    _draw_category_metric_pair_panel(all_slow_axes[0], "CSplus", "all_spike", "slow_vm", "CS+ all-spike vs slow Vm")
+    _draw_category_metric_pair_panel(all_slow_axes[1], "CSminus", "all_spike", "slow_vm", "CS- all-spike vs slow Vm")
+    _draw_category_metric_pair_panel(ss_cs_axes[0], "CSplus", "ss", "cs", "CS+ SS vs CS")
+    _draw_category_metric_pair_panel(ss_cs_axes[1], "CSminus", "ss", "cs", "CS- SS vs CS")
+    fig.tight_layout(pad=0.25)
+    fig.subplots_adjust(wspace=0.42, hspace=0.58)
+    fig.savefig(save_path, dpi=300)
+
+    stats_df = pd.DataFrame(stats_rows)
+    if bool(save_csv):
+        per_cell_df.to_csv(per_cell_csv, index=False)
+        stats_df.to_csv(stats_csv, index=False)
+
+    return {
+        "figure_path": str(save_path),
+        "per_cell_csv": str(per_cell_csv),
+        "stats_csv": str(stats_csv),
+        "per_cell_df": per_cell_df,
+        "stats_df": stats_df,
+        "skipped_counts": skipped_counts,
+        "smooth_window_cm": None if smooth_window_cm is None else float(smooth_window_cm),
+        "min_traversals_per_type": int(min_traversals),
+        "all_direction_key": str(all_key),
+        "figure": fig,
+    }
+
+
+def compute_csplus_pf_distance_centered_session_delta_width(
+    distance_centered_dataset: dict[str, Any],
+    *,
+    min_traversals_per_session: int = 5,
+    min_trials_per_column_2sessions: int | None = None,
+    strict_follow_plot_inclusion: bool = True,
+    smooth_window_cm: float | None = None,
+    width_min_peak_rate_hz: float | None = None,
+    use_saved_average_exports: bool = True,
+    average_export_dir: str | Path | None = None,
+    average_export_stage: str = "post",
+    split_mode: str = "recorded_sessions",
+    split_window_minutes: float | None = None,
+) -> dict[str, Any]:
+    """
+    Compute CS+ PF1-vs-PF2 session-delta and width summaries from distance-centered data.
+
+    Outputs per PF:
+      - all_spike_delta_fr_s2_s1_over_s1: (peak_S2 - peak_S1) / peak_S1
+      - all_spike_fwhm_s1_cm / all_spike_fwhm_s2_cm
+      - ss_fwhm_s1_cm / ss_fwhm_s2_cm
+      - cs_fwhm_s1_cm / cs_fwhm_s2_cm
+
+    Width is quantified as FWHM on the smoothed session-average tuning curve.
+    """
+    import csv
+    import pandas as pd
+
+    min_trav = int(min_traversals_per_session)
+    if min_trav < 0:
+        raise ValueError("min_traversals_per_session must be >= 0.")
+    split_mode_norm = _normalize_two_session_split_mode(split_mode)
+    split_window_minutes_use = _validate_two_session_split_window_minutes(split_mode_norm, split_window_minutes)
+    min_trials_col = None if min_trials_per_column_2sessions is None else int(min_trials_per_column_2sessions)
+    if min_trials_col is not None and min_trials_col < 0:
+        raise ValueError("min_trials_per_column_2sessions must be >= 0 when provided.")
+    effective_min_trials = int(min_trav)
+    if min_trials_col is not None:
+        if bool(strict_follow_plot_inclusion):
+            effective_min_trials = int(min_trials_col)
+        else:
+            effective_min_trials = max(effective_min_trials, int(min_trials_col))
+
+    stage = str(average_export_stage).strip().lower()
+    if stage not in {"pre", "post"}:
+        raise ValueError("average_export_stage must be 'pre' or 'post'.")
+
+    distance_bin_cm = float(distance_centered_dataset.get("metadata", {}).get("distance_bin_cm", 1.0))
+    smooth_bins = 0
+    if smooth_window_cm is not None:
+        smooth_bins = int(_distance_smooth_cm_to_bins(distance_bin_cm, float(smooth_window_cm)))
+    if smooth_bins < 0:
+        smooth_bins = 0
+    if width_min_peak_rate_hz is not None:
+        width_min_peak_rate_hz = float(width_min_peak_rate_hz)
+        if (not np.isfinite(width_min_peak_rate_hz)) or width_min_peak_rate_hz < 0:
+            raise ValueError("width_min_peak_rate_hz must be >= 0 when provided.")
+
+    group_specs = [
+        ("CSplus", 1, "CSplus_PF1"),
+        ("CSplus", 2, "CSplus_PF2"),
+        ("CSminus", 1, "CSminus_PF1"),
+        ("CSminus", 2, "CSminus_PF2"),
+    ]
+    metric_names = ("all_spike", "ss", "cs")
+
+    def _smooth_trace(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=float).reshape(-1)
+        if int(smooth_bins) > 1:
+            return _smooth_boxcar(arr, int(smooth_bins))
+        return arr
+
+    def _smooth_stack(stack: np.ndarray) -> np.ndarray:
+        if int(smooth_bins) <= 1:
+            return np.asarray(stack, dtype=float)
+        stack = np.asarray(stack, dtype=float)
+        out = np.full_like(stack, np.nan)
+        for i in range(stack.shape[0]):
+            out[i] = _smooth_boxcar(stack[i], int(smooth_bins))
+        return out
+
+    def _safe_float(v: Any, default: float = np.nan) -> float:
+        try:
+            val = float(v)
+        except (TypeError, ValueError):
+            return float(default)
+        return val if np.isfinite(val) else float(default)
+
+    def _safe_int(v: Any, default: int = 0) -> int:
+        vv = _safe_float(v, default=np.nan)
+        if not np.isfinite(vv):
+            return int(default)
+        return int(vv)
+
+    def _row_to_scalar(row: dict[str, Any], npz: Any, key: str, default: float = np.nan) -> float:
+        if key in row and row.get(key, "") not in ("", None):
+            return _safe_float(row.get(key), default=default)
+        if key in npz:
+            arr = np.asarray(npz[key], dtype=float).reshape(-1)
+            if arr.size > 0:
+                return _safe_float(arr[0], default=default)
+        return float(default)
+
+    def _peak_value_with_reason(trace: np.ndarray) -> tuple[float, str | None]:
+        trace = np.asarray(trace, dtype=float).reshape(-1)
+        if trace.ndim != 1 or trace.size == 0:
+            return np.nan, "shape_mismatch"
+        if not np.any(np.isfinite(trace)):
+            return np.nan, "all_nan_trace"
+        peak = float(np.nanmax(trace))
+        if (not np.isfinite(peak)) or peak <= 0:
+            return np.nan, "nonpositive_or_invalid_peak"
+        return float(peak), None
+
+    def _relative_delta_with_reason(v1: float, v2: float) -> tuple[float, str | None]:
+        if (not np.isfinite(v1)) or (not np.isfinite(v2)):
+            return np.nan, "invalid_input"
+        if np.isclose(float(v1), 0.0):
+            return np.nan, "zero_or_invalid_session1"
+        return float((float(v2) - float(v1)) / float(v1)), None
+
+    rows: list[dict[str, Any]] = []
+    skipped: dict[str, int] = {"missing": 0, "insufficient_sessions": 0, "low_traversals": 0}
+    used_saved_average_exports = False
+    export_root: Path | None = None
+
+    def _build_row(
+        *,
+        group: str,
+        category: str,
+        pf_rank: int,
+        animal_id: str,
+        cell_idx: int,
+        cell_num: int,
+        session1_idx: int,
+        session2_idx: int,
+        n_trials_s1: int,
+        n_trials_s2: int,
+        x: np.ndarray,
+        traces: dict[str, tuple[np.ndarray, np.ndarray]],
+    ) -> dict[str, Any]:
+        all_s1, all_s2 = traces["all_spike"]
+        peak_s1, peak_s1_reason = _peak_value_with_reason(all_s1)
+        peak_s2, peak_s2_reason = _peak_value_with_reason(all_s2)
+        delta_fr, delta_reason = _relative_delta_with_reason(peak_s1, peak_s2)
+        row_out: dict[str, Any] = {
+            "group": str(group),
+            "category": str(category),
+            "pf_rank": int(pf_rank),
+            "animal_id": str(animal_id),
+            "cell_idx": int(cell_idx),
+            "cell_num": int(cell_num) if int(cell_idx) >= 0 else np.nan,
+            "session1_idx": int(session1_idx),
+            "session2_idx": int(session2_idx),
+            "n_trials_s1": int(n_trials_s1),
+            "n_trials_s2": int(n_trials_s2),
+            "all_spike_peak_fr_s1": float(peak_s1) if np.isfinite(peak_s1) else np.nan,
+            "all_spike_peak_fr_s2": float(peak_s2) if np.isfinite(peak_s2) else np.nan,
+            "all_spike_delta_fr_s2_s1_over_s1": float(delta_fr) if np.isfinite(delta_fr) else np.nan,
+            "all_spike_delta_fr_nan_reason": str(delta_reason) if delta_reason is not None else "",
+            "all_spike_peak_s1_nan_reason": str(peak_s1_reason) if peak_s1_reason is not None else "",
+            "all_spike_peak_s2_nan_reason": str(peak_s2_reason) if peak_s2_reason is not None else "",
+        }
+        for metric_name, (tr1, tr2) in traces.items():
+            w1, w1_reason = _distance_centered_trace_fwhm(
+                tr1,
+                x,
+                min_peak_rate_hz=width_min_peak_rate_hz,
+            )
+            w2, w2_reason = _distance_centered_trace_fwhm(
+                tr2,
+                x,
+                min_peak_rate_hz=width_min_peak_rate_hz,
+            )
+            row_out[f"{metric_name}_fwhm_s1_cm"] = float(w1) if np.isfinite(w1) else np.nan
+            row_out[f"{metric_name}_fwhm_s2_cm"] = float(w2) if np.isfinite(w2) else np.nan
+            row_out[f"{metric_name}_fwhm_s1_nan_reason"] = str(w1_reason) if w1_reason is not None else ""
+            row_out[f"{metric_name}_fwhm_s2_nan_reason"] = str(w2_reason) if w2_reason is not None else ""
+        return row_out
+
+    if bool(use_saved_average_exports):
+        if average_export_dir is None:
+            export_root = Path("figures") / "CKII_pooled" / "pf_distance_centered_2sessions_average_exports"
+        else:
+            export_root = Path(average_export_dir)
+
+        if export_root.exists():
+            for cat, pf_rank, group in group_specs:
+                index_csv = export_root / str(cat) / "session_averages_pre_post_index.csv"
+                if not index_csv.exists():
+                    continue
+                try:
+                    with open(index_csv, newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            npz_path = Path(str(row.get("npz_path", "")))
+                            if not npz_path.exists():
+                                skipped["missing"] += 1
+                                continue
+                            try:
+                                with np.load(npz_path, allow_pickle=True) as npz:
+                                    if not _export_matches_two_session_split(
+                                        row,
+                                        npz,
+                                        split_mode=split_mode_norm,
+                                        split_window_minutes=split_window_minutes_use,
+                                    ):
+                                        continue
+                                    rel_key = f"distance_rel_pf{int(pf_rank)}"
+                                    if rel_key not in npz:
+                                        skipped["missing"] += 1
+                                        continue
+                                    x = np.asarray(npz[rel_key], dtype=float).reshape(-1)
+                                    if x.ndim != 1 or x.size == 0:
+                                        skipped["missing"] += 1
+                                        continue
+
+                                    n1 = _safe_int(_row_to_scalar(row, npz, f"n_trials_pf{int(pf_rank)}_s1", default=np.nan), default=0)
+                                    n2 = _safe_int(_row_to_scalar(row, npz, f"n_trials_pf{int(pf_rank)}_s2", default=np.nan), default=0)
+                                    if min(n1, n2) < effective_min_trials:
+                                        skipped["low_traversals"] += 1
+                                        continue
+
+                                    traces: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+                                    missing_all_spike = False
+                                    for metric_name in metric_names:
+                                        tr1_key = f"{stage}_pf{int(pf_rank)}_s1_{metric_name}"
+                                        tr2_key = f"{stage}_pf{int(pf_rank)}_s2_{metric_name}"
+                                        if tr1_key not in npz or tr2_key not in npz:
+                                            if metric_name == "all_spike":
+                                                missing_all_spike = True
+                                                break
+                                            traces[metric_name] = (
+                                                np.full(x.size, np.nan, dtype=float),
+                                                np.full(x.size, np.nan, dtype=float),
+                                            )
+                                            continue
+                                        tr1 = _smooth_trace(np.asarray(npz[tr1_key], dtype=float).reshape(-1))
+                                        tr2 = _smooth_trace(np.asarray(npz[tr2_key], dtype=float).reshape(-1))
+                                        if tr1.size != x.size or tr2.size != x.size:
+                                            if metric_name == "all_spike":
+                                                missing_all_spike = True
+                                                break
+                                            traces[metric_name] = (
+                                                np.full(x.size, np.nan, dtype=float),
+                                                np.full(x.size, np.nan, dtype=float),
+                                            )
+                                            continue
+                                        traces[metric_name] = (tr1, tr2)
+                                    if missing_all_spike:
+                                        skipped["missing"] += 1
+                                        continue
+
+                                    rows.append(
+                                        _build_row(
+                                            group=str(group),
+                                            category=str(cat),
+                                            pf_rank=int(pf_rank),
+                                            animal_id=str(row.get("animal_id", "")),
+                                            cell_idx=_safe_int(row.get("cell_idx", -1), default=-1),
+                                            cell_num=_safe_int(row.get("cell_num", _safe_int(row.get("cell_idx", -1), default=-1) + 1), default=_safe_int(row.get("cell_idx", -1), default=-1) + 1),
+                                            session1_idx=_safe_int(_row_to_scalar(row, npz, f"session_idx_pf{int(pf_rank)}_s1", default=0.0), default=0),
+                                            session2_idx=_safe_int(_row_to_scalar(row, npz, f"session_idx_pf{int(pf_rank)}_s2", default=1.0), default=1),
+                                            n_trials_s1=int(n1),
+                                            n_trials_s2=int(n2),
+                                            x=x,
+                                            traces=traces,
+                                        )
+                                    )
+                                    used_saved_average_exports = True
+                            except Exception:
+                                skipped["missing"] += 1
+                                continue
+                except OSError:
+                    continue
+
+    if not bool(used_saved_average_exports):
+        metric_to_stack = {
+            "all_spike": "rate_stack",
+            "ss": "ss_rate_stack",
+            "cs": "cs_rate_stack",
+        }
+        for cat, pf_rank, group in group_specs:
+            block = distance_centered_dataset.get(cat, {}).get(int(pf_rank), {})
+            x = np.asarray(block.get("distance_rel", []), dtype=float)
+            entries = list(block.get("entries", []))
+            if x.ndim != 1 or x.size == 0:
+                skipped["missing"] += int(len(entries))
+                continue
+
+            for entry in entries:
+                entry_use = _split_distance_centered_entry_for_two_sessions(
+                    entry,
+                    split_mode=split_mode_norm,
+                    split_window_minutes=split_window_minutes_use,
+                )
+                if entry_use is None:
+                    skipped["missing"] += 1
+                    continue
+                data_all = entry_use.get("data", {}).get("all", {})
+                trial_data = data_all.get("trial_data", {}) if isinstance(data_all, dict) else {}
+                sess = np.asarray(trial_data.get("session_idx", []), dtype=int) if isinstance(trial_data, dict) else np.array([], dtype=int)
+
+                rate_stack = data_all.get("rate_stack")
+                if rate_stack is None:
+                    skipped["missing"] += 1
+                    continue
+                rate_stack = np.asarray(rate_stack, dtype=float)
+                if rate_stack.ndim != 2 or rate_stack.shape[1] != x.size:
+                    skipped["missing"] += 1
+                    continue
+                if sess.ndim != 1 or sess.size != int(rate_stack.shape[0]):
+                    skipped["missing"] += 1
+                    continue
+
+                sess_vals = np.sort(np.unique(sess.astype(int)))
+                if sess_vals.size < 2:
+                    skipped["insufficient_sessions"] += 1
+                    continue
+                s1_val, s2_val = int(sess_vals[0]), int(sess_vals[1])
+                m1 = sess == s1_val
+                m2 = sess == s2_val
+                n1 = int(np.sum(m1))
+                n2 = int(np.sum(m2))
+                if min(n1, n2) < effective_min_trials:
+                    skipped["low_traversals"] += 1
+                    continue
+
+                traces = {}
+                missing_all_spike = False
+                for metric_name, stack_key in metric_to_stack.items():
+                    stack = data_all.get(stack_key)
+                    if stack is None:
+                        if metric_name == "all_spike":
+                            missing_all_spike = True
+                            break
+                        traces[metric_name] = (
+                            np.full(x.size, np.nan, dtype=float),
+                            np.full(x.size, np.nan, dtype=float),
+                        )
+                        continue
+                    stack = np.asarray(stack, dtype=float)
+                    if stack.ndim != 2 or stack.shape[1] != x.size or stack.shape[0] != sess.size:
+                        if metric_name == "all_spike":
+                            missing_all_spike = True
+                            break
+                        traces[metric_name] = (
+                            np.full(x.size, np.nan, dtype=float),
+                            np.full(x.size, np.nan, dtype=float),
+                        )
+                        continue
+                    stack = _smooth_stack(stack)
+                    traces[metric_name] = (
+                        np.asarray(np.nanmean(stack[m1], axis=0), dtype=float),
+                        np.asarray(np.nanmean(stack[m2], axis=0), dtype=float),
+                    )
+                if missing_all_spike:
+                    skipped["missing"] += 1
+                    continue
+
+                cell_idx = int(entry_use.get("cell_idx", -1))
+                rows.append(
+                    _build_row(
+                        group=str(group),
+                        category=str(cat),
+                        pf_rank=int(pf_rank),
+                        animal_id=str(entry_use.get("session", "")),
+                        cell_idx=cell_idx,
+                        cell_num=int(cell_idx) + 1 if cell_idx >= 0 else np.nan,
+                        session1_idx=int(s1_val),
+                        session2_idx=int(s2_val),
+                        n_trials_s1=int(n1),
+                        n_trials_s2=int(n2),
+                        x=x,
+                        traces=traces,
+                    )
+                )
+
+    per_cell_metrics = pd.DataFrame(rows)
+    if len(per_cell_metrics) == 0:
+        empty = pd.DataFrame()
+        return {
+            "per_cell_metrics": empty,
+            "stats_summary": empty,
+            "count_summary": {},
+            "skipped_counts": skipped,
+            "n_cells_pf1": 0,
+            "n_cells_pf2": 0,
+            "n_cells_with_pf1_pf2": 0,
+            "strict_follow_plot_inclusion": bool(strict_follow_plot_inclusion),
+            "min_traversals_per_session": int(min_trav),
+            "min_trials_per_column_2sessions": None if min_trials_col is None else int(min_trials_col),
+            "smooth_window_cm": None if smooth_window_cm is None else float(smooth_window_cm),
+            "width_min_peak_rate_hz": None if width_min_peak_rate_hz is None else float(width_min_peak_rate_hz),
+            "data_source": "saved_average_exports" if bool(used_saved_average_exports) else "distance_centered_dataset",
+            "average_export_dir": str(export_root) if export_root is not None and bool(used_saved_average_exports) else None,
+            "average_export_stage": str(stage) if bool(used_saved_average_exports) else None,
+            "split_mode": str(split_mode_norm),
+            "split_window_minutes": None if split_window_minutes_use is None else float(split_window_minutes_use),
+        }
+
+    def _paired_test_auto_small_n(vals_a: np.ndarray, vals_b: np.ndarray) -> tuple[float, float, str, int, float]:
+        vals_a = np.asarray(vals_a, dtype=float)
+        vals_b = np.asarray(vals_b, dtype=float)
+        n_pairs = min(len(vals_a), len(vals_b))
+        if n_pairs == 0:
+            return np.nan, np.nan, "n/a", 0, np.nan
+        a = vals_a[:n_pairs]
+        b = vals_b[:n_pairs]
+        valid = np.isfinite(a) & np.isfinite(b)
+        n_valid = int(np.sum(valid))
+        if n_valid < 3:
+            return np.nan, np.nan, "n/a", n_valid, np.nan
+        if n_valid <= 6:
+            try:
+                res = scipy_stats.wilcoxon(a[valid], b[valid])
+                return float(res.pvalue), float(res.statistic), "wilcoxon (n<=6)", n_valid, np.nan
+            except ValueError:
+                return np.nan, np.nan, "wilcoxon (n<=6)", n_valid, np.nan
+        return paired_test_auto(a[valid], b[valid])
+
+    stat_fields = [
+        ("all_spike_delta_fr_s2_s1_over_s1", "all_spike_delta_fr", None),
+    ]
+    stats_rows: list[dict[str, Any]] = []
+    count_summary: dict[str, dict[str, int]] = {}
+    category_order = ["CSplus", "CSminus"]
+    for category_name in category_order:
+        cat_df = per_cell_metrics[per_cell_metrics["category"] == category_name].copy()
+        if len(cat_df) == 0:
+            continue
+        for field_name, panel_name, session_name in stat_fields:
+            sub = cat_df[["animal_id", "cell_idx", "pf_rank", field_name]].copy()
+            piv = sub.pivot_table(index=["animal_id", "cell_idx"], columns="pf_rank", values=field_name, aggfunc="first")
+            if 1 not in piv.columns:
+                piv[1] = np.nan
+            if 2 not in piv.columns:
+                piv[2] = np.nan
+            vals1 = np.asarray(piv[1], dtype=float)
+            vals2 = np.asarray(piv[2], dtype=float)
+            p_val, stat_val, test_name, n_valid, shapiro_p = _paired_test_auto_small_n(vals2, vals1)
+            stats_rows.append(
+                {
+                    "category": str(category_name),
+                    "panel": str(panel_name),
+                    "session": ("" if session_name is None else str(session_name)),
+                    "field": str(field_name),
+                    "comparison": "PF2_vs_PF1",
+                    "n": int(n_valid),
+                    "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                    "statistic": float(stat_val) if np.isfinite(stat_val) else np.nan,
+                    "test": str(test_name),
+                    "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+                    "left_group": "PF2",
+                    "right_group": "PF1",
+                    "left_mean": float(np.nanmean(vals2[np.isfinite(vals2)])) if np.any(np.isfinite(vals2)) else np.nan,
+                    "right_mean": float(np.nanmean(vals1[np.isfinite(vals1)])) if np.any(np.isfinite(vals1)) else np.nan,
+                }
+            )
+            paired_mask = np.isfinite(vals1) & np.isfinite(vals2)
+            count_summary[f"{category_name}::{field_name}"] = {
+                "PF1": int(np.sum(paired_mask)),
+                "PF2": int(np.sum(paired_mask)),
+                "paired": int(np.sum(paired_mask)),
+            }
+
+        for prefix in ("all_spike", "ss", "cs"):
+            for pf_rank in (1, 2):
+                field_s1 = f"{prefix}_fwhm_s1_cm"
+                field_s2 = f"{prefix}_fwhm_s2_cm"
+                sub = cat_df.loc[cat_df["pf_rank"] == int(pf_rank), ["animal_id", "cell_idx", field_s1, field_s2]].copy()
+                vals1 = np.asarray(sub[field_s1], dtype=float)
+                vals2 = np.asarray(sub[field_s2], dtype=float)
+                p_val, stat_val, test_name, n_valid, shapiro_p = _paired_test_auto_small_n(vals2, vals1)
+                stats_rows.append(
+                    {
+                        "category": str(category_name),
+                        "panel": f"{prefix}_fwhm",
+                        "session": "",
+                        "field": f"{prefix}_fwhm_pf{int(pf_rank)}",
+                        "comparison": f"PF{int(pf_rank)}_S2_vs_S1",
+                        "n": int(n_valid),
+                        "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                        "statistic": float(stat_val) if np.isfinite(stat_val) else np.nan,
+                        "test": str(test_name),
+                        "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+                        "left_group": f"PF{int(pf_rank)} S2",
+                        "right_group": f"PF{int(pf_rank)} S1",
+                        "left_mean": float(np.nanmean(vals2[np.isfinite(vals2)])) if np.any(np.isfinite(vals2)) else np.nan,
+                        "right_mean": float(np.nanmean(vals1[np.isfinite(vals1)])) if np.any(np.isfinite(vals1)) else np.nan,
+                    }
+                )
+            for session_name_local, field_name in (("S1", f"{prefix}_fwhm_s1_cm"), ("S2", f"{prefix}_fwhm_s2_cm")):
+                pair_pf1 = cat_df.loc[
+                    (cat_df["pf_rank"] == 1)
+                    & cat_df[f"{prefix}_fwhm_s1_cm"].notna()
+                    & cat_df[f"{prefix}_fwhm_s2_cm"].notna(),
+                    ["animal_id", "cell_idx"],
+                ].drop_duplicates()
+                pair_pf2 = cat_df.loc[
+                    (cat_df["pf_rank"] == 2)
+                    & cat_df[f"{prefix}_fwhm_s1_cm"].notna()
+                    & cat_df[f"{prefix}_fwhm_s2_cm"].notna(),
+                    ["animal_id", "cell_idx"],
+                ].drop_duplicates()
+                count_summary[f"{category_name}::{field_name}"] = {
+                    "PF1": int(len(pair_pf1)),
+                    "PF2": int(len(pair_pf2)),
+                    "paired": 0,
+                }
+
+    stats_summary = pd.DataFrame(stats_rows)
+    cell_set_pf1 = {
+        (str(r["animal_id"]), int(r["cell_idx"]))
+        for _, r in per_cell_metrics[per_cell_metrics["pf_rank"] == 1][["animal_id", "cell_idx"]].drop_duplicates().iterrows()
+    }
+    cell_set_pf2 = {
+        (str(r["animal_id"]), int(r["cell_idx"]))
+        for _, r in per_cell_metrics[per_cell_metrics["pf_rank"] == 2][["animal_id", "cell_idx"]].drop_duplicates().iterrows()
+    }
+
+    return {
+        "per_cell_metrics": per_cell_metrics,
+        "stats_summary": stats_summary,
+        "count_summary": count_summary,
+        "skipped_counts": skipped,
+        "n_cells_pf1": int(len(cell_set_pf1)),
+        "n_cells_pf2": int(len(cell_set_pf2)),
+        "n_cells_with_pf1_pf2": int(len(cell_set_pf1 & cell_set_pf2)),
+        "n_cells_by_category": {
+            str(cat): int(
+                len(
+                    {
+                        (str(r["animal_id"]), int(r["cell_idx"]))
+                        for _, r in per_cell_metrics[per_cell_metrics["category"] == cat][["animal_id", "cell_idx"]].drop_duplicates().iterrows()
+                    }
+                )
+            )
+            for cat in category_order
+            if np.any(per_cell_metrics["category"] == cat)
+        },
+        "strict_follow_plot_inclusion": bool(strict_follow_plot_inclusion),
+        "min_traversals_per_session": int(min_trav),
+        "min_trials_per_column_2sessions": None if min_trials_col is None else int(min_trials_col),
+        "smooth_window_cm": None if smooth_window_cm is None else float(smooth_window_cm),
+        "width_min_peak_rate_hz": None if width_min_peak_rate_hz is None else float(width_min_peak_rate_hz),
+        "data_source": "saved_average_exports" if bool(used_saved_average_exports) else "distance_centered_dataset",
+        "average_export_dir": str(export_root) if export_root is not None and bool(used_saved_average_exports) else None,
+        "average_export_stage": str(stage) if bool(used_saved_average_exports) else None,
+        "split_mode": str(split_mode_norm),
+        "split_window_minutes": None if split_window_minutes_use is None else float(split_window_minutes_use),
+    }
+
+
+def plot_csplus_pf_distance_centered_session_delta_width(
+    delta_width_results: dict[str, Any],
+    *,
+    figure_save_folder: str | Path | None = None,
+    figsize: tuple[float, float] | None = None,
+    row_height: float = 2.2,
+    show_plot: bool = True,
+    save_csv: bool = True,
+) -> dict[str, str]:
+    """
+    Plot a compact 4-panel per-category PF1-vs-PF2 delta-and-width summary.
+    """
+    import pandas as pd
+
+    df = delta_width_results.get("per_cell_metrics")
+    if df is None or len(df) == 0:
+        return {}
+
+    stats_df = delta_width_results.get("stats_summary")
+    if stats_df is None:
+        stats_df = pd.DataFrame()
+    else:
+        stats_df = pd.DataFrame(stats_df).copy()
+
+    if figure_save_folder is None:
+        figure_root = Path("figures") / "CKII_pooled"
+    else:
+        figure_root = Path(figure_save_folder)
+    figure_root.mkdir(parents=True, exist_ok=True)
+
+    category_order = ["CSplus", "CSminus"]
+    categories_use = [cat for cat in category_order if np.any(df["category"] == cat)]
+    if len(categories_use) == 0:
+        return {}
+    add_cross_group_pf1_row = all(cat in categories_use for cat in ("CSplus", "CSminus"))
+    n_rows = int(len(categories_use) + (1 if add_cross_group_pf1_row else 0))
+    if figsize is None:
+        fig_w = 6.6
+        fig_h = max(float(row_height) * n_rows, 1.8)
+    else:
+        fig_w = float(figsize[0])
+        fig_h = float(figsize[1])
+
+    fig_path = figure_root / "csplus_pf_distance_centered_session_delta_width.svg"
+    per_cell_csv = figure_root / "csplus_pf_distance_centered_session_delta_width_per_cell.csv"
+    stats_csv = figure_root / "csplus_pf_distance_centered_session_delta_width_stats.csv"
+
+    metric_colors = {
+        "all_spike": "#555555",
+        "ss": "#026C80",
+        "cs": "#EE9B00",
+    }
+
+    def _paired_test_auto_small_n(vals_a: np.ndarray, vals_b: np.ndarray) -> tuple[float, float, str, int, float]:
+        vals_a = np.asarray(vals_a, dtype=float)
+        vals_b = np.asarray(vals_b, dtype=float)
+        n_pairs = min(len(vals_a), len(vals_b))
+        if n_pairs == 0:
+            return np.nan, np.nan, "n/a", 0, np.nan
+        a = vals_a[:n_pairs]
+        b = vals_b[:n_pairs]
+        valid = np.isfinite(a) & np.isfinite(b)
+        n_valid = int(np.sum(valid))
+        if n_valid < 3:
+            return np.nan, np.nan, "n/a", n_valid, np.nan
+        if n_valid <= 6:
+            try:
+                res = scipy_stats.wilcoxon(a[valid], b[valid])
+                return float(res.pvalue), float(res.statistic), "wilcoxon (n<=6)", n_valid, np.nan
+            except ValueError:
+                return np.nan, np.nan, "wilcoxon (n<=6)", n_valid, np.nan
+        return paired_test_auto(a[valid], b[valid])
+
+    def _unpaired_test_auto_small_n(vals_a: np.ndarray, vals_b: np.ndarray) -> tuple[float, float, str, int, int]:
+        a = np.asarray(vals_a, dtype=float)
+        b = np.asarray(vals_b, dtype=float)
+        a = a[np.isfinite(a)]
+        b = b[np.isfinite(b)]
+        na, nb = len(a), len(b)
+        if min(na, nb) < 3:
+            return np.nan, np.nan, "n/a", na, nb
+        if min(na, nb) <= 6:
+            try:
+                res = scipy_stats.mannwhitneyu(a, b, alternative="two-sided")
+                return float(res.pvalue), float(res.statistic), "mann-whitney (n<=6)", na, nb
+            except ValueError:
+                return np.nan, np.nan, "mann-whitney (n<=6)", na, nb
+        return unpaired_test_auto(a, b)
+
+    def _swarm_x(y_vals: np.ndarray, center: float, width: float = 0.08) -> np.ndarray:
+        y_vals = np.asarray(y_vals, dtype=float)
+        n = y_vals.size
+        if n == 0:
+            return np.array([], dtype=float)
+        if n == 1:
+            return np.array([center], dtype=float)
+        order = np.argsort(y_vals)
+        x = np.full(n, center, dtype=float)
+        y_span = float(np.nanmax(y_vals) - np.nanmin(y_vals)) if np.any(np.isfinite(y_vals)) else 1.0
+        if (not np.isfinite(y_span)) or y_span <= 0:
+            y_span = 1.0
+        min_dy = 0.03 * y_span
+        step = width / 5.0
+        offsets = [0.0]
+        for k in range(1, 6):
+            offsets.extend([k * step, -k * step])
+        placed: list[tuple[float, float]] = []
+        for idx in order:
+            yi = float(y_vals[idx])
+            chosen = 0.0
+            for off in offsets:
+                xi = center + off
+                clash = False
+                for xj, yj in placed:
+                    if abs(yj - yi) <= min_dy and abs(xj - xi) < (0.95 * step):
+                        clash = True
+                        break
+                if not clash:
+                    chosen = off
+                    break
+            x[idx] = center + chosen
+            placed.append((x[idx], yi))
+        return x
+
+    def _add_sig_bracket(ax: Any, x1: float, x2: float, y: float, h: float, txt: str) -> None:
+        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=0.6, clip_on=False)
+        ax.text((x1 + x2) / 2.0, y + h, txt, ha="center", va="bottom", fontsize=5)
+
+    def _panel_stat(sub_df: pd.DataFrame, field: str) -> dict[str, Any]:
+        sub = sub_df[["animal_id", "cell_idx", "pf_rank", field]].copy()
+        piv = sub.pivot_table(index=["animal_id", "cell_idx"], columns="pf_rank", values=field, aggfunc="first")
+        if 1 not in piv.columns:
+            piv[1] = np.nan
+        if 2 not in piv.columns:
+            piv[2] = np.nan
+        vals1 = np.asarray(piv[1], dtype=float)
+        vals2 = np.asarray(piv[2], dtype=float)
+        p_val, stat_val, test_name, n_valid, shapiro_p = _paired_test_auto_small_n(vals2, vals1)
+        return {
+            "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+            "statistic": float(stat_val) if np.isfinite(stat_val) else np.nan,
+            "test": str(test_name),
+            "n": int(n_valid),
+            "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+        }
+
+    def _draw_two_group_panel(ax: Any, sub_df: pd.DataFrame, *, field: str, title: str, ylabel: str, zero_line: float | None = None, row_label: str = "") -> None:
+        positions = np.array([0.0, 1.0], dtype=float)
+        box_color = metric_colors["all_spike"]
+        pair = sub_df[["animal_id", "cell_idx", "pf_rank", field]].copy()
+        piv = pair.pivot_table(index=["animal_id", "cell_idx"], columns="pf_rank", values=field, aggfunc="first")
+        if 1 not in piv.columns:
+            piv[1] = np.nan
+        if 2 not in piv.columns:
+            piv[2] = np.nan
+        piv = piv[np.isfinite(piv[1]) & np.isfinite(piv[2])]
+        groups = [np.asarray(piv[1], dtype=float), np.asarray(piv[2], dtype=float)]
+        counts = [int(len(g)) for g in groups]
+        bp = ax.boxplot(
+            groups,
+            positions=positions,
+            widths=0.5,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box in bp["boxes"]:
+            box.set_facecolor(box_color)
+            box.set_alpha(0.25)
+        for pos, vals in zip(positions, groups):
+            if len(vals) == 0:
+                continue
+            xs = _swarm_x(vals, float(pos), width=0.10)
+            ax.scatter(xs, vals, s=8, color=box_color, alpha=0.9, linewidths=0, zorder=2)
+
+        if {1, 2}.issubset(set(piv.columns)):
+            for _, row in piv.iterrows():
+                ax.plot([0.0, 1.0], [float(row[1]), float(row[2])], color="#C8C8C8", linewidth=0.45, alpha=0.7, zorder=1)
+
+        stat = _panel_stat(sub_df, field)
+        vals_all = np.concatenate([g for g in groups if len(g) > 0]) if any(len(g) > 0 for g in groups) else np.array([0.0])
+        y_min = float(np.nanmin(vals_all)) if np.any(np.isfinite(vals_all)) else -1.0
+        y_max = float(np.nanmax(vals_all)) if np.any(np.isfinite(vals_all)) else 1.0
+        span = y_max - y_min
+        if (not np.isfinite(span)) or span <= 0:
+            span = max(abs(y_max), 1.0) * 0.3
+        base = y_max + 0.08 * span
+        h = 0.03 * span
+        _add_sig_bracket(ax, 0.0, 1.0, base, h, _sig_label(stat["p_value"]))
+        ax.set_ylim(y_min - 0.08 * span, base + 2 * h + 0.10 * span)
+        if zero_line is not None:
+            ax.axhline(float(zero_line), color="black", linestyle="--", linewidth=0.5, alpha=0.6)
+        if len(row_label) > 0:
+            ax.set_ylabel(f"{row_label}\n{ylabel}", fontsize=6)
+        else:
+            ax.set_ylabel(ylabel, fontsize=6)
+        ax.set_title(title, fontsize=6)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(
+            [f"PF1\n(n={counts[0]})", f"PF2\n(n={counts[1]})"],
+            rotation=0,
+            ha="center",
+        )
+        ax.set_xlim(-0.5, 1.5)
+        ax.tick_params(labelsize=5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        print(
+            f"{title}: n={stat['n']}, test={stat['test']}, "
+            f"shapiro_p={stat['shapiro_p']:.3g}, stat={stat['statistic']:.3g}, "
+            f"p={stat['p_value']:.3g}, sig={_sig_label(stat['p_value'])}"
+        )
+
+    def _draw_width_panel(ax: Any, sub_df: pd.DataFrame, *, prefix: str, title: str, row_label: str = "") -> None:
+        positions = {"pf1_s1": 0.0, "pf1_s2": 1.0, "pf2_s1": 2.0, "pf2_s2": 3.0}
+        field_map = {
+            "pf1_s1": f"{prefix}_fwhm_s1_cm",
+            "pf1_s2": f"{prefix}_fwhm_s2_cm",
+            "pf2_s1": f"{prefix}_fwhm_s1_cm",
+            "pf2_s2": f"{prefix}_fwhm_s2_cm",
+        }
+        pf_map = {"pf1_s1": 1, "pf1_s2": 1, "pf2_s1": 2, "pf2_s2": 2}
+        box_color = metric_colors.get(str(prefix), "#555555")
+        ax.axvspan(-0.5, 1.5, color="#FFB3E6", alpha=0.2, zorder=0)
+        ax.axvspan(1.5, 3.5, color="#BFEFFF", alpha=0.2, zorder=0)
+
+        pair_pf1 = sub_df.loc[
+            (sub_df["pf_rank"] == 1)
+            & sub_df[f"{prefix}_fwhm_s1_cm"].notna()
+            & sub_df[f"{prefix}_fwhm_s2_cm"].notna(),
+            ["animal_id", "cell_idx", f"{prefix}_fwhm_s1_cm", f"{prefix}_fwhm_s2_cm"],
+        ].copy()
+        pair_pf2 = sub_df.loc[
+            (sub_df["pf_rank"] == 2)
+            & sub_df[f"{prefix}_fwhm_s1_cm"].notna()
+            & sub_df[f"{prefix}_fwhm_s2_cm"].notna(),
+            ["animal_id", "cell_idx", f"{prefix}_fwhm_s1_cm", f"{prefix}_fwhm_s2_cm"],
+        ].copy()
+        groups = []
+        order = ["pf1_s1", "pf1_s2", "pf2_s1", "pf2_s2"]
+        for key in order:
+            if key == "pf1_s1":
+                vals = np.asarray(pair_pf1[f"{prefix}_fwhm_s1_cm"], dtype=float)
+            elif key == "pf1_s2":
+                vals = np.asarray(pair_pf1[f"{prefix}_fwhm_s2_cm"], dtype=float)
+            elif key == "pf2_s1":
+                vals = np.asarray(pair_pf2[f"{prefix}_fwhm_s1_cm"], dtype=float)
+            else:
+                vals = np.asarray(pair_pf2[f"{prefix}_fwhm_s2_cm"], dtype=float)
+            groups.append(vals[np.isfinite(vals)])
+        counts = [int(len(g)) for g in groups]
+
+        bp = ax.boxplot(
+            groups,
+            positions=np.asarray([positions[k] for k in order], dtype=float),
+            widths=0.5,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box in bp["boxes"]:
+            box.set_facecolor(box_color)
+            box.set_alpha(0.25)
+        for key, vals in zip(order, groups):
+            if len(vals) == 0:
+                continue
+            xs = _swarm_x(vals, float(positions[key]), width=0.10)
+            ax.scatter(xs, vals, s=8, color=box_color, alpha=0.9, linewidths=0, zorder=2)
+
+        for pair, x1, x2, field1, field2 in (
+            (pair_pf1, positions["pf1_s1"], positions["pf1_s2"], f"{prefix}_fwhm_s1_cm", f"{prefix}_fwhm_s2_cm"),
+            (pair_pf2, positions["pf2_s1"], positions["pf2_s2"], f"{prefix}_fwhm_s1_cm", f"{prefix}_fwhm_s2_cm"),
+        ):
+            for _, row in pair.iterrows():
+                v1 = row[field1]
+                v2 = row[field2]
+                if np.isfinite(v1) and np.isfinite(v2):
+                    ax.plot([float(x1), float(x2)], [float(v1), float(v2)], color="#C8C8C8", linewidth=0.45, alpha=0.7, zorder=1)
+
+        stat_pf1 = _paired_test_auto_small_n(
+            np.asarray(pair_pf1[f"{prefix}_fwhm_s2_cm"], dtype=float),
+            np.asarray(pair_pf1[f"{prefix}_fwhm_s1_cm"], dtype=float),
+        )
+        stat_pf2 = _paired_test_auto_small_n(
+            np.asarray(pair_pf2[f"{prefix}_fwhm_s2_cm"], dtype=float),
+            np.asarray(pair_pf2[f"{prefix}_fwhm_s1_cm"], dtype=float),
+        )
+        vals_all = np.concatenate([g for g in groups if len(g) > 0]) if any(len(g) > 0 for g in groups) else np.array([0.0])
+        y_min = float(np.nanmin(vals_all)) if np.any(np.isfinite(vals_all)) else 0.0
+        y_max = float(np.nanmax(vals_all)) if np.any(np.isfinite(vals_all)) else 1.0
+        span = y_max - y_min
+        if (not np.isfinite(span)) or span <= 0:
+            span = max(abs(y_max), 1.0) * 0.3
+        base = y_max + 0.08 * span
+        h = 0.03 * span
+        _add_sig_bracket(ax, positions["pf1_s1"], positions["pf1_s2"], base, h, _sig_label(stat_pf1[0]))
+        _add_sig_bracket(ax, positions["pf2_s1"], positions["pf2_s2"], base, h, _sig_label(stat_pf2[0]))
+        ax.set_ylim(y_min - 0.08 * span, base + 2 * h + 0.12 * span)
+        if len(row_label) > 0:
+            ax.set_ylabel(f"{row_label}\nFWHM (cm)", fontsize=6)
+        else:
+            ax.set_ylabel("FWHM (cm)", fontsize=6)
+        ax.set_title(title, fontsize=6)
+        ax.set_xticks(np.asarray([positions[k] for k in order], dtype=float))
+        ax.set_xticklabels(
+            [
+                f"S1\n(n={counts[0]})",
+                f"S2\n(n={counts[1]})",
+                f"S1\n(n={counts[2]})",
+                f"S2\n(n={counts[3]})",
+            ],
+            rotation=0,
+            ha="center",
+        )
+        ax.set_xlim(-0.5, 3.5)
+        ax.tick_params(labelsize=5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        print(
+            f"{title} PF1 S2 vs S1: n={stat_pf1[3]}, test={stat_pf1[2]}, "
+            f"shapiro_p={stat_pf1[4]:.3g}, stat={stat_pf1[1]:.3g}, "
+            f"p={stat_pf1[0]:.3g}, sig={_sig_label(stat_pf1[0])}"
+        )
+        print(
+            f"{title} PF2 S2 vs S1: n={stat_pf2[3]}, test={stat_pf2[2]}, "
+            f"shapiro_p={stat_pf2[4]:.3g}, stat={stat_pf2[1]:.3g}, "
+            f"p={stat_pf2[0]:.3g}, sig={_sig_label(stat_pf2[0])}"
+        )
+
+    plot_stats_rows: list[dict[str, Any]] = []
+
+    def _draw_cross_group_pf1_panel(ax: Any, *, prefix: str, title: str, row_label: str = "") -> None:
+        plus_df = df[df["category"] == "CSplus"].copy()
+        minus_df = df[df["category"] == "CSminus"].copy()
+        field_s1 = f"{prefix}_fwhm_s1_cm"
+        field_s2 = f"{prefix}_fwhm_s2_cm"
+        plus_pair = plus_df.loc[
+            (plus_df["pf_rank"] == 1)
+            & plus_df[field_s1].notna()
+            & plus_df[field_s2].notna(),
+            ["animal_id", "cell_idx", field_s1, field_s2],
+        ].copy()
+        minus_pair = minus_df.loc[
+            (minus_df["pf_rank"] == 1)
+            & minus_df[field_s1].notna()
+            & minus_df[field_s2].notna(),
+            ["animal_id", "cell_idx", field_s1, field_s2],
+        ].copy()
+
+        positions = {"plus_s1": 0.0, "plus_s2": 1.0, "minus_s1": 2.0, "minus_s2": 3.0}
+        box_color = metric_colors.get(str(prefix), "#555555")
+        ax.axvspan(-0.5, 1.5, color="#FFF3E0", alpha=0.3, zorder=0)
+        ax.axvspan(1.5, 3.5, color="#E3F2FD", alpha=0.3, zorder=0)
+
+        groups = [
+            np.asarray(plus_pair[field_s1], dtype=float),
+            np.asarray(plus_pair[field_s2], dtype=float),
+            np.asarray(minus_pair[field_s1], dtype=float),
+            np.asarray(minus_pair[field_s2], dtype=float),
+        ]
+        groups = [g[np.isfinite(g)] for g in groups]
+        counts = [int(len(g)) for g in groups]
+
+        bp = ax.boxplot(
+            groups,
+            positions=np.asarray(list(positions.values()), dtype=float),
+            widths=0.5,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box in bp["boxes"]:
+            box.set_facecolor(box_color)
+            box.set_alpha(0.25)
+        for x0, vals in zip(positions.values(), groups):
+            if len(vals) == 0:
+                continue
+            xs = _swarm_x(vals, float(x0), width=0.10)
+            ax.scatter(xs, vals, s=8, color=box_color, alpha=0.9, linewidths=0, zorder=2)
+
+        for pair_df, x1, x2 in (
+            (plus_pair, positions["plus_s1"], positions["plus_s2"]),
+            (minus_pair, positions["minus_s1"], positions["minus_s2"]),
+        ):
+            for _, row in pair_df.iterrows():
+                v1 = row[field_s1]
+                v2 = row[field_s2]
+                if np.isfinite(v1) and np.isfinite(v2):
+                    ax.plot([float(x1), float(x2)], [float(v1), float(v2)], color="#C8C8C8", linewidth=0.45, alpha=0.7, zorder=1)
+
+        stat_plus = _paired_test_auto_small_n(
+            np.asarray(plus_pair[field_s2], dtype=float),
+            np.asarray(plus_pair[field_s1], dtype=float),
+        )
+        stat_minus = _paired_test_auto_small_n(
+            np.asarray(minus_pair[field_s2], dtype=float),
+            np.asarray(minus_pair[field_s1], dtype=float),
+        )
+        p_s1, stat_s1, test_s1, n_s1_a, n_s1_b = _unpaired_test_auto_small_n(
+            np.asarray(plus_pair[field_s1], dtype=float),
+            np.asarray(minus_pair[field_s1], dtype=float),
+        )
+        p_s2, stat_s2, test_s2, n_s2_a, n_s2_b = _unpaired_test_auto_small_n(
+            np.asarray(plus_pair[field_s2], dtype=float),
+            np.asarray(minus_pair[field_s2], dtype=float),
+        )
+
+        vals_all = np.concatenate([g for g in groups if len(g) > 0]) if any(len(g) > 0 for g in groups) else np.array([0.0])
+        y_min = float(np.nanmin(vals_all)) if np.any(np.isfinite(vals_all)) else 0.0
+        y_max = float(np.nanmax(vals_all)) if np.any(np.isfinite(vals_all)) else 1.0
+        span = y_max - y_min
+        if (not np.isfinite(span)) or span <= 0:
+            span = max(abs(y_max), 1.0) * 0.3
+        base = y_max + 0.08 * span
+        step = 0.20 * span
+        h = 0.03 * span
+        _add_sig_bracket(ax, positions["plus_s1"], positions["plus_s2"], base, h, _sig_label(stat_plus[0]))
+        _add_sig_bracket(ax, positions["minus_s1"], positions["minus_s2"], base, h, _sig_label(stat_minus[0]))
+        _add_sig_bracket(ax, positions["plus_s1"], positions["minus_s1"], base + step, h, _sig_label(p_s1))
+        _add_sig_bracket(ax, positions["plus_s2"], positions["minus_s2"], base + 2 * step, h, _sig_label(p_s2))
+        ax.set_ylim(y_min - 0.08 * span, base + 2 * step + 2 * h + 0.12 * span)
+        if len(row_label) > 0:
+            ax.set_ylabel(f"{row_label}\nFWHM (cm)", fontsize=6)
+        else:
+            ax.set_ylabel("FWHM (cm)", fontsize=6)
+        ax.set_title(title, fontsize=6)
+        ax.set_xticks(np.asarray(list(positions.values()), dtype=float))
+        ax.set_xticklabels(
+            [
+                f"S1\n(n={counts[0]})",
+                f"S2\n(n={counts[1]})",
+                f"S1\n(n={counts[2]})",
+                f"S2\n(n={counts[3]})",
+            ],
+            rotation=0,
+            ha="center",
+        )
+        ax.set_xlim(-0.5, 3.5)
+        ax.tick_params(labelsize=5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        print(
+            f"{title} CS+ PF1 S2 vs S1: n={stat_plus[3]}, test={stat_plus[2]}, "
+            f"shapiro_p={stat_plus[4]:.3g}, stat={stat_plus[1]:.3g}, p={stat_plus[0]:.3g}, sig={_sig_label(stat_plus[0])}"
+        )
+        print(
+            f"{title} CS- PF1 S2 vs S1: n={stat_minus[3]}, test={stat_minus[2]}, "
+            f"shapiro_p={stat_minus[4]:.3g}, stat={stat_minus[1]:.3g}, p={stat_minus[0]:.3g}, sig={_sig_label(stat_minus[0])}"
+        )
+        print(
+            f"{title} S1 CS+ vs CS-: n=({n_s1_a},{n_s1_b}), test={test_s1}, stat={stat_s1:.3g}, p={p_s1:.3g}, sig={_sig_label(p_s1)}"
+        )
+        print(
+            f"{title} S2 CS+ vs CS-: n=({n_s2_a},{n_s2_b}), test={test_s2}, stat={stat_s2:.3g}, p={p_s2:.3g}, sig={_sig_label(p_s2)}"
+        )
+        plot_stats_rows.extend(
+            [
+                {
+                    "category": "CSplus",
+                    "panel": f"{prefix}_fwhm_pf1_crossgroup",
+                    "comparison": "CSplus_PF1_S2_vs_S1",
+                    "n": int(stat_plus[3]),
+                    "p_value": float(stat_plus[0]) if np.isfinite(stat_plus[0]) else np.nan,
+                    "statistic": float(stat_plus[1]) if np.isfinite(stat_plus[1]) else np.nan,
+                    "test": str(stat_plus[2]),
+                    "shapiro_p": float(stat_plus[4]) if np.isfinite(stat_plus[4]) else np.nan,
+                },
+                {
+                    "category": "CSminus",
+                    "panel": f"{prefix}_fwhm_pf1_crossgroup",
+                    "comparison": "CSminus_PF1_S2_vs_S1",
+                    "n": int(stat_minus[3]),
+                    "p_value": float(stat_minus[0]) if np.isfinite(stat_minus[0]) else np.nan,
+                    "statistic": float(stat_minus[1]) if np.isfinite(stat_minus[1]) else np.nan,
+                    "test": str(stat_minus[2]),
+                    "shapiro_p": float(stat_minus[4]) if np.isfinite(stat_minus[4]) else np.nan,
+                },
+                {
+                    "category": "cross_group",
+                    "panel": f"{prefix}_fwhm_pf1_crossgroup",
+                    "comparison": "S1_CSplus_vs_CSminus",
+                    "n_a": int(n_s1_a),
+                    "n_b": int(n_s1_b),
+                    "p_value": float(p_s1) if np.isfinite(p_s1) else np.nan,
+                    "statistic": float(stat_s1) if np.isfinite(stat_s1) else np.nan,
+                    "test": str(test_s1),
+                    "shapiro_p": np.nan,
+                },
+                {
+                    "category": "cross_group",
+                    "panel": f"{prefix}_fwhm_pf1_crossgroup",
+                    "comparison": "S2_CSplus_vs_CSminus",
+                    "n_a": int(n_s2_a),
+                    "n_b": int(n_s2_b),
+                    "p_value": float(p_s2) if np.isfinite(p_s2) else np.nan,
+                    "statistic": float(stat_s2) if np.isfinite(stat_s2) else np.nan,
+                    "test": str(test_s2),
+                    "shapiro_p": np.nan,
+                },
+            ]
+        )
+
+    def _draw_cross_group_pf1_delta_panel(ax: Any, *, row_label: str = "") -> None:
+        plus_df = df[
+            (df["category"] == "CSplus")
+            & (df["pf_rank"] == 1)
+            & df["all_spike_delta_fr_s2_s1_over_s1"].notna()
+        ].copy()
+        minus_df = df[
+            (df["category"] == "CSminus")
+            & (df["pf_rank"] == 1)
+            & df["all_spike_delta_fr_s2_s1_over_s1"].notna()
+        ].copy()
+
+        positions = {"plus": 0.0, "minus": 1.0}
+        box_color = metric_colors["all_spike"]
+        plus_vals = np.asarray(plus_df["all_spike_delta_fr_s2_s1_over_s1"], dtype=float)
+        minus_vals = np.asarray(minus_df["all_spike_delta_fr_s2_s1_over_s1"], dtype=float)
+        groups = [plus_vals[np.isfinite(plus_vals)], minus_vals[np.isfinite(minus_vals)]]
+        counts = [int(len(g)) for g in groups]
+
+        ax.axvspan(-0.5, 0.5, color="#FFF3E0", alpha=0.3, zorder=0)
+        ax.axvspan(0.5, 1.5, color="#E3F2FD", alpha=0.3, zorder=0)
+
+        bp = ax.boxplot(
+            groups,
+            positions=np.asarray(list(positions.values()), dtype=float),
+            widths=0.5,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "black", "linewidth": 0.7},
+            boxprops={"linewidth": 0.5},
+            whiskerprops={"linewidth": 0.5},
+            capprops={"linewidth": 0.5},
+        )
+        for box in bp["boxes"]:
+            box.set_facecolor(box_color)
+            box.set_alpha(0.25)
+        for x0, vals in zip(positions.values(), groups):
+            if len(vals) == 0:
+                continue
+            xs = _swarm_x(vals, float(x0), width=0.10)
+            ax.scatter(xs, vals, s=8, color=box_color, alpha=0.9, linewidths=0, zorder=2)
+
+        p_val, stat_val, test_name, n_plus, n_minus = _unpaired_test_auto_small_n(plus_vals, minus_vals)
+        vals_all = np.concatenate([g for g in groups if len(g) > 0]) if any(len(g) > 0 for g in groups) else np.array([0.0])
+        y_min = float(np.nanmin(vals_all)) if np.any(np.isfinite(vals_all)) else -1.0
+        y_max = float(np.nanmax(vals_all)) if np.any(np.isfinite(vals_all)) else 1.0
+        span = y_max - y_min
+        if (not np.isfinite(span)) or span <= 0:
+            span = max(abs(y_max), 1.0) * 0.3
+        base = y_max + 0.08 * span
+        h = 0.03 * span
+        _add_sig_bracket(ax, positions["plus"], positions["minus"], base, h, _sig_label(p_val))
+        ax.set_ylim(y_min - 0.08 * span, base + 2 * h + 0.10 * span)
+        ax.axhline(0.0, color="black", linestyle="--", linewidth=0.5, alpha=0.6)
+        if len(row_label) > 0:
+            ax.set_ylabel(f"{row_label}\n(S2-S1)/S1", fontsize=6)
+        else:
+            ax.set_ylabel("(S2-S1)/S1", fontsize=6)
+        ax.set_title("", fontsize=6)
+        ax.set_xticks(np.asarray(list(positions.values()), dtype=float))
+        ax.set_xticklabels(
+            [f"CS+\n(n={counts[0]})", f"CS-\n(n={counts[1]})"],
+            rotation=0,
+            ha="center",
+        )
+        ax.set_xlim(-0.5, 1.5)
+        ax.tick_params(labelsize=5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        print(
+            f"PF1 all-spike ΔFr CS+ vs CS-: n=({n_plus},{n_minus}), "
+            f"test={test_name}, stat={stat_val:.3g}, p={p_val:.3g}, sig={_sig_label(p_val)}"
+        )
+        plot_stats_rows.append(
+            {
+                "category": "cross_group",
+                "panel": "all_spike_delta_fr_pf1_crossgroup",
+                "comparison": "PF1_CSplus_vs_CSminus",
+                "n_a": int(n_plus),
+                "n_b": int(n_minus),
+                "p_value": float(p_val) if np.isfinite(p_val) else np.nan,
+                "statistic": float(stat_val) if np.isfinite(stat_val) else np.nan,
+                "test": str(test_name),
+                "shapiro_p": np.nan,
+            }
+        )
+
+    print("\nPF1/PF2 delta-and-width stats:")
+    fig, axes = plt.subplots(n_rows, 4, figsize=(fig_w, fig_h), sharey=False)
+    axes = np.asarray(axes)
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    row_labels = {"CSplus": "CS+ PLCs", "CSminus": "CS- PLCs"}
+    for row_i, category_name in enumerate(categories_use):
+        sub_df = df[df["category"] == category_name].copy()
+        row_label = row_labels.get(category_name, str(category_name))
+        _draw_two_group_panel(
+            axes[row_i, 0],
+            sub_df,
+            field="all_spike_delta_fr_s2_s1_over_s1",
+            title=("All-spike ΔFr" if row_i == 0 else ""),
+            ylabel="(S2-S1)/S1",
+            zero_line=0.0,
+            row_label=row_label,
+        )
+        _draw_width_panel(
+            axes[row_i, 1],
+            sub_df,
+            prefix="all_spike",
+            title=("All-spike width" if row_i == 0 else ""),
+            row_label="",
+        )
+        _draw_width_panel(
+            axes[row_i, 2],
+            sub_df,
+            prefix="ss",
+            title=("SS width" if row_i == 0 else ""),
+            row_label="",
+        )
+        _draw_width_panel(
+            axes[row_i, 3],
+            sub_df,
+            prefix="cs",
+            title=("CS width" if row_i == 0 else ""),
+            row_label="",
+        )
+
+    if add_cross_group_pf1_row:
+        bottom_row = int(n_rows - 1)
+        _draw_cross_group_pf1_delta_panel(
+            axes[bottom_row, 0],
+            row_label="PF1\nCS+ vs CS-",
+        )
+        _draw_cross_group_pf1_panel(
+            axes[bottom_row, 1],
+            prefix="all_spike",
+            title="",
+            row_label="PF1\nCS+ vs CS-",
+        )
+        _draw_cross_group_pf1_panel(
+            axes[bottom_row, 2],
+            prefix="ss",
+            title="",
+            row_label="",
+        )
+        axes[bottom_row, 3].axis("off")
+
+    fig.tight_layout(pad=0.2)
+    fig.subplots_adjust(wspace=0.32, hspace=0.25)
+    fig.savefig(fig_path, dpi=300)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    if bool(save_csv):
+        df.to_csv(per_cell_csv, index=False)
+        stats_out = stats_df.copy()
+        if len(plot_stats_rows) > 0:
+            stats_out = pd.concat([stats_out, pd.DataFrame(plot_stats_rows)], ignore_index=True)
+        stats_out.to_csv(stats_csv, index=False)
+
+    return {
+        "figure_path": str(fig_path),
+        "per_cell_csv": str(per_cell_csv),
+        "stats_csv": str(stats_csv),
+    }
+
+
+def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
+    stability_results: dict[str, Any],
+    *,
+    figure_save_folder: str | Path | None = None,
+    out_name: str = "pf_distance_centered_abs_norm_fr_change_ss_cs.svg",
+    figsize: tuple[float, float] = (3.0, 6.0),
+    abs_delta_ylabel: str = "|(S2-S1)/(S2+S1)|",
+    ratio_ylabel: str = "S2/S1",
+    pearson_ylabel: str = "Pearson r",
+    spearman_ylabel: str = "Spearman rho",
+    cosine_ylabel: str = "Cosine similarity",
+    add_CSminus: bool = True,
+    compare_CSminus_to_left_groups: bool = True,
+    show_only_significant_pairs: bool = True,
+    show_plot: bool = True,
+    save_csv: bool = True,
+) -> dict[str, Any]:
+    """
+    Plot stacked summary panels from session-stability columns:
+      - peak_abs_sym_diff
+      - peak_ratio_s2_s1
+      - r (Pearson correlation between S1 and S2 average traces)
+      - spearman_r (Spearman rank correlation between S1 and S2 average traces)
+      - cosine_similarity between S1 and S2 average traces
+
+    Each panel shows:
+      - SS PF1 vs CS PF1 (paired, connected lines)
+      - SS PF2 vs CS PF2 (paired, connected lines)
+      - SS PF1 vs SS PF2 (paired test, no connected lines)
+      - CS PF1 vs CS PF2 (paired test, no connected lines)
+      - Optionally CS- PF1 SS values and comparisons against the four CS+ groups
+    """
+    import pandas as pd
+
+    def _paired_test_auto_small_n(vals_a: np.ndarray, vals_b: np.ndarray) -> tuple[float, float, str, int, float]:
+        vals_a = np.asarray(vals_a, dtype=float)
+        vals_b = np.asarray(vals_b, dtype=float)
+        n_pairs = min(len(vals_a), len(vals_b))
+        if n_pairs == 0:
+            return np.nan, np.nan, "n/a", 0, np.nan
+        a = vals_a[:n_pairs]
+        b = vals_b[:n_pairs]
+        valid = np.isfinite(a) & np.isfinite(b)
+        n_valid = int(np.sum(valid))
+        if n_valid < 3:
+            return np.nan, np.nan, "n/a", n_valid, np.nan
+        if n_valid <= 6:
+            try:
+                res = scipy_stats.wilcoxon(a[valid], b[valid])
+                return float(res.pvalue), float(res.statistic), "wilcoxon (n<=6)", n_valid, np.nan
+            except ValueError:
+                return np.nan, np.nan, "wilcoxon (n<=6)", n_valid, np.nan
+        return paired_test_auto(a[valid], b[valid])
+
+    def _unpaired_test_auto_small_n(vals_a: np.ndarray, vals_b: np.ndarray) -> tuple[float, float, str, int, int]:
+        a = np.asarray(vals_a, dtype=float)
+        b = np.asarray(vals_b, dtype=float)
+        a = a[np.isfinite(a)]
+        b = b[np.isfinite(b)]
+        if min(a.size, b.size) < 3:
+            return np.nan, np.nan, "n/a", int(a.size), int(b.size)
+        return unpaired_test_auto(a, b)
+
+    def _should_draw_comparison(p_val: float) -> bool:
+        if not np.isfinite(p_val):
+            return False
+        if bool(show_only_significant_pairs):
+            return bool(float(p_val) < 0.05)
+        return True
+
+    def _swarm_x(y_vals: np.ndarray, center: float, width: float = 0.08) -> np.ndarray:
+        y_vals = np.asarray(y_vals, dtype=float)
+        n = y_vals.size
+        if n == 0:
+            return np.array([], dtype=float)
+        if n == 1:
+            return np.array([center], dtype=float)
+        order = np.argsort(y_vals)
+        x = np.full(n, center, dtype=float)
+        y_span = float(np.nanmax(y_vals) - np.nanmin(y_vals)) if np.any(np.isfinite(y_vals)) else 1.0
+        if (not np.isfinite(y_span)) or y_span <= 0:
+            y_span = 1.0
+        min_dy = 0.03 * y_span
+        step = width / 5.0
+        offsets = [0.0]
+        for k in range(1, 6):
+            offsets.extend([k * step, -k * step])
+        placed: list[tuple[float, float]] = []
+        for idx in order:
+            yi = float(y_vals[idx])
+            chosen = 0.0
+            for off in offsets:
+                xi = center + off
+                clash = False
+                for xj, yj in placed:
+                    if abs(yj - yi) <= min_dy and abs(xj - xi) < (0.95 * step):
+                        clash = True
+                        break
+                if not clash:
+                    chosen = off
+                    break
+            x[idx] = center + chosen
+            placed.append((x[idx], yi))
+        return x
+
+    def _add_sig_bracket(ax: Any, x1: float, x2: float, y: float, h: float, txt: str) -> None:
+        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=0.6, clip_on=False)
         ax.text((x1 + x2) / 2, y + h, txt, ha="center", va="bottom", fontsize=5)
 
     df = stability_results.get("per_cell_stability")
@@ -16278,6 +25789,7 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
     figure_root.mkdir(parents=True, exist_ok=True)
     out_path = figure_root / str(out_name)
 
+    add_csminus_effective = bool(add_CSminus)
     x_pos = {
         "SS PF1": 0.0,
         "CS PF1": 1.0,
@@ -16290,39 +25802,111 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
         "SS PF2": "#026C80",
         "CS PF2": "#EE9B00",
     }
+    if add_csminus_effective:
+        x_pos["CS- PF1"] = 4.35
+        color_map["CS- PF1"] = "#1F77B4"
     labels = list(x_pos.keys())
     positions = [x_pos[k] for k in labels]
-    display_xticklabels = ["SS", "CS", "SS", "CS"]
-    fig, axes = plt.subplots(2, 1, figsize=figsize, sharex=True)
-    axes = np.asarray(axes).reshape(-1)
-
+    display_xticklabels = ["SS", "CS", "SS", "CS"] + (["CS-\nSS\nPF1"] if add_csminus_effective else [])
+    xlim_right = 4.9 if add_csminus_effective else 3.5
     panel_specs = [
         ("peak_abs_sym_diff", str(abs_delta_ylabel)),
         ("peak_ratio_s2_s1", str(ratio_ylabel)),
+        ("r", str(pearson_ylabel)),
+        ("spearman_r", str(spearman_ylabel)),
+        ("cosine_similarity", str(cosine_ylabel)),
     ]
+    fig, axes = plt.subplots(len(panel_specs), 1, figsize=figsize, sharex=True)
+    axes = np.asarray(axes).reshape(-1)
 
     stats_rows: list[dict[str, Any]] = []
     summary_counts: dict[str, dict[str, int]] = {}
+    comparison_names = [
+        "SS_PF1_vs_CS_PF1",
+        "SS_PF2_vs_CS_PF2",
+        "SS_PF1_vs_SS_PF2",
+        "CS_PF1_vs_CS_PF2",
+    ]
+    csminus_comparison_names = [
+        "SS_PF1_vs_CSminus_SS_PF1",
+        "CS_PF1_vs_CSminus_SS_PF1",
+        "SS_PF2_vs_CSminus_SS_PF1",
+        "CS_PF2_vs_CSminus_SS_PF1",
+    ]
+
+    def _empty_counts() -> dict[str, int]:
+        return {
+            "n_ss_pf1_vs_cs_pf1": 0,
+            "n_ss_pf2_vs_cs_pf2": 0,
+            "n_ss_pf1_vs_ss_pf2": 0,
+            "n_cs_pf1_vs_cs_pf2": 0,
+            "n_csminus_pf1": 0,
+        }
+
+    def _append_empty_stats(metric_col: str) -> None:
+        comparisons = list(comparison_names)
+        if bool(add_CSminus) and bool(compare_CSminus_to_left_groups):
+            comparisons.extend(csminus_comparison_names)
+        for comparison in comparisons:
+            stats_rows.append(
+                {
+                    "panel_metric": str(metric_col),
+                    "comparison": comparison,
+                    "n": 0,
+                    "n_group1": 0,
+                    "n_group2": 0,
+                    "p_value": np.nan,
+                    "statistic": np.nan,
+                    "test": "n/a",
+                    "shapiro_p": np.nan,
+                    "comparison_kind": "n/a",
+                    "displayed": False,
+                }
+            )
 
     for panel_i, (metric_col, ylabel_txt) in enumerate(panel_specs):
         ax = axes[panel_i]
         required_groups = {"CSplus_PF1", "CSplus_PF2"}
-        sub = df[
-            (df["metric"].isin(["ss", "cs"]))
-            & (df["group"].isin(list(required_groups)))
-        ][["animal_id", "cell_idx", "metric", "group", metric_col]].copy()
-
         ax.axvspan(-0.5, 1.5, color="#FFB3E6", alpha=0.2, zorder=0)  # light magenta
         ax.axvspan(1.5, 3.5, color="#BFEFFF", alpha=0.2, zorder=0)   # light cyan
+        if add_csminus_effective:
+            ax.axvspan(3.85, xlim_right, color="#E3F2FD", alpha=0.35, zorder=0)
+        if metric_col not in df.columns:
+            message = "No data"
+            if str(metric_col) == "cosine_similarity":
+                message = "No cosine data\nrerun Stability cell"
+            elif str(metric_col) == "spearman_r":
+                message = "No Spearman data\nrerun Stability cell"
+            elif str(metric_col) == "r":
+                message = "No Pearson data\nrerun Stability cell"
+            ax.text(0.5, 0.5, message, transform=ax.transAxes, ha="center", va="center", fontsize=6)
+            ax.set_xlim(-0.5, xlim_right)
+            ax.set_ylabel(ylabel_txt, fontsize=6)
+            ax.tick_params(labelsize=5)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            summary_counts[str(metric_col)] = _empty_counts()
+            _append_empty_stats(str(metric_col))
+            continue
+        groups_for_panel = set(required_groups)
+        metrics_for_panel = {"ss", "cs"}
+        if add_csminus_effective:
+            groups_for_panel.add("CSminus_PF1")
+            metrics_for_panel.add("ss")
+        sub = df[
+            (df["metric"].isin(list(metrics_for_panel)))
+            & (df["group"].isin(list(groups_for_panel)))
+        ][["animal_id", "cell_idx", "metric", "group", metric_col]].copy()
 
         if len(sub) == 0:
             ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center", fontsize=6)
-            summary_counts[str(metric_col)] = {
-                "n_ss_pf1_vs_cs_pf1": 0,
-                "n_ss_pf2_vs_cs_pf2": 0,
-                "n_ss_pf1_vs_ss_pf2": 0,
-                "n_cs_pf1_vs_cs_pf2": 0,
-            }
+            ax.set_xlim(-0.5, xlim_right)
+            ax.set_ylabel(ylabel_txt, fontsize=6)
+            ax.tick_params(labelsize=5)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            summary_counts[str(metric_col)] = _empty_counts()
+            _append_empty_stats(str(metric_col))
             continue
 
         sub["_k"] = sub["metric"].astype(str) + "__" + sub["group"].astype(str)
@@ -16337,7 +25921,11 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
         c_cs_pf1 = "cs__CSplus_PF1"
         c_ss_pf2 = "ss__CSplus_PF2"
         c_cs_pf2 = "cs__CSplus_PF2"
-        for c in [c_ss_pf1, c_cs_pf1, c_ss_pf2, c_cs_pf2]:
+        c_csminus_pf1 = "ss__CSminus_PF1"
+        pivot_cols = [c_ss_pf1, c_cs_pf1, c_ss_pf2, c_cs_pf2]
+        if add_csminus_effective:
+            pivot_cols.append(c_csminus_pf1)
+        for c in pivot_cols:
             if c not in piv.columns:
                 piv[c] = np.nan
 
@@ -16345,6 +25933,7 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
         vals_cs_pf1 = np.asarray(piv[c_cs_pf1], dtype=float)
         vals_ss_pf2 = np.asarray(piv[c_ss_pf2], dtype=float)
         vals_cs_pf2 = np.asarray(piv[c_cs_pf2], dtype=float)
+        vals_csminus_pf1 = np.asarray(piv[c_csminus_pf1], dtype=float) if add_csminus_effective else np.array([], dtype=float)
 
         series = {
             "SS PF1": vals_ss_pf1[np.isfinite(vals_ss_pf1)],
@@ -16352,6 +25941,8 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
             "SS PF2": vals_ss_pf2[np.isfinite(vals_ss_pf2)],
             "CS PF2": vals_cs_pf2[np.isfinite(vals_cs_pf2)],
         }
+        if add_csminus_effective:
+            series["CS- PF1"] = vals_csminus_pf1[np.isfinite(vals_csminus_pf1)]
         box_vals = [series[k] for k in labels]
 
         bp = ax.boxplot(
@@ -16422,6 +26013,86 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
             np.asarray(pair_cs[c_cs_pf2], dtype=float),
         )
 
+        comparison_results: list[dict[str, Any]] = [
+            {
+                "comparison": "SS_PF1_vs_CS_PF1",
+                "comparison_kind": "paired",
+                "x1": x_pos["SS PF1"],
+                "x2": x_pos["CS PF1"],
+                "p_value": p_pf1,
+                "statistic": stat_pf1,
+                "test": test_pf1,
+                "n": n_pf1,
+                "n_group1": n_pf1,
+                "n_group2": n_pf1,
+                "shapiro_p": sh_pf1,
+            },
+            {
+                "comparison": "SS_PF2_vs_CS_PF2",
+                "comparison_kind": "paired",
+                "x1": x_pos["SS PF2"],
+                "x2": x_pos["CS PF2"],
+                "p_value": p_pf2,
+                "statistic": stat_pf2,
+                "test": test_pf2,
+                "n": n_pf2,
+                "n_group1": n_pf2,
+                "n_group2": n_pf2,
+                "shapiro_p": sh_pf2,
+            },
+            {
+                "comparison": "SS_PF1_vs_SS_PF2",
+                "comparison_kind": "paired",
+                "x1": x_pos["SS PF1"],
+                "x2": x_pos["SS PF2"],
+                "p_value": p_ss,
+                "statistic": stat_ss,
+                "test": test_ss,
+                "n": n_ss,
+                "n_group1": n_ss,
+                "n_group2": n_ss,
+                "shapiro_p": sh_ss,
+            },
+            {
+                "comparison": "CS_PF1_vs_CS_PF2",
+                "comparison_kind": "paired",
+                "x1": x_pos["CS PF1"],
+                "x2": x_pos["CS PF2"],
+                "p_value": p_cs,
+                "statistic": stat_cs,
+                "test": test_cs,
+                "n": n_cs,
+                "n_group1": n_cs,
+                "n_group2": n_cs,
+                "shapiro_p": sh_cs,
+            },
+        ]
+        if add_csminus_effective and bool(compare_CSminus_to_left_groups):
+            csminus_vals = series.get("CS- PF1", np.array([], dtype=float))
+            for left_label, comparison_name in [
+                ("SS PF1", "SS_PF1_vs_CSminus_SS_PF1"),
+                ("CS PF1", "CS_PF1_vs_CSminus_SS_PF1"),
+                ("SS PF2", "SS_PF2_vs_CSminus_SS_PF1"),
+                ("CS PF2", "CS_PF2_vs_CSminus_SS_PF1"),
+            ]:
+                left_vals = series.get(left_label, np.array([], dtype=float))
+                p_u, stat_u, test_u, na_u, nb_u = _unpaired_test_auto_small_n(left_vals, csminus_vals)
+                comparison_results.append(
+                    {
+                        "comparison": comparison_name,
+                        "comparison_kind": "unpaired",
+                        "x1": x_pos[left_label],
+                        "x2": x_pos["CS- PF1"],
+                        "p_value": p_u,
+                        "statistic": stat_u,
+                        "test": test_u,
+                        "n": min(int(na_u), int(nb_u)),
+                        "n_group1": int(na_u),
+                        "n_group2": int(nb_u),
+                        "shapiro_p": np.nan,
+                    }
+                )
+
         finite_all = np.concatenate([v for v in box_vals if len(v) > 0]) if any(len(v) > 0 for v in box_vals) else np.array([0.0])
         y_min = float(np.nanmin(finite_all)) if np.any(np.isfinite(finite_all)) else -1.0
         y_max = float(np.nanmax(finite_all)) if np.any(np.isfinite(finite_all)) else 1.0
@@ -16432,34 +26103,52 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
         step = 0.22 * span
         h = 0.03 * span
 
-        _add_sig_bracket(ax, x_pos["SS PF1"], x_pos["CS PF1"], base, h, _sig_label(p_pf1))
-        _add_sig_bracket(ax, x_pos["SS PF2"], x_pos["CS PF2"], base, h, _sig_label(p_pf2))
-        _add_sig_bracket(ax, x_pos["SS PF1"], x_pos["SS PF2"], base + step, h, _sig_label(p_ss))
-        _add_sig_bracket(ax, x_pos["CS PF1"], x_pos["CS PF2"], base + 2 * step, h, _sig_label(p_cs))
+        drawn_comparisons = [row for row in comparison_results if _should_draw_comparison(float(row["p_value"]))]
+        for bracket_i, row in enumerate(drawn_comparisons):
+            _add_sig_bracket(
+                ax,
+                float(row["x1"]),
+                float(row["x2"]),
+                base + bracket_i * step,
+                h,
+                _sig_label(float(row["p_value"])),
+            )
 
-        y_top = base + 2 * step + 2 * h + 0.10 * span
+        n_brackets = max(len(drawn_comparisons), 1)
+        y_top = base + (n_brackets - 1) * step + 2 * h + 0.10 * span
         ax.set_ylim(y_min - 0.08 * span, y_top)
-        ax.set_xlim(-0.5, 3.5)
+        ax.set_xlim(-0.5, xlim_right)
         if str(metric_col) == "peak_ratio_s2_s1":
             ax.axhline(1.0, color="black", linestyle="--", linewidth=0.5, alpha=0.6)
+        elif str(metric_col) in {"r", "spearman_r", "cosine_similarity"}:
+            ax.axhline(0.0, color="black", linestyle="--", linewidth=0.5, alpha=0.6)
         ax.set_ylabel(ylabel_txt, fontsize=6)
         ax.tick_params(labelsize=5)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
-        stats_rows.extend(
-            [
-                {"panel_metric": str(metric_col), "comparison": "SS_PF1_vs_CS_PF1", "n": int(n_pf1), "p_value": float(p_pf1) if np.isfinite(p_pf1) else np.nan, "statistic": float(stat_pf1) if np.isfinite(stat_pf1) else np.nan, "test": str(test_pf1), "shapiro_p": float(sh_pf1) if np.isfinite(sh_pf1) else np.nan},
-                {"panel_metric": str(metric_col), "comparison": "SS_PF2_vs_CS_PF2", "n": int(n_pf2), "p_value": float(p_pf2) if np.isfinite(p_pf2) else np.nan, "statistic": float(stat_pf2) if np.isfinite(stat_pf2) else np.nan, "test": str(test_pf2), "shapiro_p": float(sh_pf2) if np.isfinite(sh_pf2) else np.nan},
-                {"panel_metric": str(metric_col), "comparison": "SS_PF1_vs_SS_PF2", "n": int(n_ss), "p_value": float(p_ss) if np.isfinite(p_ss) else np.nan, "statistic": float(stat_ss) if np.isfinite(stat_ss) else np.nan, "test": str(test_ss), "shapiro_p": float(sh_ss) if np.isfinite(sh_ss) else np.nan},
-                {"panel_metric": str(metric_col), "comparison": "CS_PF1_vs_CS_PF2", "n": int(n_cs), "p_value": float(p_cs) if np.isfinite(p_cs) else np.nan, "statistic": float(stat_cs) if np.isfinite(stat_cs) else np.nan, "test": str(test_cs), "shapiro_p": float(sh_cs) if np.isfinite(sh_cs) else np.nan},
-            ]
-        )
+        for row in comparison_results:
+            stats_rows.append(
+                {
+                    "panel_metric": str(metric_col),
+                    "comparison": str(row["comparison"]),
+                    "n": int(row["n"]),
+                    "n_group1": int(row["n_group1"]),
+                    "n_group2": int(row["n_group2"]),
+                    "p_value": float(row["p_value"]) if np.isfinite(row["p_value"]) else np.nan,
+                    "statistic": float(row["statistic"]) if np.isfinite(row["statistic"]) else np.nan,
+                    "test": str(row["test"]),
+                    "shapiro_p": float(row["shapiro_p"]) if np.isfinite(row["shapiro_p"]) else np.nan,
+                    "comparison_kind": str(row["comparison_kind"]),
+                    "displayed": bool(_should_draw_comparison(float(row["p_value"]))),
+                }
+            )
         summary_counts[str(metric_col)] = {
             "n_ss_pf1_vs_cs_pf1": int(n_pf1),
             "n_ss_pf2_vs_cs_pf2": int(n_pf2),
             "n_ss_pf1_vs_ss_pf2": int(n_ss),
             "n_cs_pf1_vs_cs_pf2": int(n_cs),
+            "n_csminus_pf1": int(series.get("CS- PF1", np.array([], dtype=float)).size),
         }
 
     axes[-1].set_xticks(positions)
@@ -16483,6 +26172,9 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
 
     abs_counts = summary_counts.get("peak_abs_sym_diff", {})
     ratio_counts = summary_counts.get("peak_ratio_s2_s1", {})
+    pearson_counts = summary_counts.get("r", {})
+    spearman_counts = summary_counts.get("spearman_r", {})
+    cosine_counts = summary_counts.get("cosine_similarity", {})
     return {
         "figure": str(out_path),
         "stats_csv": str(stats_csv),
@@ -16494,6 +26186,23 @@ def plot_pf_distance_centered_abs_norm_fr_change_ss_cs(
         "n_ratio_ss_pf2_vs_cs_pf2": int(ratio_counts.get("n_ss_pf2_vs_cs_pf2", 0)),
         "n_ratio_ss_pf1_vs_ss_pf2": int(ratio_counts.get("n_ss_pf1_vs_ss_pf2", 0)),
         "n_ratio_cs_pf1_vs_cs_pf2": int(ratio_counts.get("n_cs_pf1_vs_cs_pf2", 0)),
+        "n_csminus_pf1": int(abs_counts.get("n_csminus_pf1", 0)),
+        "n_ratio_csminus_pf1": int(ratio_counts.get("n_csminus_pf1", 0)),
+        "n_pearson_csminus_pf1": int(pearson_counts.get("n_csminus_pf1", 0)),
+        "n_spearman_csminus_pf1": int(spearman_counts.get("n_csminus_pf1", 0)),
+        "n_cosine_csminus_pf1": int(cosine_counts.get("n_csminus_pf1", 0)),
+        "n_pearson_ss_pf1_vs_cs_pf1": int(pearson_counts.get("n_ss_pf1_vs_cs_pf1", 0)),
+        "n_pearson_ss_pf2_vs_cs_pf2": int(pearson_counts.get("n_ss_pf2_vs_cs_pf2", 0)),
+        "n_pearson_ss_pf1_vs_ss_pf2": int(pearson_counts.get("n_ss_pf1_vs_ss_pf2", 0)),
+        "n_pearson_cs_pf1_vs_cs_pf2": int(pearson_counts.get("n_cs_pf1_vs_cs_pf2", 0)),
+        "n_spearman_ss_pf1_vs_cs_pf1": int(spearman_counts.get("n_ss_pf1_vs_cs_pf1", 0)),
+        "n_spearman_ss_pf2_vs_cs_pf2": int(spearman_counts.get("n_ss_pf2_vs_cs_pf2", 0)),
+        "n_spearman_ss_pf1_vs_ss_pf2": int(spearman_counts.get("n_ss_pf1_vs_ss_pf2", 0)),
+        "n_spearman_cs_pf1_vs_cs_pf2": int(spearman_counts.get("n_cs_pf1_vs_cs_pf2", 0)),
+        "n_cosine_ss_pf1_vs_cs_pf1": int(cosine_counts.get("n_ss_pf1_vs_cs_pf1", 0)),
+        "n_cosine_ss_pf2_vs_cs_pf2": int(cosine_counts.get("n_ss_pf2_vs_cs_pf2", 0)),
+        "n_cosine_ss_pf1_vs_ss_pf2": int(cosine_counts.get("n_ss_pf1_vs_ss_pf2", 0)),
+        "n_cosine_cs_pf1_vs_cs_pf2": int(cosine_counts.get("n_cs_pf1_vs_cs_pf2", 0)),
     }
 
 
@@ -18600,7 +28309,7 @@ def run_pooled_placecell_glm_analysis(
                 continue
 
             if animal_id not in runtime_cache:
-                merged = _load_merged_data(config.data_root / animal_id)
+                merged = _load_merged_data(config.data_root / animal_id, config)
                 runtime_cache[animal_id] = _prepare_native_analysis_context(merged, config)
             ctx = runtime_cache[animal_id]
 
@@ -19392,7 +29101,7 @@ def run_pooled_placecell_ln_model_analysis(
                 continue
 
             if animal_id not in runtime_cache:
-                merged = _load_merged_data(config.data_root / animal_id)
+                merged = _load_merged_data(config.data_root / animal_id, config)
                 runtime_cache[animal_id] = _prepare_native_analysis_context(merged, config)
             ctx = runtime_cache[animal_id]
 
@@ -25505,7 +35214,7 @@ def run_pooled_egocentric_tuning_analysis_old(
                 continue
 
             if animal_id not in runtime_cache:
-                merged = _load_merged_data(config.data_root / animal_id)
+                merged = _load_merged_data(config.data_root / animal_id, config)
                 runtime_cache[animal_id] = {
                     "ctx": _prepare_native_analysis_context(merged, config),
                     "spatial_by_idx": _load_spatial_analysis_by_idx(config.data_root / animal_id),
@@ -25728,7 +35437,7 @@ def run_pooled_egocentric_tuning_analysis(
                         continue
 
                     if animal_id not in runtime_cache:
-                        merged = _load_merged_data(config.data_root / animal_id)
+                        merged = _load_merged_data(config.data_root / animal_id, config)
                         runtime_cache[animal_id] = {
                             "ctx": _prepare_native_analysis_context(merged, config),
                             "spatial_by_idx": _load_spatial_analysis_by_idx(config.data_root / animal_id),
@@ -26246,7 +35955,7 @@ def generate_egocentric_valid_spatial_bin_diagnostic_plots(
                 continue
 
             if animal_id not in runtime_cache:
-                merged = _load_merged_data(config.data_root / animal_id)
+                merged = _load_merged_data(config.data_root / animal_id, config)
                 runtime_cache[animal_id] = {
                     "ctx": _prepare_native_analysis_context(merged, config),
                     "spatial_by_idx": _load_spatial_analysis_by_idx(config.data_root / animal_id),
@@ -31217,7 +40926,7 @@ def generate_egocentric_per_cell_summary_plots(
                 continue
 
             if animal_id not in runtime_cache:
-                merged = _load_merged_data(config.data_root / animal_id)
+                merged = _load_merged_data(config.data_root / animal_id, config)
                 runtime_cache[animal_id] = {
                     "ctx": _prepare_native_analysis_context(merged, config),
                     "spatial_by_idx": _load_spatial_analysis_by_idx(config.data_root / animal_id),

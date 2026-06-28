@@ -15,9 +15,36 @@ from typing import Any
 import numpy as np
 import numpy.ma as ma
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+from scipy.signal import medfilt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+
+def _load_refined_or_merged_data(data_folder, folder):
+    """Load manual refined sidecar data when available, otherwise legacy merged data."""
+    animal_dir = os.path.join(str(data_folder), str(folder))
+    manual_path = os.path.join(animal_dir, "manual_spike_detection_results.pkl")
+    if os.path.exists(manual_path):
+        try:
+            with open(manual_path, "rb") as f:
+                sidecar = pickle.load(f)
+            refined = sidecar.get("refined_analysis_data") if isinstance(sidecar, dict) else None
+            if isinstance(refined, dict):
+                out = dict(refined)
+                out.setdefault("manual_refined_source", True)
+                return out
+        except Exception:
+            pass
+
+    for filename in ("merged_aligned_data_CS.pkl", "merged_aligned_data.pkl"):
+        path = os.path.join(animal_dir, filename)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                loaded = pickle.load(f)
+            return loaded if isinstance(loaded, dict) else None
+    return None
 
 
 def get_deleted_cells(data_folder, folders, snr_threshold=3.5, bad_frac_threshold=0.9):
@@ -29,23 +56,21 @@ def get_deleted_cells(data_folder, folders, snr_threshold=3.5, bad_frac_threshol
     """
     deleted_set = set()
     for folder in folders:
-        merged_path = os.path.join(data_folder, folder, 'merged_aligned_data_CS.pkl')
-        if os.path.exists(merged_path):
-            with open(merged_path, 'rb') as f:
-                merged_data = pickle.load(f)
-            
-            SNR_interpolated = merged_data.get('SNR_interpolated', [])
-            for cell_idx in range(len(SNR_interpolated)):
-                snr_vals = np.asarray(SNR_interpolated[cell_idx])
-                if snr_vals.ndim == 0:
-                    deleted_set.add((folder, cell_idx))
-                    continue
-                
-                bad_mask = snr_vals < snr_threshold
-                bad_frac = np.mean(bad_mask)
-                
-                if bad_frac > bad_frac_threshold:
-                    deleted_set.add((folder, cell_idx))
+        merged_data = _load_refined_or_merged_data(data_folder, folder)
+        if not isinstance(merged_data, dict):
+            continue
+        SNR_interpolated = merged_data.get('SNR_interpolated', [])
+        for cell_idx in range(len(SNR_interpolated)):
+            snr_vals = np.asarray(SNR_interpolated[cell_idx])
+            if snr_vals.ndim == 0:
+                deleted_set.add((folder, cell_idx))
+                continue
+
+            bad_mask = snr_vals < snr_threshold
+            bad_frac = np.mean(bad_mask)
+
+            if bad_frac > bad_frac_threshold:
+                deleted_set.add((folder, cell_idx))
     return deleted_set
 
 
@@ -53,22 +78,19 @@ def get_deleted_cells_with_fallback(data_folder, folders, snr_threshold=3.5, bad
     """Same logic as get_deleted_cells, but supports merged_aligned_data.pkl fallback."""
     deleted_set = set()
     for folder in folders:
-        merged_path = os.path.join(data_folder, folder, 'merged_aligned_data_CS.pkl')
-        if not os.path.exists(merged_path):
-            merged_path = os.path.join(data_folder, folder, 'merged_aligned_data.pkl')
-        if os.path.exists(merged_path):
-            with open(merged_path, 'rb') as f:
-                merged_data = pickle.load(f)
-            SNR_interpolated = merged_data.get('SNR_interpolated', [])
-            for cell_idx in range(len(SNR_interpolated)):
-                snr_vals = np.asarray(SNR_interpolated[cell_idx])
-                if snr_vals.ndim == 0:
-                    deleted_set.add((folder, cell_idx))
-                    continue
-                bad_mask = snr_vals < snr_threshold
-                bad_frac = np.mean(bad_mask)
-                if bad_frac > bad_frac_threshold:
-                    deleted_set.add((folder, cell_idx))
+        merged_data = _load_refined_or_merged_data(data_folder, folder)
+        if not isinstance(merged_data, dict):
+            continue
+        SNR_interpolated = merged_data.get('SNR_interpolated', [])
+        for cell_idx in range(len(SNR_interpolated)):
+            snr_vals = np.asarray(SNR_interpolated[cell_idx])
+            if snr_vals.ndim == 0:
+                deleted_set.add((folder, cell_idx))
+                continue
+            bad_mask = snr_vals < snr_threshold
+            bad_frac = np.mean(bad_mask)
+            if bad_frac > bad_frac_threshold:
+                deleted_set.add((folder, cell_idx))
     return deleted_set
 
 
@@ -89,14 +111,9 @@ def compute_removed_frame_stats_with_fallback(
 
     out = {}
     for folder in folders:
-        merged_path = os.path.join(data_folder, folder, "merged_aligned_data.pkl")
-        if not os.path.exists(merged_path):
-            merged_path = os.path.join(data_folder, folder, "merged_aligned_data_CS.pkl")
-        if not os.path.exists(merged_path):
+        merged_data = _load_refined_or_merged_data(data_folder, folder)
+        if not isinstance(merged_data, dict):
             continue
-
-        with open(merged_path, "rb") as f:
-            merged_data = pickle.load(f)
 
         try:
             bad_masks = _compute_bad_masks(
@@ -190,6 +207,59 @@ class SpatialCategoryData:
     cb_in_pf_counts: dict[tuple[str, int], int]
 
 
+CS_PLC_DEFINITION_LEGACY = "legacy"
+CS_PLC_DEFINITION_CS_PLACE_FIELD = "cs_place_field"
+
+
+def normalize_cs_plc_definition_mode(mode: str | None) -> str:
+    raw = str(mode or CS_PLC_DEFINITION_LEGACY).strip().lower().replace("-", "_")
+    if raw in {"legacy", "current", "cb", "cb_peak", "cb_peak_rate", "cb_in_pf", "cb_in_pf_and_cs_peak"}:
+        return CS_PLC_DEFINITION_LEGACY
+    if raw in {"cs_place_field", "cs_pf", "csfield", "cs_field", "any_cs_place_field", "has_cs_place_field"}:
+        return CS_PLC_DEFINITION_CS_PLACE_FIELD
+    raise ValueError(
+        f"Unknown CS+ PLC definition mode {mode!r}. "
+        "Use 'legacy' or 'cs_place_field'."
+    )
+
+
+def cell_has_cs_place_field(cell: dict[str, Any] | None) -> bool:
+    if not isinstance(cell, dict):
+        return False
+
+    n_fields = cell.get("n_cs_place_fields", cell.get("n_place_fields_cs", None))
+    try:
+        if n_fields is not None and np.isfinite(float(n_fields)) and int(n_fields) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    components = cell.get("cs_place_field_components", None)
+    if isinstance(components, (list, tuple)) and len(components) > 0:
+        return True
+
+    mask = cell.get("cs_place_field_mask", None)
+    if mask is not None:
+        try:
+            mask_arr = np.asarray(mask)
+            if mask_arr.dtype == bool:
+                return bool(np.any(mask_arr))
+            mask_arr = np.asarray(mask, dtype=float)
+            return bool(np.any(np.isfinite(mask_arr) & (mask_arr > 0)))
+        except Exception:
+            return False
+
+    sizes = cell.get("place_field_sizes_cm2_cs", cell.get("cs_pf_sizes", None))
+    if sizes is not None:
+        try:
+            arr = np.asarray(sizes, dtype=float).reshape(-1)
+            return bool(np.any(np.isfinite(arr) & (arr > 0)))
+        except Exception:
+            return False
+
+    return False
+
+
 def is_csplus_place_cell(
     *,
     is_place_cell: bool,
@@ -197,10 +267,18 @@ def is_csplus_place_cell(
     cs_peak_rate: float,
     cb_num_threshold: int = 10,
     cs_peak_rate_threshold: float = 0.5,
+    has_cs_place_field: bool | None = None,
+    cs_plc_definition_mode: str = CS_PLC_DEFINITION_LEGACY,
 ) -> bool:
+    if not bool(is_place_cell):
+        return False
+
+    mode = normalize_cs_plc_definition_mode(cs_plc_definition_mode)
+    if mode == CS_PLC_DEFINITION_CS_PLACE_FIELD:
+        return bool(has_cs_place_field)
+
     return (
-        bool(is_place_cell)
-        and int(n_cb_in_pf) >= int(cb_num_threshold)
+        int(n_cb_in_pf) >= int(cb_num_threshold)
         and np.isfinite(float(cs_peak_rate))
         and float(cs_peak_rate) > float(cs_peak_rate_threshold)
     )
@@ -211,8 +289,10 @@ def classify_spatial_cells(
     folders,
     cb_num_threshold=10,
     cs_peak_rate_threshold=0.5,
+    cs_plc_definition_mode=CS_PLC_DEFINITION_LEGACY,
     snr_threshold=3.5,
     bad_frac_threshold=0.9,
+    min_good_minutes=5.0,
 ):
     deleted_cells = get_deleted_cells_with_fallback(
         data_folder, folders, snr_threshold=snr_threshold, bad_frac_threshold=bad_frac_threshold
@@ -222,7 +302,7 @@ def classify_spatial_cells(
         data_folder,
         folders,
         snr_threshold=snr_threshold,
-        min_good_minutes=5.0,
+        min_good_minutes=min_good_minutes,
     )
 
     all_spatial_cells = load_pooled_spatial_data(data_folder, folders)
@@ -233,13 +313,18 @@ def classify_spatial_cells(
     for cell in valid_spatial_cells:
         n_cb = cb_in_pf_counts.get((cell['session'], cell['cell_idx']), 0)
         cs_peak_rate = cell.get('cs_peak_rate', np.nan)
+        has_cs_pf = cell_has_cs_place_field(cell)
         cell['n_cb_in_pf'] = n_cb
+        cell['has_cs_place_field'] = has_cs_pf
+        cell['cs_plc_definition_mode'] = normalize_cs_plc_definition_mode(cs_plc_definition_mode)
         cell['is_cs_plc'] = is_csplus_place_cell(
             is_place_cell=bool(cell.get('is_place_cell', False)),
             n_cb_in_pf=int(n_cb),
             cs_peak_rate=float(cs_peak_rate),
             cb_num_threshold=int(cb_num_threshold),
             cs_peak_rate_threshold=float(cs_peak_rate_threshold),
+            has_cs_place_field=has_cs_pf,
+            cs_plc_definition_mode=cs_plc_definition_mode,
         )
         rm_stats = removed_stats.get((cell['session'], cell['cell_idx']))
         if isinstance(rm_stats, dict):
@@ -330,6 +415,160 @@ def plot_celltype_distribution_pie(
     return fig, ax
 
 
+def _count_all_place_fields(cell: dict[str, Any] | None) -> int:
+    if not isinstance(cell, dict):
+        return 0
+
+    for key in ("n_place_fields", "n_all_place_fields", "n_place_fields_all"):
+        value = cell.get(key, None)
+        try:
+            if value is not None and np.isfinite(float(value)):
+                return max(0, int(value))
+        except (TypeError, ValueError):
+            pass
+
+    components = cell.get("place_field_components", None)
+    if isinstance(components, (list, tuple)):
+        return int(len(components))
+
+    for key in ("place_field_sizes_cm2", "pf_sizes"):
+        sizes = cell.get(key, None)
+        if isinstance(sizes, (list, tuple, np.ndarray)):
+            try:
+                arr = np.asarray(sizes, dtype=float).reshape(-1)
+                return int(np.sum(np.isfinite(arr) & (arr > 0)))
+            except Exception:
+                pass
+    return 0
+
+
+def plot_multiple_pf_percentage_by_group(
+    plcs_csplus,
+    plcs_csminus,
+    save_path=None,
+    fig_width: float = 1.2,
+    fig_height: float = 1.2,
+):
+    """Plot single- vs multi-PF cell counts for CS+ and CS- place cells."""
+    import pandas as pd
+
+    group_specs = [
+        ("CS+ PLCs", list(plcs_csplus), "#EE9B00"),
+        ("CS- PLCs", list(plcs_csminus), "#1F77B4"),
+    ]
+    rows = []
+    for group_label, cells, _color in group_specs:
+        n_cells = int(len(cells))
+        pf_counts = np.asarray([_count_all_place_fields(c) for c in cells], dtype=int)
+        n_multiple = int(np.sum(pf_counts > 1)) if n_cells > 0 else 0
+        n_single = int(np.sum(pf_counts == 1)) if n_cells > 0 else 0
+        pct_multiple = (100.0 * n_multiple / n_cells) if n_cells > 0 else np.nan
+        pct_single = (100.0 * n_single / n_cells) if n_cells > 0 else np.nan
+        rows.append(
+            {
+                "group": group_label,
+                "n_cells": n_cells,
+                "n_single_pf": n_single,
+                "n_multiple_pf": n_multiple,
+                "pct_single_pf": pct_single,
+                "pct_multiple_pf": pct_multiple,
+            }
+        )
+
+    summary_df = pd.DataFrame(rows)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    x = np.asarray([0.0, 0.72], dtype=float)
+    single_frac = summary_df["pct_single_pf"].to_numpy(dtype=float) / 100.0
+    multiple_frac = summary_df["pct_multiple_pf"].to_numpy(dtype=float) / 100.0
+    single_frac = np.where(np.isfinite(single_frac), single_frac, 0.0)
+    multiple_frac = np.where(np.isfinite(multiple_frac), multiple_frac, 0.0)
+    single_color = "#BDBDBD"
+    multi_color = "#4C78A8"
+    width = 0.64
+    single_bars = ax.bar(
+        x,
+        single_frac,
+        color=single_color,
+        edgecolor="black",
+        linewidth=0.4,
+        width=width,
+        label="1 PF",
+    )
+    multi_bars = ax.bar(
+        x,
+        multiple_frac,
+        bottom=single_frac,
+        color=multi_color,
+        edgecolor="black",
+        linewidth=0.4,
+        width=width,
+        label=">1 PF",
+    )
+
+    y_top = 1.10
+    ax.set_ylim(0, y_top)
+    ax.set_ylabel("Fraction", fontsize=6, fontname="Arial")
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.set_xlim(float(x[0]) - 0.48, float(x[-1]) + 0.48)
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [f"CB+\nN={rows[0]['n_cells']}", f"CB-\nN={rows[1]['n_cells']}"],
+        fontsize=5,
+        fontname="Arial",
+    )
+    ax.tick_params(axis="both", labelsize=5, width=0.5, length=1.75, direction="in")
+    for label in ax.get_yticklabels():
+        label.set_fontname("Arial")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(
+        frameon=False,
+        fontsize=5,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.18),
+        ncol=2,
+        handlelength=0.9,
+        handletextpad=0.35,
+        columnspacing=0.7,
+    )
+
+    for bar, row in zip(single_bars, rows):
+        count = int(row["n_single_pf"])
+        frac = float(row["pct_single_pf"]) / 100.0 if np.isfinite(float(row["pct_single_pf"])) else 0.0
+        if count <= 0:
+            continue
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            frac / 2.0,
+            f"n={count}",
+            ha="center",
+            va="center",
+            fontsize=4.5,
+            fontname="Arial",
+            color="black",
+        )
+    for bar, row in zip(multi_bars, rows):
+        count = int(row["n_multiple_pf"])
+        bottom = float(row["pct_single_pf"]) / 100.0 if np.isfinite(float(row["pct_single_pf"])) else 0.0
+        frac = float(row["pct_multiple_pf"]) / 100.0 if np.isfinite(float(row["pct_multiple_pf"])) else 0.0
+        if count > 0 and frac > 0:
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bottom + frac / 2.0,
+                f"n={count}",
+                ha="center",
+                va="center",
+                fontsize=4.5,
+                fontname="Arial",
+                color="black",
+            )
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=300)
+    return {"fig": fig, "ax": ax, "summary_df": summary_df, "figure_path": str(save_path) if save_path else None}
+
+
 def _extract_cell_event_entry(entries: Any, cell_idx: int) -> dict[str, Any] | None:
     if isinstance(entries, (list, tuple)):
         idx = int(cell_idx)
@@ -383,6 +622,41 @@ def _sanitize_and_merge_intervals(
             merged_starts.append(s_i)
             merged_ends.append(e_i)
     return np.asarray(merged_starts, dtype=int), np.asarray(merged_ends, dtype=int)
+
+
+def _sanitize_individual_intervals(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    n_frames: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Clip/order intervals without merging them, preserving source indices."""
+    starts = np.asarray(starts, dtype=int).ravel()
+    ends = np.asarray(ends, dtype=int).ravel()
+    n = int(min(starts.size, ends.size))
+    if n <= 0:
+        return np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=int)
+
+    starts = starts[:n].copy()
+    ends = ends[:n].copy()
+    source_idx = np.arange(n, dtype=int)
+    swap = ends < starts
+    if np.any(swap):
+        temp = starts.copy()
+        starts[swap] = ends[swap]
+        ends[swap] = temp[swap]
+
+    if int(n_frames) > 0:
+        starts = np.clip(starts, 0, int(n_frames) - 1)
+        ends = np.clip(ends, 0, int(n_frames) - 1)
+    valid = ends >= starts
+    starts = starts[valid]
+    ends = ends[valid]
+    source_idx = source_idx[valid]
+    if starts.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=int)
+
+    order = np.argsort(starts, kind="mergesort")
+    return starts[order], ends[order], source_idx[order]
 
 
 def _build_plateau_intervals_from_merged(
@@ -465,6 +739,7 @@ def _resolve_merged_data_for_cell(
     plateau_data_folder: str | None,
     merged_cache: dict[str, dict[str, Any] | None],
     warned_sessions: set[str],
+    warning_prefix: str = "Plateau map",
 ) -> dict[str, Any] | None:
     session = str(cell.get("session", "")).strip()
     if len(session) == 0:
@@ -473,7 +748,7 @@ def _resolve_merged_data_for_cell(
     data_root = plateau_data_folder if plateau_data_folder is not None else cell.get("data_folder", None)
     if not isinstance(data_root, str) or len(data_root.strip()) == 0:
         if session not in warned_sessions:
-            print(f"Plateau map warning: missing data folder for session '{session}'.")
+            print(f"{warning_prefix} warning: missing data folder for session '{session}'.")
             warned_sessions.add(session)
         return None
 
@@ -481,22 +756,13 @@ def _resolve_merged_data_for_cell(
     if key in merged_cache:
         return merged_cache[key]
 
-    merged_path = os.path.join(data_root, session, "merged_aligned_data.pkl")
-    if not os.path.exists(merged_path):
-        merged_path = os.path.join(data_root, session, "merged_aligned_data_CS.pkl")
-    if not os.path.exists(merged_path):
-        if session not in warned_sessions:
-            print(f"Plateau map warning: missing merged data for session '{session}'.")
-            warned_sessions.add(session)
-        merged_cache[key] = None
-        return None
-
     try:
-        with open(merged_path, "rb") as f:
-            merged = pickle.load(f)
+        merged = _load_refined_or_merged_data(data_root, session)
     except Exception:
+        merged = None
+    if not isinstance(merged, dict):
         if session not in warned_sessions:
-            print(f"Plateau map warning: failed loading merged data for session '{session}'.")
+            print(f"{warning_prefix} warning: missing source data for session '{session}'.")
             warned_sessions.add(session)
         merged_cache[key] = None
         return None
@@ -589,6 +855,852 @@ def _compute_plateau_occurrence_maps_for_cell(
         _accumulate_unique(resting, xi, yi, out_resting)
 
     return {"all": out_all, "moving": out_moving, "resting": out_resting}
+
+
+def _interpolate_nan_1d(values: np.ndarray) -> np.ndarray:
+    """Interpolate NaN/inf runs for movement-state smoothing."""
+    arr = np.asarray(values, dtype=float).reshape(-1).copy()
+    if arr.size == 0:
+        return arr
+    finite = np.isfinite(arr)
+    if np.all(finite):
+        return arr
+    if not np.any(finite):
+        return np.zeros_like(arr, dtype=float)
+    idx = np.arange(arr.size, dtype=float)
+    arr[~finite] = np.interp(idx[~finite], idx[finite], arr[finite])
+    return arr
+
+
+def _moving_mask_from_speed(
+    speed: np.ndarray,
+    frame_rate: float,
+    params: dict[str, Any],
+    *,
+    valid_frames: np.ndarray | None = None,
+) -> np.ndarray:
+    """Recreate the moving-frame mask from cached spatial-analysis parameters."""
+    speed_arr = np.asarray(speed, dtype=float).reshape(-1).copy()
+    n_frames = int(speed_arr.size)
+    if n_frames == 0:
+        return np.zeros(0, dtype=bool)
+
+    frame_rate = float(frame_rate)
+    if (not np.isfinite(frame_rate)) or frame_rate <= 0:
+        frame_rate = 30.0
+
+    speed_max = float(params.get("speed_max", 60.0))
+    if np.isfinite(speed_max) and speed_max > 0:
+        speed_arr[speed_arr > speed_max] = np.nan
+
+    if valid_frames is not None:
+        vf = np.asarray(valid_frames, dtype=bool).reshape(-1)
+        if vf.size == n_frames:
+            speed_arr[~vf] = np.nan
+
+    speed_arr = _interpolate_nan_1d(speed_arr)
+
+    kernel_size = int(params.get("kernel_size", 51))
+    if kernel_size < 1:
+        kernel_size = 1
+    filter_type = str(params.get("filter_type", "boxcar")).strip().lower()
+    if filter_type == "median":
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        speed_smooth = medfilt(speed_arr, kernel_size=kernel_size)
+    elif filter_type == "boxcar":
+        kernel = np.ones(kernel_size, dtype=float) / float(kernel_size)
+        speed_smooth = np.convolve(speed_arr, kernel, mode="same")
+    else:
+        raise ValueError("filter_type must be 'median' or 'boxcar'")
+
+    speed_threshold = float(params.get("speed_threshold", 2.5))
+    moving_raw = speed_smooth > speed_threshold
+    if valid_frames is not None:
+        vf = np.asarray(valid_frames, dtype=bool).reshape(-1)
+        if vf.size == n_frames:
+            moving_raw &= vf
+
+    min_frames = int(round(float(params.get("min_duration_s", 0.25)) * frame_rate))
+    merge_gap = int(round(float(params.get("merge_gap_s", 0.0)) * frame_rate))
+    min_frames = max(1, min_frames)
+    merge_gap = max(0, merge_gap)
+
+    starts = []
+    ends = []
+    in_run = False
+    for idx, is_moving in enumerate(moving_raw):
+        if bool(is_moving) and not in_run:
+            starts.append(idx)
+            in_run = True
+        elif (not bool(is_moving)) and in_run:
+            ends.append(idx - 1)
+            in_run = False
+    if in_run:
+        ends.append(n_frames - 1)
+
+    epochs = [
+        [int(start), int(end)]
+        for start, end in zip(starts, ends)
+        if (int(end) - int(start) + 1) >= min_frames
+    ]
+
+    merged_epochs: list[list[int]] = []
+    for start, end in epochs:
+        if not merged_epochs:
+            merged_epochs.append([start, end])
+            continue
+        prev_start, prev_end = merged_epochs[-1]
+        if (start - prev_end - 1) < merge_gap:
+            merged_epochs[-1][1] = end
+        else:
+            merged_epochs.append([start, end])
+
+    moving_mask = np.zeros(n_frames, dtype=bool)
+    for start, end in merged_epochs:
+        moving_mask[int(start):int(end) + 1] = True
+    return moving_mask
+
+
+def _cb_spatial_edges_for_cell(
+    cell: dict[str, Any],
+    shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    params = cell.get("params", {})
+    width_real = float(params.get("width_real", 35.5))
+    height_real = float(params.get("height_real", 20.0))
+    if (not np.isfinite(width_real)) or width_real <= 0:
+        width_real = 35.5
+    if (not np.isfinite(height_real)) or height_real <= 0:
+        height_real = 20.0
+
+    n_x, n_y = int(shape[0]), int(shape[1])
+    bin_size = float(params.get("bin_size", np.nan))
+    if np.isfinite(bin_size) and bin_size > 0:
+        x_edges = np.arange(0.0, width_real + bin_size, bin_size, dtype=float)
+        y_edges = np.arange(0.0, height_real + bin_size, bin_size, dtype=float)
+        if x_edges.size != n_x + 1:
+            x_edges = np.linspace(0.0, width_real, n_x + 1, dtype=float)
+        if y_edges.size != n_y + 1:
+            y_edges = np.linspace(0.0, height_real, n_y + 1, dtype=float)
+    else:
+        x_edges = np.linspace(0.0, width_real, n_x + 1, dtype=float)
+        y_edges = np.linspace(0.0, height_real, n_y + 1, dtype=float)
+    return x_edges, y_edges, width_real, height_real
+
+
+def _cb_plot_mask_for_cell(
+    cell: dict[str, Any],
+    shape: tuple[int, int],
+    occupancy_map: np.ndarray,
+) -> np.ndarray:
+    rate_map = cell.get("rate_map", None)
+    if rate_map is not None:
+        rate_arr = np.asarray(rate_map, dtype=float)
+        if rate_arr.shape == tuple(shape):
+            return ~np.isfinite(rate_arr)
+
+    occ = np.asarray(occupancy_map, dtype=float)
+    if occ.shape == tuple(shape):
+        return (~np.isfinite(occ)) | (occ <= 0)
+    return np.zeros(shape, dtype=bool)
+
+
+def _cb_event_frames_from_intervals(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    cs_spikes: np.ndarray,
+) -> np.ndarray:
+    cs_spikes = np.asarray(cs_spikes, dtype=int).reshape(-1)
+    cs_spikes = np.sort(cs_spikes[np.isfinite(cs_spikes)])
+    events = np.asarray(starts, dtype=int).reshape(-1).copy()
+    ends = np.asarray(ends, dtype=int).reshape(-1)
+    for idx, (start, end) in enumerate(zip(events, ends)):
+        in_burst = cs_spikes[(cs_spikes >= int(start)) & (cs_spikes <= int(end))]
+        if in_burst.size:
+            events[idx] = int(in_burst[0])
+    return events.astype(int)
+
+
+def _get_cell_frame_events(
+    merged_data: dict[str, Any],
+    key: str,
+    cell_idx: int,
+) -> np.ndarray:
+    entries = merged_data.get(key, [])
+    if isinstance(entries, (list, tuple)):
+        if 0 <= int(cell_idx) < len(entries):
+            return np.asarray(entries[int(cell_idx)], dtype=int).reshape(-1)
+    elif isinstance(entries, np.ndarray):
+        if entries.dtype == object and 0 <= int(cell_idx) < len(entries):
+            return np.asarray(entries[int(cell_idx)], dtype=int).reshape(-1)
+        if entries.ndim == 1:
+            return np.asarray(entries, dtype=int).reshape(-1)
+    return np.array([], dtype=int)
+
+
+def _get_burst_metric_values(
+    cb_entry: dict[str, Any],
+    keys: tuple[str, ...],
+    n_cb: int,
+) -> np.ndarray:
+    for key in keys:
+        if key not in cb_entry:
+            continue
+        vals = np.asarray(cb_entry.get(key, []), dtype=float).reshape(-1)
+        if vals.size >= int(n_cb):
+            return vals[:int(n_cb)].astype(float)
+    return np.full(int(n_cb), np.nan, dtype=float)
+
+
+def _cb_rate_map_from_events(
+    x_events: np.ndarray,
+    y_events: np.ndarray,
+    occupancy_map: np.ndarray,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    shape: tuple[int, int],
+    mask: np.ndarray,
+    smooth_sigma: float,
+) -> np.ndarray:
+    out = np.zeros(shape, dtype=float)
+    out[np.asarray(mask, dtype=bool)] = np.nan
+    if x_events.size == 0:
+        return out
+
+    counts, _, _ = np.histogram2d(x_events, y_events, bins=[x_edges, y_edges])
+    occ = np.asarray(occupancy_map, dtype=float)
+    raw = np.zeros(shape, dtype=float)
+    valid_occ = np.isfinite(occ) & (occ > 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        raw[valid_occ] = counts[valid_occ] / occ[valid_occ]
+    raw[~np.isfinite(raw)] = 0.0
+
+    sigma = float(smooth_sigma)
+    smoothed = gaussian_filter(raw, sigma=sigma, mode="constant") if sigma > 0 else raw
+    smoothed = np.asarray(smoothed, dtype=float)
+    smoothed[np.asarray(mask, dtype=bool)] = np.nan
+    return smoothed
+
+
+def _cb_weighted_mean_map(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    values: np.ndarray,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    shape: tuple[int, int],
+    mask: np.ndarray,
+    smooth_sigma: float,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float).reshape(-1)
+    x_values = np.asarray(x_values, dtype=float).reshape(-1)
+    y_values = np.asarray(y_values, dtype=float).reshape(-1)
+    n = int(min(values.size, x_values.size, y_values.size))
+    out = np.full(shape, np.nan, dtype=float)
+    if n <= 0:
+        return out
+
+    values = values[:n]
+    x_values = x_values[:n]
+    y_values = y_values[:n]
+    finite = np.isfinite(values) & np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(finite):
+        return out
+
+    sum_map, _, _ = np.histogram2d(
+        x_values[finite],
+        y_values[finite],
+        bins=[x_edges, y_edges],
+        weights=values[finite],
+    )
+    count_map, _, _ = np.histogram2d(
+        x_values[finite],
+        y_values[finite],
+        bins=[x_edges, y_edges],
+    )
+
+    sigma = float(smooth_sigma)
+    if sigma > 0:
+        sum_map = gaussian_filter(sum_map, sigma=sigma, mode="constant")
+        count_map = gaussian_filter(count_map, sigma=sigma, mode="constant")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean_map = sum_map / count_map
+    mean_map[~np.isfinite(mean_map)] = np.nan
+    mean_map[count_map <= 0] = np.nan
+    mean_map[np.asarray(mask, dtype=bool)] = np.nan
+    return mean_map
+
+
+def _compute_complex_burst_event_maps_for_cell(
+    cell: dict[str, Any],
+    *,
+    merged_data: dict[str, Any] | None,
+) -> dict[str, np.ndarray | int]:
+    shape = _infer_cell_map_shape(cell)
+    n_x, n_y = int(shape[0]), int(shape[1])
+    blank_rate = np.zeros((n_x, n_y), dtype=float)
+    blank_mean = np.full((n_x, n_y), np.nan, dtype=float)
+
+    occupancy = np.asarray(cell.get("occupancy", np.full(shape, np.nan)), dtype=float)
+    if occupancy.shape != tuple(shape):
+        occupancy = np.full(shape, np.nan, dtype=float)
+    plot_mask = _cb_plot_mask_for_cell(cell, shape, occupancy)
+    blank_rate[plot_mask] = np.nan
+
+    if not isinstance(merged_data, dict):
+        return {
+            "cb_event_rate": blank_rate,
+            "cb_subthreshold": blank_mean.copy(),
+            "cb_amplitude": blank_mean.copy(),
+            "cb_duration": blank_mean.copy(),
+            "n_cb_events": 0,
+            "n_cb_frames": 0,
+        }
+
+    x = np.asarray(merged_data.get("x_neural", []), dtype=float).reshape(-1)
+    y = np.asarray(merged_data.get("y_neural", []), dtype=float).reshape(-1)
+    speed = np.asarray(merged_data.get("speed", np.full_like(x, np.nan)), dtype=float).reshape(-1)
+    n_frames = int(min(x.size, y.size, speed.size))
+    if n_frames <= 0:
+        return {
+            "cb_event_rate": blank_rate,
+            "cb_subthreshold": blank_mean.copy(),
+            "cb_amplitude": blank_mean.copy(),
+            "cb_duration": blank_mean.copy(),
+            "n_cb_events": 0,
+            "n_cb_frames": 0,
+        }
+
+    x = x[:n_frames]
+    y = y[:n_frames]
+    speed = speed[:n_frames]
+    valid_pos = np.isfinite(x) & np.isfinite(y) & np.isfinite(speed)
+
+    params = cell.get("params", {})
+    frame_rate = float(merged_data.get("frame_rate", np.nan))
+    moving_mask = _moving_mask_from_speed(
+        speed,
+        frame_rate=frame_rate,
+        params=params,
+        valid_frames=valid_pos,
+    )
+    if moving_mask.size != n_frames:
+        moving_mask = np.zeros(n_frames, dtype=bool)
+
+    x_edges, y_edges, _, _ = _cb_spatial_edges_for_cell(cell, shape)
+    if not np.any(np.isfinite(occupancy)):
+        occ_counts, _, _ = np.histogram2d(x[moving_mask], y[moving_mask], bins=[x_edges, y_edges])
+        fr = frame_rate if np.isfinite(frame_rate) and frame_rate > 0 else 30.0
+        occ_raw = occ_counts / float(fr)
+        occ_sigma = float(params.get("occ_smooth_sigma", params.get("smooth_sigma", 1.5)))
+        occupancy = gaussian_filter(occ_raw, sigma=occ_sigma, mode="constant") if occ_sigma > 0 else occ_raw
+        plot_mask = _cb_plot_mask_for_cell(cell, shape, occupancy)
+        blank_rate = np.zeros(shape, dtype=float)
+        blank_rate[plot_mask] = np.nan
+
+    cb_entry = _extract_cell_event_entry(
+        merged_data.get("complex_bursts_dicts"),
+        int(cell.get("cell_idx", -1)),
+    )
+    if cb_entry is None:
+        return {
+            "cb_event_rate": blank_rate,
+            "cb_subthreshold": blank_mean.copy(),
+            "cb_amplitude": blank_mean.copy(),
+            "cb_duration": blank_mean.copy(),
+            "n_cb_events": 0,
+            "n_cb_frames": 0,
+        }
+
+    starts_raw = np.asarray(cb_entry.get("starts", []), dtype=int).reshape(-1)
+    ends_raw = np.asarray(cb_entry.get("ends", []), dtype=int).reshape(-1)
+    n_cb_raw = int(min(starts_raw.size, ends_raw.size))
+    if n_cb_raw <= 0:
+        return {
+            "cb_event_rate": blank_rate,
+            "cb_subthreshold": blank_mean.copy(),
+            "cb_amplitude": blank_mean.copy(),
+            "cb_duration": blank_mean.copy(),
+            "n_cb_events": 0,
+            "n_cb_frames": 0,
+        }
+
+    starts, ends, source_idx = _sanitize_individual_intervals(
+        starts_raw[:n_cb_raw],
+        ends_raw[:n_cb_raw],
+        n_frames,
+    )
+    n_cb = int(min(starts.size, ends.size))
+    if n_cb <= 0:
+        return {
+            "cb_event_rate": blank_rate,
+            "cb_subthreshold": blank_mean.copy(),
+            "cb_amplitude": blank_mean.copy(),
+            "cb_duration": blank_mean.copy(),
+            "n_cb_events": 0,
+            "n_cb_frames": 0,
+        }
+
+    cell_idx = int(cell.get("cell_idx", -1))
+    cs_spikes = _get_cell_frame_events(merged_data, "all_CS_spikes", cell_idx)
+    event_frames = _cb_event_frames_from_intervals(starts, ends, cs_spikes)
+    event_valid = (
+        (event_frames >= 0)
+        & (event_frames < n_frames)
+        & moving_mask[event_frames]
+        & np.isfinite(x[event_frames])
+        & np.isfinite(y[event_frames])
+    )
+    event_frames_valid = event_frames[event_valid]
+
+    smooth_sigma = float(params.get("smooth_sigma", 1.5))
+    event_rate_map = _cb_rate_map_from_events(
+        x[event_frames_valid],
+        y[event_frames_valid],
+        occupancy,
+        x_edges,
+        y_edges,
+        shape,
+        plot_mask,
+        smooth_sigma,
+    )
+
+    amp_values_raw = _get_burst_metric_values(
+        cb_entry,
+        ("amplitudes", "peak_amp", "peak_amps", "peak_amplitudes"),
+        int(n_cb_raw),
+    )
+    duration_values_raw = _get_burst_metric_values(
+        cb_entry,
+        ("durations_ms", "duration_ms", "durations"),
+        int(n_cb_raw),
+    )
+    amp_values = amp_values_raw[source_idx] if amp_values_raw.size >= n_cb_raw else np.full(n_cb, np.nan)
+    duration_values = (
+        duration_values_raw[source_idx]
+        if duration_values_raw.size >= n_cb_raw
+        else np.full(n_cb, np.nan)
+    )
+    if not np.any(np.isfinite(duration_values)):
+        fr = frame_rate if np.isfinite(frame_rate) and frame_rate > 0 else np.nan
+        if np.isfinite(fr):
+            duration_values = (ends - starts + 1).astype(float) / float(fr) * 1000.0
+
+    amplitude_map = _cb_weighted_mean_map(
+        x[event_frames[event_valid]],
+        y[event_frames[event_valid]],
+        amp_values[event_valid],
+        x_edges,
+        y_edges,
+        shape,
+        plot_mask,
+        smooth_sigma,
+    )
+    duration_map = _cb_weighted_mean_map(
+        x[event_frames[event_valid]],
+        y[event_frames[event_valid]],
+        duration_values[event_valid],
+        x_edges,
+        y_edges,
+        shape,
+        plot_mask,
+        smooth_sigma,
+    )
+
+    trace = np.asarray(cb_entry.get("trace_bl_subtracted", []), dtype=float).reshape(-1)
+    if trace.size != n_frames:
+        trace = np.full(n_frames, np.nan, dtype=float)
+    frame_valid = moving_mask & valid_pos & np.isfinite(trace)
+    subthreshold_map = _cb_weighted_mean_map(
+        x[frame_valid],
+        y[frame_valid],
+        trace[frame_valid],
+        x_edges,
+        y_edges,
+        shape,
+        plot_mask,
+        smooth_sigma,
+    )
+
+    return {
+        "cb_event_rate": event_rate_map,
+        "cb_subthreshold": subthreshold_map,
+        "cb_amplitude": amplitude_map,
+        "cb_duration": duration_map,
+        "n_cb_events": int(np.sum(event_valid)),
+        "n_cb_frames": int(np.sum(frame_valid)),
+    }
+
+
+def _auto_vlim_for_cb_maps(
+    maps: list[np.ndarray],
+    *,
+    symmetric: bool,
+    fallback: tuple[float, float],
+) -> tuple[float, float]:
+    finite_values = []
+    for arr in maps:
+        arr_np = np.asarray(arr, dtype=float)
+        vals = arr_np[np.isfinite(arr_np)]
+        if vals.size:
+            finite_values.append(vals)
+    if not finite_values:
+        return fallback
+    vals_all = np.concatenate(finite_values)
+    if symmetric:
+        abs_max = float(np.nanmax(np.abs(vals_all)))
+        if (not np.isfinite(abs_max)) or abs_max <= 0:
+            abs_max = float(fallback[1]) if fallback[1] > 0 else 1.0
+        return -abs_max, abs_max
+    vmax = float(np.nanmax(vals_all))
+    if (not np.isfinite(vmax)) or vmax <= 0:
+        vmax = float(fallback[1]) if fallback[1] > 0 else 1.0
+    return 0.0, vmax
+
+
+def plot_complex_burst_event_heatmaps(
+    cell_groups,
+    group_names=None,
+    subplot_width=0.25,
+    gap_ratio=0.1,
+    save_path=None,
+    cb_event_rate_vlim=None,
+    cb_subthreshold_vlim=None,
+    cb_amplitude_vlim=None,
+    cb_duration_vlim=None,
+    plot_pf_contours=True,
+    pf_contour_color="magenta",
+    pf_contour_linewidth=0.45,
+    data_folder=None,
+    show=True,
+):
+    """Plot CB-event-only spatial heatmaps for grouped PLC cells.
+
+    The four rows are CB event rate, full-trace baseline-subtracted Vm,
+    per-burst amplitude, and per-burst duration. CB event position uses the
+    first CS spike inside each complex burst interval, falling back to the burst
+    start frame when no CS spike is recorded in the interval. The CB event-rate
+    row is displayed as a per-cell 0-1 normalized map, with the raw max rate
+    written under each panel.
+    """
+    from matplotlib.gridspec import GridSpec
+
+    if len(cell_groups) > 0 and isinstance(cell_groups[0], dict):
+        cell_groups = [cell_groups]
+
+    if group_names is None:
+        group_names = [f"Group {idx + 1}" for idx in range(len(cell_groups))]
+
+    indexed_groups = [
+        (idx, list(group))
+        for idx, group in enumerate(cell_groups)
+        if len(group) > 0
+    ]
+    if len(indexed_groups) == 0:
+        print("No cells to plot!")
+        return None
+
+    display_group_names = [
+        str(group_names[idx]) if idx < len(group_names) else f"Group {idx + 1}"
+        for idx, _group in indexed_groups
+    ]
+    cell_groups = [group for _idx, group in indexed_groups]
+    cells_per_group = [len(group) for group in cell_groups]
+    total_cells = int(sum(cells_per_group))
+    all_cells = [cell for group in cell_groups for cell in group]
+
+    width_ratios = []
+    col_to_cell = {}
+    group_col_spans = []
+    flat_idx = 0
+    col_idx = 0
+    for group_idx, n_cells in enumerate(cells_per_group):
+        group_start_col = col_idx
+        for _ in range(n_cells):
+            width_ratios.append(1.0)
+            col_to_cell[col_idx] = flat_idx
+            flat_idx += 1
+            col_idx += 1
+        group_col_spans.append((group_start_col, col_idx - 1))
+        if group_idx < len(cells_per_group) - 1:
+            width_ratios.append(float(gap_ratio))
+            col_idx += 1
+
+    n_cols = int(len(width_ratios))
+    n_rows = 4
+    data_cols = sorted(col_to_cell.keys())
+    first_data_col = data_cols[0]
+    last_data_col = data_cols[-1]
+
+    params = all_cells[0].get("params", {})
+    width_real = float(params.get("width_real", 35.5))
+    height_real = float(params.get("height_real", 20.0))
+    if (not np.isfinite(width_real)) or width_real <= 0:
+        width_real = 35.5
+    if (not np.isfinite(height_real)) or height_real <= 0:
+        height_real = 20.0
+    arena_aspect = height_real / width_real
+    extent = (0.0, width_real, 0.0, height_real)
+
+    left_margin = 0.55
+    right_margin = 0.35
+    top_margin = 0.35
+    bottom_margin = 0.12
+    row_gap = 0.1
+    cell_width = float(subplot_width)
+    cell_height = cell_width * arena_aspect
+    fig_width = left_margin + right_margin + float(sum(width_ratios)) * cell_width
+    fig_height = n_rows * cell_height + (n_rows - 1) * row_gap + top_margin + bottom_margin
+
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    gs = GridSpec(
+        n_rows,
+        n_cols,
+        figure=fig,
+        width_ratios=width_ratios,
+        left=left_margin / fig_width,
+        right=1 - right_margin / fig_width,
+        top=1 - top_margin / fig_height,
+        bottom=bottom_margin / fig_height,
+        wspace=0.05,
+        hspace=0.15,
+    )
+
+    axes_grid = {
+        (row, col): fig.add_subplot(gs[row, col])
+        for row in range(n_rows)
+        for col in data_cols
+    }
+
+    def _style_map_axis(ax):
+        ax.set_xlim(0, width_real)
+        ax.set_ylim(0, height_real)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    def _plot_pf_contour(ax, pf_mask, color, linewidth=0.45, linestyle="solid", alpha=0.8):
+        if pf_mask is None:
+            return
+        pf_arr = np.asarray(pf_mask)
+        if pf_arr.ndim != 2 or not np.any(pf_arr):
+            return
+        padded_mask = np.pad(pf_arr.astype(float), pad_width=1, mode="constant", constant_values=0)
+        bin_size = width_real / float(pf_arr.shape[0])
+        padded_extent = (-bin_size, width_real + bin_size, -bin_size, height_real + bin_size)
+        ax.contour(
+            padded_mask.T,
+            levels=[0.5],
+            colors=color,
+            linewidths=linewidth,
+            linestyles=linestyle,
+            extent=padded_extent,
+            origin="lower",
+            alpha=alpha,
+        )
+
+    def _add_colorbar(ax, im, ticks=None, ticklabels=None):
+        cax = inset_axes(
+            ax,
+            width="10%",
+            height="100%",
+            loc="center right",
+            bbox_to_anchor=(0.12, 0.0, 1, 1),
+            bbox_transform=ax.transAxes,
+            borderpad=0,
+        )
+        cbar = ax.figure.colorbar(im, cax=cax)
+        if ticks is not None:
+            cbar.set_ticks(ticks)
+        if ticklabels is not None:
+            cbar.set_ticklabels(ticklabels)
+        cbar.ax.yaxis.set_ticks_position("right")
+        cbar.ax.yaxis.set_label_position("right")
+        cbar.ax.tick_params(
+            labelsize=5,
+            width=0.4,
+            direction="out",
+            right=True,
+            left=False,
+            labelright=True,
+            labelleft=False,
+        )
+        return cbar
+
+    merged_cache: dict[str, dict[str, Any] | None] = {}
+    warned_sessions: set[str] = set()
+    maps_by_cell: dict[int, dict[str, np.ndarray | int]] = {}
+    for flat_idx, cell in enumerate(all_cells):
+        merged_data = _resolve_merged_data_for_cell(
+            cell,
+            plateau_data_folder=os.path.abspath(str(data_folder)) if data_folder is not None else None,
+            merged_cache=merged_cache,
+            warned_sessions=warned_sessions,
+            warning_prefix="CB heatmap",
+        )
+        maps_by_cell[flat_idx] = _compute_complex_burst_event_maps_for_cell(
+            cell,
+            merged_data=merged_data,
+        )
+
+    row_specs = [
+        {
+            "key": "cb_event_rate",
+            "label": "CB event rate",
+            "cmap": "magma",
+            "vlim": cb_event_rate_vlim,
+            "symmetric": False,
+            "fallback": (0.0, 1.0),
+        },
+        {
+            "key": "cb_subthreshold",
+            "label": "Subthreshold Vm",
+            "cmap": "coolwarm",
+            "vlim": cb_subthreshold_vlim,
+            "symmetric": True,
+            "fallback": (-1.0, 1.0),
+        },
+        {
+            "key": "cb_amplitude",
+            "label": "CB amplitude",
+            "cmap": "magma",
+            "vlim": cb_amplitude_vlim,
+            "symmetric": False,
+            "fallback": (0.0, 1.0),
+        },
+        {
+            "key": "cb_duration",
+            "label": "CB duration",
+            "cmap": "magma",
+            "vlim": cb_duration_vlim,
+            "symmetric": False,
+            "fallback": (0.0, 1.0),
+        },
+    ]
+
+    row_vlims: dict[str, tuple[float, float]] = {}
+    for spec in row_specs:
+        if spec["vlim"] is not None:
+            vmin, vmax = spec["vlim"]
+            row_vlims[str(spec["key"])] = (float(vmin), float(vmax))
+        elif str(spec["key"]) == "cb_event_rate":
+            row_vlims[str(spec["key"])] = (0.0, 1.0)
+        else:
+            row_maps = [
+                np.asarray(maps_by_cell[idx][str(spec["key"])], dtype=float)
+                for idx in range(total_cells)
+            ]
+            row_vlims[str(spec["key"])] = _auto_vlim_for_cb_maps(
+                row_maps,
+                symmetric=bool(spec["symmetric"]),
+                fallback=spec["fallback"],
+            )
+
+    for display_col, flat_idx in col_to_cell.items():
+        cell = all_cells[flat_idx]
+        animal_id = str(cell.get("animal_id", ""))
+        animal_short = animal_id.split("_")[1] if "_" in animal_id else animal_id
+        cell_num = int(cell.get("cell_idx", -1)) + 1
+        cell_maps = maps_by_cell[flat_idx]
+        is_last_column = display_col == last_data_col
+
+        for row_idx, spec in enumerate(row_specs):
+            key = str(spec["key"])
+            ax = axes_grid[(row_idx, display_col)]
+            arr = np.asarray(cell_maps[key], dtype=float)
+            raw_max = np.nan
+            if key == "cb_event_rate":
+                finite_rate = arr[np.isfinite(arr)]
+                if finite_rate.size:
+                    raw_max = float(np.nanmax(finite_rate))
+                if np.isfinite(raw_max) and raw_max > 0:
+                    arr_to_plot = arr / raw_max
+                else:
+                    arr_to_plot = arr.copy()
+            else:
+                arr_to_plot = arr
+            masked = ma.masked_where(~np.isfinite(arr_to_plot), arr_to_plot)
+            vmin, vmax = row_vlims[key]
+            im = ax.imshow(
+                masked.T,
+                origin="lower",
+                extent=extent,
+                cmap=str(spec["cmap"]),
+                interpolation="nearest",
+                vmin=vmin,
+                vmax=vmax,
+            )
+            if plot_pf_contours:
+                _plot_pf_contour(
+                    ax,
+                    cell.get("place_field_mask", None),
+                    pf_contour_color,
+                    linewidth=float(pf_contour_linewidth),
+                    linestyle="solid",
+                    alpha=0.75,
+                )
+            _style_map_axis(ax)
+            if row_idx == 0:
+                ax.set_title(f"{animal_short}\nCell {cell_num}", fontsize=5, fontname="Arial", pad=2)
+                max_label = f"{raw_max:.2g}" if np.isfinite(raw_max) else "N/A"
+                ax.text(
+                    1.0,
+                    -0.03,
+                    max_label,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=4,
+                    fontname="Arial",
+                )
+            if is_last_column:
+                if bool(spec["symmetric"]):
+                    _add_colorbar(ax, im, ticks=[vmin, 0.0, vmax], ticklabels=["min", "0", "max"])
+                elif key == "cb_event_rate":
+                    _add_colorbar(ax, im, ticks=[vmin, vmax], ticklabels=["0", "1"])
+                else:
+                    _add_colorbar(ax, im, ticks=[vmin, vmax], ticklabels=["0", "max"])
+
+    for row_idx, spec in enumerate(row_specs):
+        axes_grid[(row_idx, first_data_col)].text(
+            -0.18,
+            0.5,
+            str(spec["label"]),
+            transform=axes_grid[(row_idx, first_data_col)].transAxes,
+            ha="right",
+            va="center",
+            fontsize=5,
+            fontname="Arial",
+            rotation=90,
+        )
+
+    for group_name, (start_col, end_col) in zip(display_group_names, group_col_spans):
+        if start_col not in col_to_cell or end_col not in col_to_cell:
+            continue
+        pos0 = axes_grid[(0, start_col)].get_position()
+        pos1 = axes_grid[(0, end_col)].get_position()
+        fig.text(
+            (pos0.x0 + pos1.x1) / 2.0,
+            pos0.y1 + 0.012,
+            str(group_name),
+            ha="center",
+            va="bottom",
+            fontsize=6,
+            fontname="Arial",
+        )
+
+    if save_path:
+        plt.rcParams["svg.fonttype"] = "none"
+        fig.savefig(save_path, dpi=300)
+        print(f"Saved: {save_path}")
+
+    if show:
+        plt.show()
+    return fig
 
 
 def plot_selected_cells_figure(
@@ -945,8 +2057,11 @@ def plot_selected_cells_figure(
             traces_for_cell: list[tuple[np.ndarray, np.ndarray]] = []
             if isinstance(merged_data, dict):
                 src = merged_data.get(
-                    "traces_SNR_interpolated",
-                    merged_data.get("traces", []),
+                    "plateau_traces_normalized",
+                    merged_data.get(
+                        "traces_SNR_interpolated",
+                        merged_data.get("traces", []),
+                    ),
                 )
                 ci = int(cell.get("cell_idx", -1))
                 trace = np.array([], dtype=float)
@@ -1790,6 +2905,1030 @@ def plot_selected_cells_figure(
         fig.savefig(save_path, dpi=300)
         print(f"Saved: {save_path}")
     
+    plt.show()
+    return fig
+
+
+def plot_selected_cells_transposed_figure(
+    cell_groups,
+    group_names=None,
+    subplot_width=0.25,
+    gap_ratio=0.1,
+    figsize=None,
+    wspace=0.05,
+    hspace=0.15,
+    trailing_col_width_ratio=0.5,
+    theta_vlim=None,
+    slow_vlim=None,
+    save_path=None,
+    show_scale_bar=True,
+    pf_only_place_cells=True,
+    plot_putative_PF=False,
+    show_place_cell_star=True,
+    show_significance_marker=True,
+    show_theta_slow_corr_text=False,
+    plot_spike_shapes=True,
+    plot_spike_shapes_overall=True,
+    min_shapes_per_condition=None,
+    min_shapes_per_condition_ss=5,
+    min_shapes_per_condition_cb=3,
+    spike_shape_state='run',
+    show_shape_counts=False,
+    shape_ylim=None,
+    print_removed_frames=True,
+    include_plateau=True,
+    plateau_state_mode='split',
+    plateau_include_long_cb_as_plateau=True,
+    plateau_cb_min_duration_ms=200.0,
+    plateau_speed_threshold=3.0,
+    plateau_data_folder=None,
+    trajectory_spike_size=0.5,
+    trajectory_spike_alpha=0.4,
+):
+    """Plot selected-cell spatial heatmaps with cells as rows and panels as columns.
+
+    ``trajectory_spike_size`` is the Matplotlib scatter marker area for SS/CB
+    spikes in the trajectory column. ``trajectory_spike_alpha`` controls their
+    opacity.
+    """
+    from matplotlib.gridspec import GridSpec
+
+    if len(cell_groups) > 0 and isinstance(cell_groups[0], dict):
+        cell_groups = [cell_groups]
+
+    n_groups = len(cell_groups)
+    cells_per_group = [len(g) for g in cell_groups]
+    total_cells = sum(cells_per_group)
+    if total_cells == 0:
+        print("No cells to plot!")
+        return None
+
+    if group_names is None:
+        group_names = [f"Group {idx + 1}" for idx in range(n_groups)]
+
+    all_cells = []
+    group_start_flat_idxs = []
+    for group in cell_groups:
+        group_start_flat_idxs.append(len(all_cells))
+        all_cells.extend(group)
+
+    if min_shapes_per_condition is not None:
+        min_shapes_per_condition_ss = int(min_shapes_per_condition)
+        min_shapes_per_condition_cb = int(min_shapes_per_condition)
+    min_shapes_per_condition_ss = int(min_shapes_per_condition_ss)
+    min_shapes_per_condition_cb = int(min_shapes_per_condition_cb)
+
+    include_plateau = bool(include_plateau)
+    plateau_state_mode = str(plateau_state_mode).strip().lower()
+    valid_plateau_modes = {'split', 'all', 'moving', 'resting'}
+    if plateau_state_mode not in valid_plateau_modes:
+        raise ValueError(
+            "plateau_state_mode must be one of {'split', 'all', 'moving', 'resting'}."
+        )
+    if (not np.isfinite(float(plateau_cb_min_duration_ms))) or float(plateau_cb_min_duration_ms) <= 0:
+        raise ValueError("plateau_cb_min_duration_ms must be a finite number > 0.")
+    if not np.isfinite(float(plateau_speed_threshold)):
+        raise ValueError("plateau_speed_threshold must be a finite number.")
+    if plateau_data_folder is not None:
+        plateau_data_folder = os.path.abspath(str(plateau_data_folder))
+    trajectory_spike_size = float(trajectory_spike_size)
+    if (not np.isfinite(trajectory_spike_size)) or trajectory_spike_size < 0:
+        raise ValueError("trajectory_spike_size must be a finite number >= 0.")
+    trajectory_spike_alpha = float(trajectory_spike_alpha)
+    if (
+        (not np.isfinite(trajectory_spike_alpha))
+        or trajectory_spike_alpha < 0
+        or trajectory_spike_alpha > 1
+    ):
+        raise ValueError("trajectory_spike_alpha must be a finite number between 0 and 1.")
+
+    plot_spike_shapes_overall = bool(plot_spike_shapes_overall)
+    if not bool(plot_spike_shapes):
+        plot_spike_shapes_overall = False
+
+    plateau_col_modes: list[tuple[str, str]] = []
+    if include_plateau:
+        if plateau_state_mode == 'split':
+            plateau_col_modes = [('moving', 'Plateau (moving)'), ('resting', 'Plateau (resting)')]
+        elif plateau_state_mode == 'all':
+            plateau_col_modes = [('all', 'Plateau')]
+        elif plateau_state_mode == 'moving':
+            plateau_col_modes = [('moving', 'Plateau')]
+        else:
+            plateau_col_modes = [('resting', 'Plateau')]
+
+    col_labels = ['Trajectory', 'All spikes', 'SS', 'CS', 'Theta', 'Slow Vm']
+    for _, label in plateau_col_modes:
+        col_labels.append(label)
+    if plot_spike_shapes:
+        if plot_spike_shapes_overall:
+            col_labels.extend(['SS shape', 'CB shape'])
+        else:
+            col_labels.extend(['In-PF shapes', 'Out-PF shapes'])
+    plot_plateau_shapes = bool(include_plateau and plot_spike_shapes)
+    if plot_plateau_shapes:
+        col_labels.append('All plateaus')
+
+    n_cols = len(col_labels)
+    trajectory_col = 0
+    rate_col = 1
+    ss_col = 2
+    cs_col = 3
+    theta_col = 4
+    slow_col = 5
+    plateau_col_by_mode = {
+        mode: 6 + idx for idx, (mode, _) in enumerate(plateau_col_modes)
+    }
+    shape_col_top = 6 + len(plateau_col_modes)
+    shape_col_bottom = shape_col_top + 1
+    plateau_shape_col = shape_col_top + (2 if plot_spike_shapes else 0)
+
+    row_ratios = []
+    row_to_cell = {}
+    flat_idx = 0
+    grid_row = 0
+    for group_idx, n_cells in enumerate(cells_per_group):
+        for _ in range(n_cells):
+            row_ratios.append(1.0)
+            row_to_cell[grid_row] = flat_idx
+            flat_idx += 1
+            grid_row += 1
+        if group_idx < n_groups - 1:
+            row_ratios.append(float(gap_ratio))
+            grid_row += 1
+    data_grid_rows = list(row_to_cell.keys())
+    first_data_row = data_grid_rows[0]
+    legend_grid_row = len(row_ratios)
+
+    params = all_cells[0]['params']
+    width_real = params['width_real']
+    height_real = params['height_real']
+    arena_aspect = height_real / width_real
+
+    left_margin = 0.75
+    right_margin = 0.2
+    top_margin = 0.35
+    bottom_margin = 0.35
+    legend_height = 0.24
+    cell_width = float(subplot_width)
+    cell_height = cell_width * arena_aspect
+    trailing_col_width_ratio = float(trailing_col_width_ratio)
+    if not np.isfinite(trailing_col_width_ratio) or trailing_col_width_ratio <= 0:
+        raise ValueError("trailing_col_width_ratio must be a finite number > 0.")
+    width_ratios = [1.0] * n_cols
+    if n_cols >= 3:
+        width_ratios[-3:] = [trailing_col_width_ratio] * 3
+    if figsize is None:
+        fig_width = left_margin + right_margin + float(sum(width_ratios)) * cell_width
+        fig_height = top_margin + bottom_margin + sum(row_ratios) * cell_height + legend_height
+        figsize = (fig_width, fig_height)
+    else:
+        fig_width, fig_height = float(figsize[0]), float(figsize[1])
+
+    legend_ratio = max(0.25, legend_height / cell_height) if cell_height > 0 else 0.5
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(
+        len(row_ratios) + 1,
+        n_cols,
+        figure=fig,
+        width_ratios=width_ratios,
+        height_ratios=row_ratios + [legend_ratio],
+        left=left_margin / fig_width,
+        right=1 - right_margin / fig_width,
+        top=1 - top_margin / fig_height,
+        bottom=bottom_margin / fig_height,
+        wspace=float(wspace),
+        hspace=float(hspace),
+    )
+
+    axes_grid = {
+        (row, col): fig.add_subplot(gs[row, col])
+        for row in data_grid_rows
+        for col in range(n_cols)
+    }
+    legend_axes = {
+        col: fig.add_subplot(gs[legend_grid_row, col])
+        for col in range(n_cols)
+    }
+    for ax in legend_axes.values():
+        ax.set_axis_off()
+
+    cmap = 'magma'
+    slow_cmap = 'coolwarm'
+    extent = (0, width_real, 0, height_real)
+    simple_spike_color = "#026C80"
+    complex_spike_color = "#EE9B00"
+    ss_contour_color = "#026C80"
+
+    def _style_map_axis(ax):
+        ax.set_xlim(0, width_real)
+        ax.set_ylim(0, height_real)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    def _style_shape_axis(ax, xlim=None, ylim=None):
+        ax.set_facecolor('white')
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    def _plot_pf_contour(ax, pf_mask, color, linewidth=0.6, linestyle='solid', alpha=1.0):
+        if pf_mask is None or not np.any(pf_mask):
+            return
+        padded_mask = np.pad(pf_mask.astype(float), pad_width=1, mode='constant', constant_values=0)
+        bin_size = width_real / pf_mask.shape[0]
+        padded_extent = (-bin_size, width_real + bin_size, -bin_size, height_real + bin_size)
+        ax.contour(
+            padded_mask.T,
+            levels=[0.5],
+            colors=color,
+            linewidths=linewidth,
+            linestyles=linestyle,
+            extent=padded_extent,
+            origin="lower",
+            alpha=alpha,
+        )
+
+    def _get_sig_marker(p_val):
+        if p_val < 0.001:
+            return "***"
+        if p_val < 0.01:
+            return "**"
+        if p_val < 0.05:
+            return "*"
+        return ""
+
+    def _animal_short(cell):
+        animal_id = str(cell.get('animal_id', ''))
+        return animal_id.split('_')[1] if '_' in animal_id else animal_id
+
+    cbar_specs = {}
+
+    def _remember_cbar(col, im, ticks=None, ticklabels=None):
+        if im is not None and col not in cbar_specs:
+            cbar_specs[col] = (im, ticks, ticklabels)
+
+    plateau_maps_by_cell: dict[int, dict[str, np.ndarray]] = {}
+    merged_data_by_cell: dict[int, dict[str, Any] | None] = {}
+    if include_plateau:
+        merged_cache: dict[str, dict[str, Any] | None] = {}
+        warned_sessions: set[str] = set()
+        for flat_idx, cell in enumerate(all_cells):
+            merged_data = _resolve_merged_data_for_cell(
+                cell,
+                plateau_data_folder=plateau_data_folder,
+                merged_cache=merged_cache,
+                warned_sessions=warned_sessions,
+            )
+            merged_data_by_cell[flat_idx] = merged_data
+            plateau_maps_by_cell[flat_idx] = _compute_plateau_occurrence_maps_for_cell(
+                cell,
+                merged_data=merged_data,
+                include_long_cb_as_plateau=bool(plateau_include_long_cb_as_plateau),
+                cb_min_duration_ms=float(plateau_cb_min_duration_ms),
+                speed_threshold=float(plateau_speed_threshold),
+            )
+
+    plateau_shape_traces_by_cell: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {}
+    plateau_shape_xlim: tuple[float, float] | None = None
+    plateau_shape_ylim: tuple[float, float] | None = None
+    if plot_plateau_shapes:
+        plateau_shape_pre_ms = 40.0
+        plateau_shape_post_ms = 20.0
+        y_min_ps = np.inf
+        y_max_ps = -np.inf
+        for flat_idx, cell in enumerate(all_cells):
+            merged_data = merged_data_by_cell.get(flat_idx)
+            traces_for_cell: list[tuple[np.ndarray, np.ndarray]] = []
+            if isinstance(merged_data, dict):
+                src = merged_data.get(
+                    "plateau_traces_normalized",
+                    merged_data.get(
+                        "traces_SNR_interpolated",
+                        merged_data.get("traces", []),
+                    ),
+                )
+                ci = int(cell.get("cell_idx", -1))
+                trace = np.array([], dtype=float)
+                if isinstance(src, (list, tuple, np.ndarray)) and 0 <= ci < len(src):
+                    trace = np.asarray(src[ci], dtype=float).reshape(-1)
+                if trace.size > 0:
+                    starts, ends = _build_plateau_intervals_from_merged(
+                        merged_data,
+                        cell_idx=ci,
+                        include_long_cb_as_plateau=bool(plateau_include_long_cb_as_plateau),
+                        cb_min_duration_ms=float(plateau_cb_min_duration_ms),
+                        n_frames=int(trace.size),
+                    )
+                    frame_rate_ps = float(merged_data.get("frame_rate", np.nan))
+                    use_ms = np.isfinite(frame_rate_ps) and frame_rate_ps > 0
+                    if use_ms:
+                        pre_frames = max(0, int(np.ceil(float(plateau_shape_pre_ms) / 1000.0 * float(frame_rate_ps))))
+                        post_frames = max(0, int(np.ceil(float(plateau_shape_post_ms) / 1000.0 * float(frame_rate_ps))))
+                    else:
+                        pre_frames = int(np.ceil(float(plateau_shape_pre_ms)))
+                        post_frames = int(np.ceil(float(plateau_shape_post_ms)))
+                    for s, e in zip(starts, ends):
+                        s_i = int(s)
+                        e_i = int(e)
+                        if e_i < s_i:
+                            continue
+                        seg_start = max(0, s_i - pre_frames)
+                        seg_end = min(int(trace.size) - 1, e_i + post_frames)
+                        if seg_end < seg_start:
+                            continue
+                        seg = np.asarray(trace[seg_start:seg_end + 1], dtype=float)
+                        if seg.size == 0 or not np.any(np.isfinite(seg)):
+                            continue
+                        frame_idx = np.arange(seg_start, seg_end + 1, dtype=float)
+                        if use_ms:
+                            x_ms = (frame_idx - float(s_i)) / float(frame_rate_ps) * 1000.0
+                        else:
+                            x_ms = frame_idx - float(s_i)
+                        traces_for_cell.append((x_ms, seg))
+                        finite_seg = seg[np.isfinite(seg)]
+                        if finite_seg.size:
+                            y_min_ps = min(y_min_ps, float(np.nanmin(finite_seg)))
+                            y_max_ps = max(y_max_ps, float(np.nanmax(finite_seg)))
+            plateau_shape_traces_by_cell[flat_idx] = traces_for_cell
+
+        plateau_shape_xlim = (0.0, 250.0)
+        if np.isfinite(y_min_ps) and np.isfinite(y_max_ps):
+            plateau_shape_ylim = (
+                (y_min_ps - 1e-3, y_max_ps + 1e-3)
+                if y_max_ps == y_min_ps
+                else (y_min_ps, y_max_ps)
+            )
+        else:
+            plateau_shape_ylim = (-0.2, 1.2)
+        plateau_shape_ylim = (
+            min(float(plateau_shape_ylim[0]), 0.0),
+            max(float(plateau_shape_ylim[1]), 1.0),
+        )
+
+    shape_xlim = None
+    _shape_ylim_user = shape_ylim
+    shape_ylim = None
+    shape_gap_ms = None
+    shape_ss_x_scale = None
+    shape_cb_x_scale = None
+    shape_ss_x_start = None
+    shape_ss_x_end = None
+    shape_cb_x_start = None
+    shape_xlim_ss_full = None
+    shape_xlim_cb_full = None
+    shape_time_xlim_ss = (-20.0, 20.0)
+    shape_time_xlim_cb = (-20.0, 80.0)
+
+    def _mean_sem(waves):
+        if len(waves) == 0:
+            return None, None
+        arr = np.vstack(waves)
+        mean = np.nanmean(arr, axis=0)
+        n_eff = np.sum(np.isfinite(arr), axis=0)
+        std = np.nanstd(arr, axis=0, ddof=0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sem = np.where(n_eff > 0, std / np.sqrt(n_eff), np.nan)
+        return mean, sem
+
+    def _min_req(spike_type):
+        return min_shapes_per_condition_ss if spike_type == 'simple' else min_shapes_per_condition_cb
+
+    def _normalize_wave(time_ms, wave):
+        time_ms = np.asarray(time_ms, dtype=float)
+        wave = np.asarray(wave, dtype=float)
+        if time_ms.size == 0 or wave.size != time_ms.size:
+            return None
+        pre_mask = time_ms < 0
+        if not np.any(pre_mask):
+            return None
+        baseline = np.nanmean(wave[pre_mask])
+        if not np.isfinite(baseline):
+            return None
+        idx0 = int(np.nanargmin(np.abs(time_ms)))
+        if not np.isfinite(wave[idx0]):
+            return None
+        height = wave[idx0] - baseline
+        if not np.isfinite(height) or abs(height) < 1e-12:
+            return None
+        return (wave - baseline) / height
+
+    if plot_spike_shapes:
+        if spike_shape_state not in ('run', 'rest'):
+            raise ValueError("spike_shape_state must be 'run' or 'rest'")
+
+        ss_x_min = np.inf
+        ss_x_max = -np.inf
+        cb_x_min = np.inf
+        cb_x_max = -np.inf
+        y_min = np.inf
+        y_max = -np.inf
+        ss_y_min = np.inf
+
+        def _gather_waves(spike_shapes, spike_type, pf_key):
+            info = spike_shapes.get(spike_type) if isinstance(spike_shapes, dict) else None
+            if not info:
+                return np.array([]), []
+            time_ms = np.asarray(info.get('time_ms', []), dtype=float)
+            shapes = info.get('shapes', {})
+            in_key = f"{spike_shape_state}_in"
+            out_key = f"{spike_shape_state}_out"
+            waves = list(shapes.get(in_key if pf_key == 'in' else out_key, []))
+            return time_ms, waves
+
+        def _normalize_waves(time_ms, waves):
+            out = []
+            for wave in waves:
+                wave_n = _normalize_wave(time_ms, wave)
+                if wave_n is not None:
+                    out.append(wave_n)
+            return out
+
+        for cell in all_cells:
+            spike_shapes = cell.get('spike_shapes')
+            if not spike_shapes:
+                continue
+            for spike_type in ('simple', 'complex'):
+                info = spike_shapes.get(spike_type) if isinstance(spike_shapes, dict) else None
+                if info:
+                    time_ms = np.asarray(info.get('time_ms', []), dtype=float)
+                    if time_ms.size:
+                        if spike_type == 'simple':
+                            ss_x_min = min(ss_x_min, float(np.nanmin(time_ms)))
+                            ss_x_max = max(ss_x_max, float(np.nanmax(time_ms)))
+                        else:
+                            cb_x_min = min(cb_x_min, float(np.nanmin(time_ms)))
+                            cb_x_max = max(cb_x_max, float(np.nanmax(time_ms)))
+                for pf_key in ('in', 'out'):
+                    time_ms, waves = _gather_waves(spike_shapes, spike_type, pf_key)
+                    norm_waves = _normalize_waves(time_ms, waves)
+                    if len(norm_waves) == 0:
+                        continue
+                    mean, _ = _mean_sem(norm_waves)
+                    if mean is None:
+                        continue
+                    if np.any(np.isfinite(mean)):
+                        low_min = float(np.nanmin(mean))
+                        y_min = min(y_min, low_min)
+                        if spike_type == 'simple':
+                            ss_y_min = min(ss_y_min, low_min)
+                        y_max = max(y_max, float(np.nanmax(mean)))
+
+        if np.isfinite(ss_x_min) and np.isfinite(ss_x_max):
+            shape_time_xlim_ss = (float(ss_x_min), float(ss_x_max))
+        if np.isfinite(cb_x_min) and np.isfinite(cb_x_max):
+            shape_time_xlim_cb = (float(cb_x_min), float(cb_x_max))
+        shape_xlim_ss_full = shape_time_xlim_ss
+        shape_xlim_cb_full = shape_time_xlim_cb
+        shape_gap_ms = 5.0
+        shape_ss_x_scale = 5.0
+        shape_cb_x_scale = 1.0
+        shape_ss_x_start = 0.0
+        shape_ss_x_end = float((shape_time_xlim_ss[1] - shape_time_xlim_ss[0]) * shape_ss_x_scale)
+        shape_cb_x_start = float(shape_ss_x_end + shape_gap_ms * shape_cb_x_scale)
+        shape_xlim = (
+            float(shape_ss_x_start),
+            float(shape_cb_x_start + (shape_time_xlim_cb[1] - shape_time_xlim_cb[0]) * shape_cb_x_scale),
+        )
+        if np.isfinite(y_min) and np.isfinite(y_max):
+            shape_ylim_auto = (
+                (y_min - 1e-3, y_max + 1e-3)
+                if y_max == y_min
+                else (y_min, y_max)
+            )
+        else:
+            shape_ylim_auto = (-0.2, 1.2)
+        shape_ylim_auto = (max(shape_ylim_auto[0], -0.2), shape_ylim_auto[1])
+        shape_ylim = _shape_ylim_user if _shape_ylim_user is not None else shape_ylim_auto
+
+    def _plot_shapes_axis_overall(ax, spike_shapes, spike_type):
+        axis_xlim = shape_xlim_ss_full if spike_type == 'simple' else shape_xlim_cb_full
+        tmin, tmax = shape_time_xlim_ss if spike_type == 'simple' else shape_time_xlim_cb
+        color = simple_spike_color if spike_type == 'simple' else complex_spike_color
+        axis_ylim = (-0.155, 1.1) if spike_type == 'simple' else shape_ylim
+        _style_shape_axis(ax, axis_xlim, axis_ylim)
+        if not spike_shapes:
+            return
+        info = spike_shapes.get(spike_type) if isinstance(spike_shapes, dict) else None
+        if not info:
+            return
+        time_ms_full = np.asarray(info.get('time_ms', []), dtype=float)
+        shapes = info.get('shapes', {})
+        waves = []
+        for key in (f"{spike_shape_state}_in", f"{spike_shape_state}_out"):
+            waves.extend(list(shapes.get(key, [])))
+        if time_ms_full.size == 0 or len(waves) == 0:
+            return
+        tmask = (time_ms_full >= tmin) & (time_ms_full <= tmax)
+        if not np.any(tmask):
+            return
+        time_ms = time_ms_full[tmask]
+        norm_waves = []
+        for wave in waves:
+            wave_arr = np.asarray(wave, dtype=float)
+            if wave_arr.size != time_ms_full.size:
+                continue
+            wave_n = _normalize_wave(time_ms_full, wave_arr)
+            if wave_n is None:
+                continue
+            norm_waves.append(wave_n)
+            ax.plot(time_ms, wave_n[tmask], color=color, alpha=0.1, linewidth=0.1, rasterized=True)
+        if len(norm_waves) >= _min_req(spike_type):
+            mean, _ = _mean_sem(norm_waves)
+            if mean is not None:
+                ax.plot(time_ms, mean[tmask], color=color, alpha=1.0, linewidth=1.0)
+        if show_shape_counts:
+            x_mid = (time_ms[0] + time_ms[-1]) / 2
+            y_top = axis_ylim[1] - 0.08 * (axis_ylim[1] - axis_ylim[0])
+            ax.text(
+                x_mid,
+                y_top,
+                f'n={len(norm_waves)}',
+                ha='center',
+                va='top',
+                fontsize=3.5,
+                fontname='Arial',
+                color=color,
+                alpha=0.8,
+            )
+        y_line_low = max(axis_ylim[0], min(0.0, axis_ylim[1]))
+        y_line_high = max(axis_ylim[0], min(1.0, axis_ylim[1]))
+        if y_line_high > y_line_low:
+            ax.plot([0.0, 0.0], [y_line_low, y_line_high], color='black', linestyle='--', linewidth=0.5, alpha=0.35)
+
+    def _plot_shapes_axis_split(ax, spike_shapes, pf_key, no_pf=False):
+        bg_color = "#FFE6F2" if pf_key == 'in' else "#F0F0F0"
+        ax.set_facecolor(bg_color)
+        ax.set_xlim(*shape_xlim)
+        ax.set_ylim(*shape_ylim)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        if no_pf and pf_key == 'in':
+            ax.set_facecolor('white')
+            return
+        if not spike_shapes:
+            return
+
+        def _plot_block(spike_type, color):
+            info = spike_shapes.get(spike_type) if isinstance(spike_shapes, dict) else None
+            if not info:
+                return
+            time_ms_full = np.asarray(info.get('time_ms', []), dtype=float)
+            shapes = info.get('shapes', {})
+            if no_pf and pf_key == 'out':
+                keys = [f"{spike_shape_state}_in", f"{spike_shape_state}_out"]
+            else:
+                keys = [f"{spike_shape_state}_{pf_key}"]
+            waves = []
+            for key in keys:
+                waves.extend(list(shapes.get(key, [])))
+            if time_ms_full.size == 0 or len(waves) == 0:
+                return
+            if spike_type == 'simple':
+                tmin, tmax = shape_time_xlim_ss
+                x_start = shape_ss_x_start
+                x_scale = shape_ss_x_scale
+            else:
+                tmin, tmax = shape_time_xlim_cb
+                x_start = shape_cb_x_start
+                x_scale = shape_cb_x_scale
+            tmask = (time_ms_full >= tmin) & (time_ms_full <= tmax)
+            if not np.any(tmask):
+                return
+            time_ms = time_ms_full[tmask]
+            x = (time_ms - tmin) * x_scale + x_start
+            norm_waves = []
+            for wave in waves:
+                wave_arr = np.asarray(wave, dtype=float)
+                if wave_arr.size != time_ms_full.size:
+                    continue
+                wave_n = _normalize_wave(time_ms_full, wave_arr)
+                if wave_n is None:
+                    continue
+                norm_waves.append(wave_n)
+                ax.plot(x, wave_n[tmask], color=color, alpha=0.1, linewidth=0.1, rasterized=True)
+            if len(norm_waves) >= _min_req(spike_type):
+                mean, _ = _mean_sem(norm_waves)
+                if mean is not None:
+                    ax.plot(x, mean[tmask], color=color, alpha=1.0, linewidth=1.0)
+            if show_shape_counts:
+                x_mid = (x[0] + x[-1]) / 2
+                y_top = shape_ylim[1] - 0.08 * (shape_ylim[1] - shape_ylim[0])
+                ax.text(
+                    x_mid,
+                    y_top,
+                    f'n={len(norm_waves)}',
+                    ha='center',
+                    va='top',
+                    fontsize=3.5,
+                    fontname='Arial',
+                    color=color,
+                    alpha=0.8,
+                )
+
+        _plot_block('simple', simple_spike_color)
+        _plot_block('complex', complex_spike_color)
+
+        y_line_low = max(shape_ylim[0], min(0.0, shape_ylim[1]))
+        y_line_high = max(shape_ylim[0], min(1.0, shape_ylim[1]))
+        if y_line_high > y_line_low:
+            x0_ss = (0.0 - shape_time_xlim_ss[0]) * shape_ss_x_scale + shape_ss_x_start
+            x0_cb = (0.0 - shape_time_xlim_cb[0]) * shape_cb_x_scale + shape_cb_x_start
+            ax.plot([x0_ss, x0_ss], [y_line_low, y_line_high], color='black', linestyle='--', linewidth=0.5, alpha=0.35)
+            ax.plot([x0_cb, x0_cb], [y_line_low, y_line_high], color='black', linestyle='--', linewidth=0.5, alpha=0.35)
+
+    def _add_shape_scale_bars(ax, x_len, label):
+        x0_lim, x1_lim = [float(v) for v in ax.get_xlim()]
+        y0_lim, y1_lim = [float(v) for v in ax.get_ylim()]
+        x_span = x1_lim - x0_lim
+        y_span = y1_lim - y0_lim
+        if not np.isfinite(x_span) or not np.isfinite(y_span) or x_span <= 0 or y_span <= 0:
+            return
+
+        x_len = float(min(float(x_len), 0.5 * x_span))
+        h_x0 = x0_lim + 0.38 * x_span
+        h_x1 = h_x0 + x_len
+        if h_x1 > x1_lim - 0.08 * x_span:
+            h_x1 = x1_lim - 0.08 * x_span
+            h_x0 = h_x1 - x_len
+        h_y = y0_lim + 0.12 * y_span
+        ax.plot([h_x0, h_x1], [h_y, h_y], color='black', linewidth=0.8, solid_capstyle='butt')
+        ax.text(
+            (h_x0 + h_x1) / 2,
+            h_y - 0.06 * y_span,
+            label,
+            ha='center',
+            va='top',
+            fontsize=4,
+            fontname='Arial',
+        )
+
+        v_y0 = max(y0_lim, min(0.0, y1_lim))
+        v_y1 = max(y0_lim, min(1.0, y1_lim))
+        if v_y1 <= v_y0:
+            return
+        v_x = x0_lim + 0.13 * x_span
+        ax.plot([v_x, v_x], [v_y0, v_y1], color='black', linewidth=0.8, solid_capstyle='butt')
+
+    for display_row, cell_idx in row_to_cell.items():
+        cell = all_cells[cell_idx]
+        animal_short = _animal_short(cell)
+        cell_num = int(cell['cell_idx']) + 1
+        is_place_cell = cell.get('is_place_cell', False)
+        is_place_cell_ss = cell.get('is_place_cell_ss', False)
+        is_place_cell_cs = cell.get('is_place_cell_cs', False)
+
+        if print_removed_frames:
+            n_total = cell.get('n_frames_total', None)
+            n_removed_snr = cell.get('n_removed_frames_snr_only', None)
+            n_removed_total = cell.get('n_removed_frames_total', None)
+            pct_snr = cell.get('pct_removed_frames_snr_only', None)
+            pct_total = cell.get('pct_removed_frames_total', None)
+            if (
+                isinstance(n_total, (int, np.integer))
+                and isinstance(n_removed_snr, (int, np.integer))
+                and isinstance(n_removed_total, (int, np.integer))
+                and int(n_total) > 0
+            ):
+                pct_snr_str = f"{float(pct_snr):.2f}%" if np.isfinite(pct_snr) else "nan"
+                pct_total_str = f"{float(pct_total):.2f}%" if np.isfinite(pct_total) else "nan"
+                print(
+                    f"{animal_short} Cell {cell_num}: "
+                    f"removed_snr={int(n_removed_snr)}/{int(n_total)} ({pct_snr_str}), "
+                    f"removed_total={int(n_removed_total)}/{int(n_total)} ({pct_total_str})"
+                )
+            else:
+                print(f"{animal_short} Cell {cell_num}: removed-frame stats unavailable in this cache.")
+
+        ax_traj = axes_grid[(display_row, trajectory_col)]
+        ax_traj.plot(cell['x_traj'], cell['y_traj'], color="gray", linewidth=0.3, alpha=0.5)
+        ss_x = cell.get('ss_spikes_x', cell['spikes_x'])
+        ss_y = cell.get('ss_spikes_y', cell['spikes_y'])
+        if len(ss_x) > 0:
+            ax_traj.scatter(
+                ss_x, ss_y,
+                s=trajectory_spike_size,
+                color=simple_spike_color,
+                alpha=trajectory_spike_alpha,
+                linewidths=0,
+                zorder=2,
+                rasterized=True,
+            )
+        cs_x = cell.get('cs_spikes_x', np.array([]))
+        cs_y = cell.get('cs_spikes_y', np.array([]))
+        if len(cs_x) > 0:
+            ax_traj.scatter(
+                cs_x, cs_y,
+                s=trajectory_spike_size,
+                color=complex_spike_color,
+                alpha=trajectory_spike_alpha,
+                linewidths=0,
+                zorder=3,
+                rasterized=True,
+            )
+        _style_map_axis(ax_traj)
+        if cell_idx in group_start_flat_idxs:
+            group_idx = group_start_flat_idxs.index(cell_idx)
+            if group_idx < len(group_names):
+                ax_traj.text(
+                    -0.16,
+                    0.5,
+                    str(group_names[group_idx]),
+                    transform=ax_traj.transAxes,
+                    ha="right",
+                    va="center",
+                    fontsize=5,
+                    fontname="Arial",
+                    rotation=90,
+                )
+        if display_row == first_data_row and show_scale_bar:
+            scale_bar_length = 10
+            x_start = 1
+            y_pos = -1
+            ax_traj.plot(
+                [x_start, x_start + scale_bar_length],
+                [y_pos, y_pos],
+                color='black',
+                linewidth=1.5,
+                solid_capstyle='butt',
+                clip_on=False,
+            )
+            ax_traj.text(
+                x_start + scale_bar_length / 2,
+                y_pos - 1.5,
+                '10 cm',
+                ha='center',
+                va='top',
+                fontsize=5,
+                fontname='Arial',
+                clip_on=False,
+            )
+
+        ax_rate = axes_grid[(display_row, rate_col)]
+        rate_map = cell['rate_map']
+        peak_rate = cell['peak_rate']
+        p_val = cell.get('p_value', 1.0)
+        im_rate = None
+        if rate_map is not None:
+            masked_map = ma.masked_where(np.isnan(rate_map), rate_map)
+            im_rate = ax_rate.imshow(
+                masked_map.T,
+                origin="lower",
+                extent=extent,
+                cmap=cmap,
+                interpolation="nearest",
+                vmin=0,
+                vmax=peak_rate if np.isfinite(peak_rate) and peak_rate > 0 else None,
+            )
+            pf_mask = cell['place_field_mask']
+            if pf_mask is None or not np.any(pf_mask):
+                print(f"{animal_short} Cell {cell_num}: All spikes PF mask is empty")
+            elif is_place_cell:
+                _plot_pf_contour(ax_rate, pf_mask, "magenta", linestyle='solid')
+            elif p_val < 0.05 and not pf_only_place_cells and plot_putative_PF:
+                _plot_pf_contour(ax_rate, pf_mask, "magenta", linestyle='dashed')
+        _style_map_axis(ax_rate)
+        rate_str = f"{peak_rate:.1f}" if np.isfinite(peak_rate) else "N/A"
+        display_sig_mark = _get_sig_marker(p_val) if show_significance_marker else ""
+        ax_rate.text(1.0, -0.02, f"{display_sig_mark} {rate_str} Hz".strip(), transform=ax_rate.transAxes,
+                     ha="right", va="top", fontsize=4, fontname="Arial")
+        if is_place_cell and show_place_cell_star:
+            ax_rate.plot(0.03, -0.06, marker='*', markersize=4, color='black',
+                         transform=ax_rate.transAxes, clip_on=False)
+        if im_rate is not None:
+            _remember_cbar(rate_col, im_rate, ticks=[0, im_rate.get_clim()[1]], ticklabels=["0", "max"])
+
+        ax_ss = axes_grid[(display_row, ss_col)]
+        ss_norm_map = cell['ss_norm_map']
+        ss_p_val = cell.get('ss_p_value', 1.0)
+        ss_mask = cell.get('ss_place_field_mask', None)
+        im_ss = None
+        if ss_norm_map is not None:
+            ss_masked = ma.masked_where(np.isnan(ss_norm_map), ss_norm_map)
+            im_ss = ax_ss.imshow(ss_masked.T, origin="lower", extent=extent, cmap=cmap,
+                                 interpolation="nearest", vmin=0, vmax=1)
+            if ss_mask is None or not np.any(ss_mask):
+                print(f"{animal_short} Cell {cell_num}: SS PF mask is empty")
+            elif pf_only_place_cells and not is_place_cell:
+                pass
+            elif is_place_cell_ss:
+                _plot_pf_contour(ax_ss, ss_mask, ss_contour_color, linestyle='solid')
+            elif plot_putative_PF:
+                _plot_pf_contour(ax_ss, ss_mask, ss_contour_color, linestyle='dashed')
+        _style_map_axis(ax_ss)
+        ss_peak = cell['ss_peak_rate']
+        ss_str = f"{ss_peak:.1f}" if np.isfinite(ss_peak) else "N/A"
+        ss_display_sig = _get_sig_marker(ss_p_val) if show_significance_marker else ""
+        ax_ss.text(1.0, -0.02, f"{ss_display_sig} {ss_str} Hz".strip(), transform=ax_ss.transAxes,
+                   ha="right", va="top", fontsize=4, fontname="Arial")
+        if is_place_cell_ss and show_place_cell_star:
+            ax_ss.plot(0.03, -0.06, marker='*', markersize=4, color='black',
+                       transform=ax_ss.transAxes, clip_on=False)
+        _remember_cbar(ss_col, im_ss, ticks=[0, 1], ticklabels=["0", "1"])
+
+        ax_cs = axes_grid[(display_row, cs_col)]
+        cs_norm_map = cell['cs_norm_map']
+        cs_p_val = cell.get('cs_p_value', 1.0)
+        cs_mask = cell.get('cs_place_field_mask', None)
+        im_cs = None
+        if cs_norm_map is not None:
+            cs_masked = ma.masked_where(np.isnan(cs_norm_map), cs_norm_map)
+            im_cs = ax_cs.imshow(cs_masked.T, origin="lower", extent=extent, cmap=cmap,
+                                 interpolation="nearest", vmin=0, vmax=1)
+            if cs_mask is None or not np.any(cs_mask):
+                print(f"{animal_short} Cell {cell_num}: CS PF mask is empty")
+            elif pf_only_place_cells and not is_place_cell:
+                pass
+            elif is_place_cell_cs:
+                _plot_pf_contour(ax_cs, cs_mask, complex_spike_color, linestyle='solid')
+            elif plot_putative_PF:
+                _plot_pf_contour(ax_cs, cs_mask, complex_spike_color, linestyle='dashed')
+        _style_map_axis(ax_cs)
+        cs_peak = cell['cs_peak_rate']
+        cs_str = f"{cs_peak:.1f}" if np.isfinite(cs_peak) else "N/A"
+        cs_display_sig = _get_sig_marker(cs_p_val) if show_significance_marker else ""
+        ax_cs.text(1.0, -0.02, f"{cs_display_sig} {cs_str} Hz".strip(), transform=ax_cs.transAxes,
+                   ha="right", va="top", fontsize=4, fontname="Arial")
+        if is_place_cell_cs and show_place_cell_star:
+            ax_cs.plot(0.03, -0.06, marker='*', markersize=4, color='black',
+                       transform=ax_cs.transAxes, clip_on=False)
+        _remember_cbar(cs_col, im_cs, ticks=[0, 1], ticklabels=["0", "1"])
+
+        ax_theta = axes_grid[(display_row, theta_col)]
+        theta_map = cell.get('theta_map', None)
+        im_theta = None
+        if theta_map is not None and np.any(np.isfinite(theta_map)):
+            theta_masked = ma.masked_where(np.isnan(theta_map), theta_map)
+            theta_vmin, theta_vmax = theta_vlim if theta_vlim else (np.nanmin(theta_map), np.nanmax(theta_map))
+            im_theta = ax_theta.imshow(theta_masked.T, origin="lower", extent=extent, cmap=cmap,
+                                       interpolation="nearest", vmin=theta_vmin, vmax=theta_vmax)
+        _style_map_axis(ax_theta)
+        if show_theta_slow_corr_text:
+            theta_corrs = []
+            for key, color in (('theta_corr_all', 'black'), ('theta_corr_ss', simple_spike_color), ('theta_corr_cs', complex_spike_color)):
+                val = cell.get(key, np.nan)
+                if np.isfinite(val):
+                    theta_corrs.append((f"{val:.2f}", color))
+            x_positions = [0.25, 0.5, 0.75] if len(theta_corrs) == 3 else ([0.33, 0.67] if len(theta_corrs) == 2 else [0.5])
+            for idx, (corr_str, color) in enumerate(theta_corrs):
+                ax_theta.text(x_positions[idx], -0.02, corr_str, transform=ax_theta.transAxes,
+                              ha="center", va="top", fontsize=4, fontname="Arial", color=color)
+        _remember_cbar(theta_col, im_theta)
+
+        ax_slow = axes_grid[(display_row, slow_col)]
+        slow_map = cell.get('slow_map', None)
+        im_slow = None
+        if slow_map is not None and np.any(np.isfinite(slow_map)):
+            slow_masked = ma.masked_where(np.isnan(slow_map), slow_map)
+            slow_vmin, slow_vmax = slow_vlim if slow_vlim else (-np.nanmax(np.abs(slow_map)), np.nanmax(np.abs(slow_map)))
+            im_slow = ax_slow.imshow(slow_masked.T, origin="lower", extent=extent, cmap=slow_cmap,
+                                     interpolation="nearest", vmin=slow_vmin, vmax=slow_vmax)
+        _style_map_axis(ax_slow)
+        if show_theta_slow_corr_text:
+            slow_corrs = []
+            for key, color in (('slow_corr_all', 'black'), ('slow_corr_ss', simple_spike_color), ('slow_corr_cs', complex_spike_color)):
+                val = cell.get(key, np.nan)
+                if np.isfinite(val):
+                    slow_corrs.append((f"{val:.2f}", color))
+            x_positions = [0.25, 0.5, 0.75] if len(slow_corrs) == 3 else ([0.33, 0.67] if len(slow_corrs) == 2 else [0.5])
+            for idx, (corr_str, color) in enumerate(slow_corrs):
+                ax_slow.text(x_positions[idx], -0.02, corr_str, transform=ax_slow.transAxes,
+                             ha="center", va="top", fontsize=4, fontname="Arial", color=color)
+        _remember_cbar(slow_col, im_slow)
+
+        if include_plateau:
+            plateau_maps = plateau_maps_by_cell.get(cell_idx, {})
+            for mode, _label in plateau_col_modes:
+                col_idx = plateau_col_by_mode[mode]
+                ax_plateau = axes_grid[(display_row, col_idx)]
+                plateau_map = plateau_maps.get(mode, None)
+                im_plateau = None
+                plateau_max_occ = np.nan
+                if plateau_map is not None and np.any(np.isfinite(plateau_map)):
+                    plateau_masked = ma.masked_where(np.isnan(plateau_map), plateau_map)
+                    plateau_max_occ = float(np.nanmax(plateau_map))
+                    vmax = plateau_max_occ if np.isfinite(plateau_max_occ) and plateau_max_occ > 0 else 1.0
+                    im_plateau = ax_plateau.imshow(
+                        plateau_masked.T,
+                        origin="lower",
+                        extent=extent,
+                        cmap="Reds",
+                        interpolation="nearest",
+                        vmin=0.0,
+                        vmax=vmax,
+                    )
+                _style_map_axis(ax_plateau)
+                pf_mask = cell['place_field_mask']
+                if pf_mask is not None and np.any(pf_mask):
+                    if is_place_cell:
+                        _plot_pf_contour(ax_plateau, pf_mask, "magenta", linewidth=0.3, linestyle='solid', alpha=0.6)
+                    elif p_val < 0.05 and not pf_only_place_cells and plot_putative_PF:
+                        _plot_pf_contour(ax_plateau, pf_mask, "magenta", linewidth=0.3, linestyle='dashed', alpha=0.6)
+                occ_text = f"max {plateau_max_occ:g}" if np.isfinite(plateau_max_occ) else "max N/A"
+                ax_plateau.text(1.0, -0.02, occ_text, transform=ax_plateau.transAxes,
+                                ha="right", va="top", fontsize=4, fontname="Arial")
+                if im_plateau is not None:
+                    _remember_cbar(col_idx, im_plateau, ticks=[0.0, float(im_plateau.get_clim()[1])], ticklabels=["0", "max"])
+
+        if plot_spike_shapes:
+            spike_shapes = cell.get('spike_shapes')
+            if plot_spike_shapes_overall:
+                _plot_shapes_axis_overall(axes_grid[(display_row, shape_col_top)], spike_shapes, 'simple')
+                _plot_shapes_axis_overall(axes_grid[(display_row, shape_col_bottom)], spike_shapes, 'complex')
+            else:
+                pf_mask_all = cell.get('place_field_mask', None)
+                no_pf = (not bool(is_place_cell)) or (pf_mask_all is None) or (not np.any(np.asarray(pf_mask_all)))
+                _plot_shapes_axis_split(axes_grid[(display_row, shape_col_top)], spike_shapes, 'in', no_pf=no_pf)
+                _plot_shapes_axis_split(axes_grid[(display_row, shape_col_bottom)], spike_shapes, 'out', no_pf=no_pf)
+
+        if plot_plateau_shapes:
+            ax_plateau_shape = axes_grid[(display_row, plateau_shape_col)]
+            _style_shape_axis(ax_plateau_shape, plateau_shape_xlim, plateau_shape_ylim)
+            for x_ms, seg in plateau_shape_traces_by_cell.get(cell_idx, []):
+                if x_ms.size == 0 or seg.size != x_ms.size:
+                    continue
+                ax_plateau_shape.plot(x_ms, seg, color='red', alpha=0.5, linewidth=0.3, rasterized=True)
+
+    if plot_spike_shapes:
+        if plot_spike_shapes_overall:
+            _add_shape_scale_bars(axes_grid[(first_data_row, shape_col_top)], 10.0, '10 ms')
+            _add_shape_scale_bars(axes_grid[(first_data_row, shape_col_bottom)], 50.0, '50 ms')
+        else:
+            _add_shape_scale_bars(axes_grid[(first_data_row, shape_col_top)], 50.0, '50 ms')
+            _add_shape_scale_bars(axes_grid[(first_data_row, shape_col_bottom)], 50.0, '50 ms')
+    if plot_plateau_shapes:
+        _add_shape_scale_bars(axes_grid[(first_data_row, plateau_shape_col)], 100.0, '100 ms')
+
+    for col_idx, label in enumerate(col_labels):
+        axes_grid[(first_data_row, col_idx)].set_title(label, fontsize=5, fontname="Arial", pad=2)
+
+    traj_leg_ax = legend_axes[trajectory_col]
+    traj_leg_ax.set_axis_off()
+    traj_leg_ax.set_xlim(0, 1)
+    traj_leg_ax.set_ylim(0, 1)
+    traj_leg_ax.scatter([0.18], [0.65], s=12, color=simple_spike_color, clip_on=False)
+    traj_leg_ax.text(0.34, 0.65, "SS", va="center", ha="left", fontsize=4, fontname="Arial")
+    traj_leg_ax.scatter([0.18], [0.25], s=12, color=complex_spike_color, clip_on=False)
+    traj_leg_ax.text(0.34, 0.25, "CB", va="center", ha="left", fontsize=4, fontname="Arial")
+
+    if plot_spike_shapes:
+        shape_leg_ax = legend_axes[shape_col_top]
+        shape_leg_ax.set_axis_off()
+        shape_leg_ax.set_xlim(0, 1)
+        shape_leg_ax.set_ylim(0, 1)
+        shape_leg_ax.plot([0.1, 0.45], [0.65, 0.65], color=simple_spike_color, linewidth=1.2)
+        shape_leg_ax.text(0.52, 0.65, "SS", va="center", ha="left", fontsize=4, fontname="Arial")
+        shape_leg_ax.plot([0.1, 0.45], [0.25, 0.25], color=complex_spike_color, linewidth=1.2)
+        shape_leg_ax.text(0.52, 0.25, "CB", va="center", ha="left", fontsize=4, fontname="Arial")
+
+    def _add_bottom_colorbar(col_idx, im, ticks=None, ticklabels=None):
+        host_ax = legend_axes[col_idx]
+        host_ax.set_axis_off()
+        cax = inset_axes(
+            host_ax,
+            width="82%",
+            height="14%",
+            loc="center",
+            borderpad=0,
+        )
+        cbar = fig.colorbar(im, cax=cax, orientation='horizontal')
+        if ticks is not None:
+            cbar.set_ticks(ticks)
+        if ticklabels is not None:
+            cbar.set_ticklabels(ticklabels)
+        cbar.ax.xaxis.set_ticks_position('bottom')
+        cbar.ax.xaxis.set_label_position('bottom')
+        cbar.ax.tick_params(
+            labelsize=5,
+            width=0.4,
+            direction='out',
+            bottom=True,
+            top=False,
+            labelbottom=True,
+            labeltop=False,
+            length=2,
+        )
+        return cbar
+
+    for col_idx, spec in cbar_specs.items():
+        im, ticks, ticklabels = spec
+        _add_bottom_colorbar(col_idx, im, ticks=ticks, ticklabels=ticklabels)
+
+    if save_path:
+        plt.rcParams["svg.fonttype"] = "none"
+        fig.savefig(save_path, dpi=300)
+        print(f"Saved: {save_path}")
+
     plt.show()
     return fig
 

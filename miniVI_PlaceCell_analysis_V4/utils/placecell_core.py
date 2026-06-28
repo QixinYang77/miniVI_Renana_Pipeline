@@ -1785,8 +1785,16 @@ def analyze_place_cell_single_moving(
     is_first_column=False,
     display_PF_SS_CS=False,
     min_peak_rate=0.5,
-    min_pf_reliability=0.10,
-    min_pf_traversals=5,
+    min_pf_firing_traversals=5,
+    pf_firing_traversal_distance_window_cm=15.0,
+    pf_firing_traversal_detection_window_cm=8.0,
+    pf_firing_traversal_distance_bin_cm=1.5,
+    pf_firing_traversal_distance_mode="euclidean_to_peak",
+    pf_firing_traversal_center_vicinity_min_cm=1,
+    pf_firing_traversal_center_vicinity_max_cm=5,
+    pf_firing_traversal_resting_speed_threshold=0.5,
+    pf_firing_traversal_merge_gap_s=2.0,
+    pf_firing_traversal_exclude_trials_with_bad_frames=True,
     pf_reliability_dilation_bins=3,
     pf_reliability_dilation_shape="disk",
     save_spike_shapes=False,
@@ -2139,30 +2147,61 @@ def analyze_place_cell_single_moving(
         place_field_mask = np.zeros_like(smooth_map_for_pf, dtype=bool)
         place_field_components = []
 
+    # Compute the all-spike SI shuffle before the expensive PF traversal gate.
+    # The traversal gate can only remove candidate fields, so cells failing SI,
+    # peak-rate, or basic PF detection cannot become place cells later.
+    si = calculate_spatial_information(raw_map, occ_map)
+    shuffled_si_values = []
+    if len(spikes_in_sub_idx) > 0:
+        rng = np.random.default_rng(random_seed)
+        for _ in range(num_shuffles):
+            shift = int(rng.integers(1, len(binary_train_sub)))
+            shuf_bool = np.roll(binary_train_sub, shift=shift)
+            shuf_x = x_sub[shuf_bool]
+            shuf_y = y_sub[shuf_bool]
+            shuf_spk_map, _, _ = np.histogram2d(shuf_x, shuf_y, bins=bins)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                shuf_rate = shuf_spk_map / occ_map
+                shuf_rate[np.isnan(shuf_rate)] = 0
+            shuffled_si_values.append(calculate_spatial_information(shuf_rate, occ_map))
+    else:
+        shuffled_si_values = [0] * num_shuffles
+
+    shuffled_si_arr = np.array(shuffled_si_values)
+    p_val = np.sum(shuffled_si_arr >= si) / num_shuffles
+
     # ------------------------------------------------------------------------
-    # Optional PF-component filtering by traversal reliability (All spikes):
-    # keep only PF components that have:
-    #   1) reliability >= min_pf_reliability
-    #   2) at least min_pf_traversals traversals
-    # Reliability is computed from trial-by-trial traversals (all directions):
+    # Optional PF-component filtering by firing traversals (All spikes):
+    # keep only PF components with spikes in at least min_pf_firing_traversals
+    # traversals. The reliability fraction is still computed for reporting:
     #   reliability = (# traversals with >=1 spike) / (total traversals)
     # ------------------------------------------------------------------------
     pf_component_filter_stats = []
-    reliability_threshold = None if min_pf_reliability is None else float(min_pf_reliability)
-    min_traversals_required = None if min_pf_traversals is None else int(min_pf_traversals)
+    min_firing_traversals_required = (
+        None if min_pf_firing_traversals is None else int(min_pf_firing_traversals)
+    )
+    component_firing_traversal_filter_enabled = (
+        (min_firing_traversals_required is not None)
+        and (min_firing_traversals_required > 0)
+    )
+    reliability_dilation_structure = (
+        _build_pf_dilation_structure(
+            pf_reliability_dilation_bins, pf_reliability_dilation_shape
+        )
+        if component_firing_traversal_filter_enabled and pf_reliability_dilation_bins > 0
+        else None
+    )
+    candidate_is_place_cell_for_pf_filter = (
+        (p_val < 0.05)
+        and bool(place_field_components)
+        and (np.isfinite(peak_rate) and peak_rate >= min_peak_rate)
+    )
     apply_pf_component_filter = (
-        place_field_components
-        and (reliability_threshold is not None)
-        and np.isfinite(reliability_threshold)
-        and (min_traversals_required is not None)
-        and (min_traversals_required > 0)
+        bool(place_field_components)
+        and component_firing_traversal_filter_enabled
+        and bool(candidate_is_place_cell_for_pf_filter)
     )
     if apply_pf_component_filter:
-        reliability_dilation_structure = _build_pf_dilation_structure(
-            pf_reliability_dilation_bins, pf_reliability_dilation_shape
-        ) if pf_reliability_dilation_bins > 0 else None
-        speed_for_reliability = np.asarray(speed, dtype=float).copy()
-        speed_for_reliability[~valid_frames] = np.nan
         cell_spikes_sorted = np.sort(cell_spikes)
         kept_components = []
 
@@ -2174,59 +2213,48 @@ def analyze_place_cell_single_moving(
                 comp_mask_eval = binary_dilation(comp_mask, structure=reliability_dilation_structure)
                 reliability_eval_expanded = True
             reliability_eval_size_bins = int(np.sum(comp_mask_eval)) if comp_mask_eval.size > 0 else 0
-            traversal_epochs = []
-            if comp_mask_eval.size > 0 and np.any(comp_mask_eval):
-                analysis_for_component = {
-                    "is_place_cell": True,
-                    "place_field_mask": comp_mask_eval,
-                    "rate_map": smooth_map_for_pf,
-                    "peak_rate": float(comp.get("peak_rate", np.nan)),
-                    "params": {
-                        "width_real": float(width_real),
-                        "height_real": float(height_real),
-                        "bin_size": float(bin_size),
-                    },
-                }
-                try:
-                    traversal_epochs, _, _, _ = find_place_field_traversals(
-                        x_neural,
-                        y_neural,
-                        spikes,
-                        speed_for_reliability,
-                        frame_rate,
-                        cell_idx,
-                        speed_threshold=float(speed_threshold),
-                        min_duration_ms=200.0,
-                        min_distance_cm=10.0,
-                        merge_gap_s=float(merge_gap_s),
-                        clear_traversal=False,
-                        analysis=analysis_for_component,
-                        verbose=False,
-                    )
-                except Exception:
-                    traversal_epochs = []
-
-            n_total = int(len(traversal_epochs))
-            n_reliable = 0
-            if n_total > 0 and cell_spikes_sorted.size > 0:
-                starts = np.asarray([start for start, _ in traversal_epochs], dtype=int)
-                ends = np.asarray([end for _, end in traversal_epochs], dtype=int)
-                left = np.searchsorted(cell_spikes_sorted, starts, side="left")
-                right = np.searchsorted(cell_spikes_sorted, ends, side="left")
-                n_reliable = int(np.sum((right - left) > 0))
-            reliability = (n_reliable / n_total) if n_total > 0 else np.nan
-
-            passes_component = (
-                (n_total >= min_traversals_required)
-                and np.isfinite(reliability)
-                and (reliability >= reliability_threshold)
+            traversal_stats = _compute_distance_defined_pf_firing_traversal_stats(
+                x_neural=x_neural,
+                y_neural=y_neural,
+                speed=speed,
+                frame_rate=frame_rate,
+                event_spikes=cell_spikes_sorted,
+                place_field_mask=comp_mask_eval,
+                rate_map=smooth_map_for_pf,
+                width_real=width_real,
+                height_real=height_real,
+                bin_size=bin_size,
+                bad_timepoints=bad_timepoints,
+                moving_speed_threshold=float(speed_threshold),
+                moving_kernel_size=int(kernel_size),
+                moving_min_duration_s=float(min_duration_s),
+                moving_merge_gap_s=float(pf_firing_traversal_merge_gap_s),
+                distance_window_cm=float(pf_firing_traversal_distance_window_cm),
+                detection_window_cm=float(pf_firing_traversal_detection_window_cm),
+                distance_bin_cm=float(pf_firing_traversal_distance_bin_cm),
+                distance_mode=str(pf_firing_traversal_distance_mode),
+                center_vicinity_min_cm=int(pf_firing_traversal_center_vicinity_min_cm),
+                center_vicinity_max_cm=int(pf_firing_traversal_center_vicinity_max_cm),
+                resting_speed_threshold=float(pf_firing_traversal_resting_speed_threshold),
+                exclude_trials_with_bad_frames=bool(pf_firing_traversal_exclude_trials_with_bad_frames),
             )
+
+            n_total = int(traversal_stats["n_trials"])
+            n_reliable = int(traversal_stats["n_firing_traversals"])
+            reliability = traversal_stats["reliability"]
+
+            passes_component = n_reliable >= min_firing_traversals_required
             comp_with_stats = dict(comp)
             comp_with_stats["component_index"] = int(comp_idx)
             comp_with_stats["n_traversals_all"] = n_total
             comp_with_stats["n_reliable_traversals_all"] = int(n_reliable)
+            comp_with_stats["n_firing_traversals_all"] = int(n_reliable)
             comp_with_stats["reliability_all"] = reliability
+            comp_with_stats["min_pf_firing_traversals"] = int(min_firing_traversals_required)
+            comp_with_stats["passes_firing_traversal_filter"] = bool(passes_component)
             comp_with_stats["passes_reliability_filter"] = bool(passes_component)
+            comp_with_stats["firing_traversal_filter_spike_type"] = "all"
+            comp_with_stats["firing_traversal_detection"] = "distance_defined_iterative"
             comp_with_stats["reliability_eval_expanded"] = bool(reliability_eval_expanded)
             comp_with_stats["reliability_eval_size_bins"] = reliability_eval_size_bins
             comp_with_stats["reliability_eval_radius_bins"] = int(pf_reliability_dilation_bins)
@@ -2239,8 +2267,13 @@ def analyze_place_cell_single_moving(
                     "peak_rate": float(comp.get("peak_rate", np.nan)),
                     "n_traversals_all": n_total,
                     "n_reliable_traversals_all": int(n_reliable),
+                    "n_firing_traversals_all": int(n_reliable),
                     "reliability_all": reliability,
+                    "min_pf_firing_traversals": int(min_firing_traversals_required),
+                    "passes_firing_traversal_filter": bool(passes_component),
                     "passes_reliability_filter": bool(passes_component),
+                    "firing_traversal_filter_spike_type": "all",
+                    "firing_traversal_detection": "distance_defined_iterative",
                     "reliability_eval_expanded": bool(reliability_eval_expanded),
                     "reliability_eval_size_bins": reliability_eval_size_bins,
                     "reliability_eval_radius_bins": int(pf_reliability_dilation_bins),
@@ -2255,15 +2288,146 @@ def analyze_place_cell_single_moving(
         for comp in place_field_components:
             place_field_mask |= np.asarray(comp.get("mask"), dtype=bool)
 
+    # Final all-spike place-cell status after any firing-traversal PF filtering.
+    # SS/CS traversal validation is only meaningful for cells that remain PLCs.
+    field_area = np.sum(place_field_mask) * (bin_size ** 2)
+    n_place_fields = len(place_field_components)
+    is_place_cell = (
+        (p_val < 0.05) and
+        (n_place_fields > 0) and
+        (field_area <= max_field_area) and
+        (np.isfinite(peak_rate) and peak_rate >= min_peak_rate)
+    )
+
+    def _filter_event_place_field_components(
+        components,
+        event_spike_times,
+        rate_map_for_pf,
+        label,
+    ):
+        filter_stats = []
+        if not (components and component_firing_traversal_filter_enabled):
+            return list(components or []), filter_stats
+
+        event_spikes = (
+            np.asarray(event_spike_times, dtype=int)
+            if event_spike_times is not None
+            else np.array([], dtype=int)
+        )
+        event_spikes = event_spikes[(event_spikes >= 0) & (event_spikes < total_frames)]
+        event_spikes = event_spikes[valid_frames[event_spikes]]
+        event_spikes_sorted = np.sort(event_spikes)
+
+        kept_components = []
+        label = str(label)
+        traversals_key = f"n_traversals_{label}"
+        reliable_key = f"n_reliable_traversals_{label}"
+        firing_key = f"n_firing_traversals_{label}"
+        reliability_key = f"reliability_{label}"
+
+        for comp_idx, comp in enumerate(components):
+            comp_mask = np.asarray(comp.get("mask"), dtype=bool)
+            comp_mask_eval = comp_mask
+            reliability_eval_expanded = False
+            if reliability_dilation_structure is not None and comp_mask.size > 0 and np.any(comp_mask):
+                comp_mask_eval = binary_dilation(comp_mask, structure=reliability_dilation_structure)
+                reliability_eval_expanded = True
+            reliability_eval_size_bins = int(np.sum(comp_mask_eval)) if comp_mask_eval.size > 0 else 0
+            traversal_stats = _compute_distance_defined_pf_firing_traversal_stats(
+                x_neural=x_neural,
+                y_neural=y_neural,
+                speed=speed,
+                frame_rate=frame_rate,
+                event_spikes=event_spikes_sorted,
+                place_field_mask=comp_mask_eval,
+                rate_map=rate_map_for_pf,
+                width_real=width_real,
+                height_real=height_real,
+                bin_size=bin_size,
+                bad_timepoints=bad_timepoints,
+                moving_speed_threshold=float(speed_threshold),
+                moving_kernel_size=int(kernel_size),
+                moving_min_duration_s=float(min_duration_s),
+                moving_merge_gap_s=float(pf_firing_traversal_merge_gap_s),
+                distance_window_cm=float(pf_firing_traversal_distance_window_cm),
+                detection_window_cm=float(pf_firing_traversal_detection_window_cm),
+                distance_bin_cm=float(pf_firing_traversal_distance_bin_cm),
+                distance_mode=str(pf_firing_traversal_distance_mode),
+                center_vicinity_min_cm=int(pf_firing_traversal_center_vicinity_min_cm),
+                center_vicinity_max_cm=int(pf_firing_traversal_center_vicinity_max_cm),
+                resting_speed_threshold=float(pf_firing_traversal_resting_speed_threshold),
+                exclude_trials_with_bad_frames=bool(pf_firing_traversal_exclude_trials_with_bad_frames),
+            )
+
+            n_total = int(traversal_stats["n_trials"])
+            n_reliable = int(traversal_stats["n_firing_traversals"])
+            reliability = traversal_stats["reliability"]
+
+            passes_component = n_reliable >= min_firing_traversals_required
+            comp_with_stats = dict(comp)
+            comp_with_stats["component_index"] = int(comp_idx)
+            comp_with_stats[traversals_key] = n_total
+            comp_with_stats[reliable_key] = int(n_reliable)
+            comp_with_stats[firing_key] = int(n_reliable)
+            comp_with_stats[reliability_key] = reliability
+            comp_with_stats["min_pf_firing_traversals"] = int(min_firing_traversals_required)
+            comp_with_stats["passes_firing_traversal_filter"] = bool(passes_component)
+            comp_with_stats["passes_reliability_filter"] = bool(passes_component)
+            comp_with_stats["firing_traversal_filter_spike_type"] = label
+            comp_with_stats["firing_traversal_detection"] = "distance_defined_iterative"
+            comp_with_stats["reliability_filter_spike_type"] = label
+            comp_with_stats["reliability_eval_expanded"] = bool(reliability_eval_expanded)
+            comp_with_stats["reliability_eval_size_bins"] = reliability_eval_size_bins
+            comp_with_stats["reliability_eval_radius_bins"] = int(pf_reliability_dilation_bins)
+            comp_with_stats["reliability_eval_shape"] = pf_reliability_dilation_shape
+
+            filter_stats.append(
+                {
+                    "component_index": int(comp_idx),
+                    "spike_type": label,
+                    "size_bins": int(comp.get("size", 0)),
+                    "peak_rate": float(comp.get("peak_rate", np.nan)),
+                    traversals_key: n_total,
+                    reliable_key: int(n_reliable),
+                    firing_key: int(n_reliable),
+                    reliability_key: reliability,
+                    "min_pf_firing_traversals": int(min_firing_traversals_required),
+                    "passes_firing_traversal_filter": bool(passes_component),
+                    "passes_reliability_filter": bool(passes_component),
+                    "firing_traversal_filter_spike_type": label,
+                    "firing_traversal_detection": "distance_defined_iterative",
+                    "reliability_eval_expanded": bool(reliability_eval_expanded),
+                    "reliability_eval_size_bins": reliability_eval_size_bins,
+                    "reliability_eval_radius_bins": int(pf_reliability_dilation_bins),
+                    "reliability_eval_shape": pf_reliability_dilation_shape,
+                }
+            )
+            if passes_component:
+                kept_components.append(comp_with_stats)
+
+        return kept_components, filter_stats
+
+    def _mask_from_components(components, template):
+        component_mask = np.zeros_like(template, dtype=bool)
+        for comp in components or []:
+            mask = np.asarray(comp.get("mask"), dtype=bool)
+            if mask.shape == component_mask.shape:
+                component_mask |= mask
+        return component_mask
+
     # Calculate place field masks for SS and CS separately
     # These are always computed (not just for display) since they're needed for is_place_cell_ss/cs
     ss_place_field_mask = np.zeros_like(smooth_map_for_pf, dtype=bool)
     cs_place_field_mask = np.zeros_like(smooth_map_for_pf, dtype=bool)
     ss_place_field_components = []
     cs_place_field_components = []
+    ss_pf_component_filter_stats = []
+    cs_pf_component_filter_stats = []
+    ss_smooth_for_pf = None
+    cs_smooth_for_pf = None
     
-    # SS place field: computed from SS rate map (no significance requirement for the mask)
-    # The mask is used for visualization; is_place_cell_ss still requires ss_p_val < 0.05
+    # SS place field: computed from SS rate map, then component-filtered by
+    # minimum firing traversals only for final all-spike PLCs or SS PLC candidates.
     if ss_rate_map is not None:
         ss_peak = np.nanmax(ss_rate_map)
         if np.isfinite(ss_peak) and ss_peak > 0:
@@ -2293,9 +2457,31 @@ def analyze_place_cell_single_moving(
     if not (np.isfinite(ss_peak_rate) and ss_peak_rate >= min_peak_rate):
         ss_place_field_mask = np.zeros_like(smooth_map_for_pf, dtype=bool)
         ss_place_field_components = []
+    elif (
+        ss_place_field_components
+        and (
+            is_place_cell
+            or (
+                (ss_p_val < 0.05)
+                and (np.isfinite(ss_peak_rate) and ss_peak_rate >= min_peak_rate)
+            )
+        )
+    ):
+        ss_spike_times_for_reliability = (
+            refined_SS[cell_idx]
+            if refined_SS is not None and cell_idx < len(refined_SS)
+            else None
+        )
+        ss_place_field_components, ss_pf_component_filter_stats = _filter_event_place_field_components(
+            ss_place_field_components,
+            ss_spike_times_for_reliability,
+            ss_smooth_for_pf if ss_smooth_for_pf is not None else ss_rate_map,
+            "ss",
+        )
+        ss_place_field_mask = _mask_from_components(ss_place_field_components, smooth_map_for_pf)
     
-    # CS place field: computed from CS rate map (no significance requirement for the mask)
-    # The mask is used for visualization; is_place_cell_cs still requires cs_p_val < 0.05
+    # CS place field: computed from CS rate map, then component-filtered by
+    # minimum firing traversals only for final all-spike PLCs or CS PLC candidates.
     if cs_rate_map is not None:
         cs_peak = np.nanmax(cs_rate_map)
         if np.isfinite(cs_peak) and cs_peak > 0:
@@ -2325,27 +2511,29 @@ def analyze_place_cell_single_moving(
     if not (np.isfinite(cs_peak_rate) and cs_peak_rate >= min_peak_rate):
         cs_place_field_mask = np.zeros_like(smooth_map_for_pf, dtype=bool)
         cs_place_field_components = []
+    elif (
+        cs_place_field_components
+        and (
+            is_place_cell
+            or (
+                (cs_p_val < 0.05)
+                and (np.isfinite(cs_peak_rate) and cs_peak_rate >= min_peak_rate)
+            )
+        )
+    ):
+        cs_spike_times_for_reliability = (
+            all_CS_spikes[cell_idx]
+            if all_CS_spikes is not None and cell_idx < len(all_CS_spikes)
+            else None
+        )
+        cs_place_field_components, cs_pf_component_filter_stats = _filter_event_place_field_components(
+            cs_place_field_components,
+            cs_spike_times_for_reliability,
+            cs_smooth_for_pf if cs_smooth_for_pf is not None else cs_rate_map,
+            "cs",
+        )
+        cs_place_field_mask = _mask_from_components(cs_place_field_components, smooth_map_for_pf)
 
-    si = calculate_spatial_information(raw_map, occ_map)
-    shuffled_si_values = []
-    if len(spikes_in_sub_idx) > 0:
-        rng = np.random.default_rng(random_seed)
-        for _ in range(num_shuffles):
-            shift = int(rng.integers(1, len(binary_train_sub)))
-            shuf_bool = np.roll(binary_train_sub, shift=shift)
-            shuf_x = x_sub[shuf_bool]
-            shuf_y = y_sub[shuf_bool]
-            shuf_spk_map, _, _ = np.histogram2d(shuf_x, shuf_y, bins=bins)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                shuf_rate = shuf_spk_map / occ_map
-                shuf_rate[np.isnan(shuf_rate)] = 0
-            shuffled_si_values.append(calculate_spatial_information(shuf_rate, occ_map))
-    else:
-        shuffled_si_values = [0] * num_shuffles
-
-    shuffled_si_arr = np.array(shuffled_si_values)
-    p_val = np.sum(shuffled_si_arr >= si) / num_shuffles
-    
     # Field area is the SUMMED area of all valid place field components
     field_area = np.sum(place_field_mask) * (bin_size ** 2)
     n_place_fields = len(place_field_components)
@@ -2385,11 +2573,13 @@ def analyze_place_cell_single_moving(
 
     is_place_cell_ss = (
         (ss_p_val < 0.05) and
+        (n_ss_place_fields > 0) and
         (ss_field_area <= max_field_area) and  # Field area within limit (same as is_place_cell)
         (np.isfinite(ss_peak_rate) and ss_peak_rate >= min_peak_rate)
     )
     is_place_cell_cs = (
         (cs_p_val < 0.05) and
+        (n_cs_place_fields > 0) and
         (cs_field_area <= max_field_area) and  # Field area within limit (same as is_place_cell)
         (np.isfinite(cs_peak_rate) and cs_peak_rate >= min_peak_rate)
     )
@@ -2883,6 +3073,8 @@ def analyze_place_cell_single_moving(
         "pf_component_filter_stats": pf_component_filter_stats,
         "ss_place_field_components": ss_place_field_components,
         "cs_place_field_components": cs_place_field_components,
+        "ss_pf_component_filter_stats": ss_pf_component_filter_stats,
+        "cs_pf_component_filter_stats": cs_pf_component_filter_stats,
         "n_place_fields": n_place_fields,
         "n_ss_place_fields": n_ss_place_fields,
         "n_cs_place_fields": n_cs_place_fields,
@@ -2960,8 +3152,23 @@ def analyze_place_cell_single_moving(
             "top_row_trimmed_analysis": bool(top_row_trimmed_analysis),
             "top_row_trimmed_plotting": bool(top_row_trimmed_plotting),
             "min_peak_rate": min_peak_rate,
-            "min_pf_reliability": None if min_pf_reliability is None else float(min_pf_reliability),
-            "min_pf_traversals": None if min_pf_traversals is None else int(min_pf_traversals),
+            "min_pf_firing_traversals": (
+                None
+                if min_firing_traversals_required is None
+                else int(min_firing_traversals_required)
+            ),
+            "pf_firing_traversal_filter_scope": "candidate_place_cells_only",
+            "pf_firing_traversal_all_filter_applied": bool(apply_pf_component_filter),
+            "pf_firing_traversal_detection": "distance_defined_iterative",
+            "pf_firing_traversal_distance_window_cm": float(pf_firing_traversal_distance_window_cm),
+            "pf_firing_traversal_detection_window_cm": float(pf_firing_traversal_detection_window_cm),
+            "pf_firing_traversal_distance_bin_cm": float(pf_firing_traversal_distance_bin_cm),
+            "pf_firing_traversal_distance_mode": str(pf_firing_traversal_distance_mode),
+            "pf_firing_traversal_center_vicinity_min_cm": int(pf_firing_traversal_center_vicinity_min_cm),
+            "pf_firing_traversal_center_vicinity_max_cm": int(pf_firing_traversal_center_vicinity_max_cm),
+            "pf_firing_traversal_resting_speed_threshold": float(pf_firing_traversal_resting_speed_threshold),
+            "pf_firing_traversal_merge_gap_s": float(pf_firing_traversal_merge_gap_s),
+            "pf_firing_traversal_exclude_trials_with_bad_frames": bool(pf_firing_traversal_exclude_trials_with_bad_frames),
             "pf_reliability_dilation_bins": int(pf_reliability_dilation_bins),
             "pf_reliability_dilation_shape": pf_reliability_dilation_shape,
             "random_seed": random_seed,
@@ -7450,6 +7657,437 @@ def _build_pf_dilation_structure(radius_bins, shape="disk"):
     if shape == "disk":
         return (xx * xx + yy * yy) <= (radius_bins * radius_bins)
     return (np.abs(xx) + np.abs(yy)) <= radius_bins
+
+
+def _normalize_bad_frame_mask_for_pf_filter(bad_timepoints, n_frames):
+    if bad_timepoints is None:
+        return None
+    bad_mask = np.asarray(bad_timepoints)
+    if bad_mask.dtype != bool:
+        if bad_mask.ndim == 1 and bad_mask.size == int(n_frames):
+            bad_mask = bad_mask.astype(bool)
+        else:
+            bad_idx = np.asarray(bad_mask, dtype=int)
+            bad_idx = bad_idx[(bad_idx >= 0) & (bad_idx < int(n_frames))]
+            out = np.zeros(int(n_frames), dtype=bool)
+            out[bad_idx] = True
+            bad_mask = out
+    if bad_mask.shape[0] != int(n_frames):
+        return None
+    return np.asarray(bad_mask, dtype=bool)
+
+
+def _build_symmetric_distance_axis_for_pf_filter(distance_window_cm, distance_bin_cm):
+    window_req = float(distance_window_cm)
+    bin_cm = float(distance_bin_cm)
+    if window_req <= 0 or bin_cm <= 0:
+        raise ValueError("distance_window_cm and distance_bin_cm must be > 0.")
+    n_half_bins = max(1, int(np.ceil(window_req / bin_cm - 1e-12)))
+    window_eff = float(n_half_bins) * bin_cm
+    distance_rel = np.arange(-n_half_bins, n_half_bins + 1, dtype=float) * bin_cm
+    distance_rel[np.abs(distance_rel) < 1e-12] = 0.0
+    return window_req, window_eff, distance_rel
+
+
+def _normalize_distance_mode_for_pf_filter(raw):
+    mode = str(raw if raw is not None else "").strip().lower()
+    if mode in {"cumulative_path", "cumulative", "path", "path_length", "travel", "traveled_distance"}:
+        return "cumulative_path"
+    if mode in {"euclidean_to_peak", "euclidean", "peak", "straight_to_peak"}:
+        return "euclidean_to_peak"
+    raise ValueError(
+        f"Unsupported distance_mode {raw!r}. Use 'cumulative_path' or 'euclidean_to_peak'."
+    )
+
+
+def _compute_signed_distance_from_center_for_pf_filter(
+    x_seg,
+    y_seg,
+    *,
+    center_local,
+    pf_peak_xy,
+    distance_mode,
+):
+    x_seg = np.asarray(x_seg, dtype=float)
+    y_seg = np.asarray(y_seg, dtype=float)
+    if x_seg.size == 0 or y_seg.size == 0 or x_seg.size != y_seg.size:
+        return None
+    center_local = int(center_local)
+    if center_local < 0 or center_local >= int(x_seg.size):
+        return None
+    if not (np.all(np.isfinite(x_seg)) and np.all(np.isfinite(y_seg))):
+        return None
+
+    mode = _normalize_distance_mode_for_pf_filter(distance_mode)
+    if mode == "cumulative_path":
+        if x_seg.size == 1:
+            return np.array([0.0], dtype=float)
+        step_cm = np.sqrt(np.diff(x_seg) ** 2 + np.diff(y_seg) ** 2)
+        cumulative_cm = np.concatenate([np.array([0.0], dtype=float), np.cumsum(step_cm, dtype=float)])
+        signed_distance = cumulative_cm - float(cumulative_cm[center_local])
+        signed_distance[np.abs(signed_distance) < 1e-12] = 0.0
+        return signed_distance
+
+    pf_x, pf_y = pf_peak_xy
+    signed_distance = np.sqrt((x_seg - float(pf_x)) ** 2 + (y_seg - float(pf_y)) ** 2)
+    signed_distance = np.asarray(signed_distance, dtype=float)
+    signed_distance[:center_local] *= -1.0
+    signed_distance[center_local] = 0.0
+    signed_distance[np.abs(signed_distance) < 1e-12] = 0.0
+    return signed_distance
+
+
+def _find_distance_defined_trials_iterative_for_pf_filter(
+    dist_to_peak,
+    valid_mask,
+    moving_mask,
+    *,
+    trial_span_cm,
+    detection_span_cm,
+    vicinity_min_cm,
+    vicinity_max_cm,
+):
+    n = int(len(dist_to_peak))
+    if n == 0:
+        return []
+    dist_arr = np.asarray(dist_to_peak, dtype=float).reshape(-1)
+    valid_arr = np.asarray(valid_mask, dtype=bool).reshape(-1)
+    moving_arr = np.asarray(moving_mask, dtype=bool).reshape(-1)
+    if dist_arr.size != n or valid_arr.size != n or moving_arr.size != n:
+        raise ValueError("dist_to_peak, valid_mask, and moving_mask must have matching lengths.")
+
+    trials = []
+    taken = np.zeros(n, dtype=bool)
+    valid_dist_mask = valid_arr & np.isfinite(dist_arr)
+    moving_valid_mask = valid_dist_mask & moving_arr
+    if not np.any(moving_valid_mask):
+        return []
+    moving_valid_indices = np.flatnonzero(moving_valid_mask)
+
+    def _build_reach_arrays(span_cm):
+        reach_mask = valid_dist_mask & (dist_arr >= float(span_cm))
+        left_reach = np.full(n, -1, dtype=int)
+        right_reach = np.full(n, -1, dtype=int)
+        last_idx = -1
+        for i in range(n):
+            if reach_mask[i]:
+                last_idx = int(i)
+            left_reach[i] = int(last_idx)
+        next_idx = -1
+        for i in range(n - 1, -1, -1):
+            if reach_mask[i]:
+                next_idx = int(i)
+            right_reach[i] = int(next_idx)
+        return left_reach, right_reach
+
+    left_detect_reach, right_detect_reach = _build_reach_arrays(float(detection_span_cm))
+    left_trial_reach, right_trial_reach = _build_reach_arrays(float(trial_span_cm))
+
+    def _find_left(center_idx, left_reach):
+        center_idx = int(center_idx)
+        if center_idx <= 0:
+            return None
+        out = int(left_reach[center_idx - 1])
+        return None if out < 0 else out
+
+    def _find_right(center_idx, right_reach):
+        center_idx = int(center_idx)
+        if center_idx >= (n - 1):
+            return None
+        out = int(right_reach[center_idx + 1])
+        return None if out < 0 else out
+
+    for vicinity_cm in range(int(vicinity_min_cm), int(vicinity_max_cm) + 1):
+        candidate_indices = np.flatnonzero(moving_valid_mask & (dist_arr <= float(vicinity_cm)))
+        if candidate_indices.size == 0:
+            continue
+        pointer = 0
+        pos = 0
+        n_candidates = int(candidate_indices.size)
+        while pos < n_candidates:
+            center_idx = int(candidate_indices[pos])
+            if center_idx < pointer or bool(taken[center_idx]):
+                pos += 1
+                continue
+            candidate_center_idx = int(center_idx)
+            detect_start_idx = _find_left(center_idx, left_detect_reach)
+            detect_end_idx = _find_right(center_idx, right_detect_reach)
+            if (
+                detect_start_idx is None
+                or detect_end_idx is None
+                or detect_end_idx <= detect_start_idx
+            ):
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
+                continue
+            start_idx = _find_left(center_idx, left_trial_reach)
+            end_idx = _find_right(center_idx, right_trial_reach)
+            if start_idx is None or end_idx is None or end_idx <= start_idx:
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
+                continue
+
+            left_pos = int(np.searchsorted(moving_valid_indices, int(start_idx), side="left"))
+            right_pos = int(np.searchsorted(moving_valid_indices, int(end_idx), side="right"))
+            trial_candidates = moving_valid_indices[left_pos:right_pos]
+            if trial_candidates.size > 0 and np.any(taken[trial_candidates]):
+                trial_candidates = trial_candidates[~taken[trial_candidates]]
+            if trial_candidates.size == 0:
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
+                continue
+            trial_dists = np.asarray(dist_arr[trial_candidates], dtype=float)
+            center_idx = int(trial_candidates[int(np.nanargmin(trial_dists))])
+            detect_start_idx = _find_left(center_idx, left_detect_reach)
+            detect_end_idx = _find_right(center_idx, right_detect_reach)
+            if (
+                detect_start_idx is None
+                or detect_end_idx is None
+                or detect_end_idx <= detect_start_idx
+            ):
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
+                continue
+            start_idx = _find_left(center_idx, left_trial_reach)
+            end_idx = _find_right(center_idx, right_trial_reach)
+            if start_idx is None or end_idx is None or end_idx <= start_idx:
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
+                continue
+            end_exclusive = int(end_idx + 1)
+            if np.any(taken[start_idx:end_exclusive]):
+                pointer = max(int(pointer), int(candidate_center_idx) + 1, int(center_idx) + 1)
+                pos += 1
+                continue
+            trials.append(
+                {
+                    "epoch_start": int(start_idx),
+                    "epoch_end": int(end_exclusive),
+                    "center_idx": int(center_idx),
+                    "center_vicinity_cm": float(vicinity_cm),
+                    "detect_start": int(detect_start_idx),
+                    "detect_end": int(detect_end_idx + 1),
+                }
+            )
+            taken[start_idx:end_exclusive] = True
+            pointer = int(end_exclusive)
+            pos = int(np.searchsorted(candidate_indices, int(pointer), side="left"))
+    if len(trials) > 1:
+        trials = sorted(
+            trials,
+            key=lambda t: (int(t["epoch_start"]), int(t["epoch_end"]), int(t["center_idx"])),
+        )
+    return trials
+
+
+def _compute_pf_peak_xy_from_mask_for_pf_filter(place_field_mask, rate_map, pf_bins):
+    if place_field_mask is None or not np.any(place_field_mask):
+        return None
+    if rate_map is None:
+        return None
+    masked_rate = np.where(place_field_mask, rate_map, np.nan)
+    if not np.any(np.isfinite(masked_rate)):
+        return None
+    x_centers = (pf_bins[0][:-1] + pf_bins[0][1:]) / 2
+    y_centers = (pf_bins[1][:-1] + pf_bins[1][1:]) / 2
+    peak_idx = np.nanargmax(masked_rate)
+    peak_row, peak_col = np.unravel_index(peak_idx, masked_rate.shape)
+    return float(x_centers[peak_row]), float(y_centers[peak_col])
+
+
+def _compute_distance_defined_pf_firing_traversal_stats(
+    *,
+    x_neural,
+    y_neural,
+    speed,
+    frame_rate,
+    event_spikes,
+    place_field_mask,
+    rate_map,
+    width_real,
+    height_real,
+    bin_size,
+    bad_timepoints=None,
+    moving_speed_threshold=3.0,
+    moving_kernel_size=51,
+    moving_min_duration_s=0.25,
+    moving_merge_gap_s=2.0,
+    distance_window_cm=15.0,
+    detection_window_cm=8.0,
+    distance_bin_cm=1.5,
+    distance_mode="euclidean_to_peak",
+    center_vicinity_min_cm=1,
+    center_vicinity_max_cm=5,
+    resting_speed_threshold=0.5,
+    exclude_trials_with_bad_frames=True,
+):
+    x_arr = np.asarray(x_neural, dtype=float)
+    y_arr = np.asarray(y_neural, dtype=float)
+    speed_arr = np.asarray(speed, dtype=float)
+    n_frames = int(min(x_arr.size, y_arr.size, speed_arr.size))
+    if n_frames <= 0:
+        return {"n_trials": 0, "n_firing_traversals": 0, "reliability": np.nan}
+    x_arr = x_arr[:n_frames]
+    y_arr = y_arr[:n_frames]
+    speed_arr = speed_arr[:n_frames]
+
+    distance_window_req, distance_window_eff, distance_rel = _build_symmetric_distance_axis_for_pf_filter(
+        distance_window_cm,
+        distance_bin_cm,
+    )
+    detection_window_eff = min(float(detection_window_cm), float(distance_window_eff))
+    if (not np.isfinite(detection_window_eff)) or detection_window_eff <= 0:
+        raise ValueError("detection_window_cm must be a finite number > 0.")
+    distance_window_eff = float(distance_window_eff)
+    distance_bin_cm = float(distance_bin_cm)
+    bin_edges = np.concatenate(
+        [
+            distance_rel - 0.5 * distance_bin_cm,
+            np.array([distance_rel[-1] + 0.5 * distance_bin_cm], dtype=float),
+        ]
+    )
+
+    pf_bins = [
+        np.arange(0, float(width_real) + float(bin_size), float(bin_size)),
+        np.arange(0, float(height_real) + float(bin_size), float(bin_size)),
+    ]
+    pf_mask = np.asarray(place_field_mask, dtype=bool)
+    pf_peak_xy = _compute_pf_peak_xy_from_mask_for_pf_filter(pf_mask, rate_map, pf_bins)
+    if pf_peak_xy is None:
+        return {"n_trials": 0, "n_firing_traversals": 0, "reliability": np.nan}
+    pf_x, pf_y = pf_peak_xy
+
+    bad_mask = _normalize_bad_frame_mask_for_pf_filter(bad_timepoints, n_frames)
+    valid_frame_mask = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(speed_arr)
+    if bad_mask is not None:
+        valid_frame_mask &= ~bad_mask
+
+    moving_kernel_size = max(3, int(moving_kernel_size))
+    if moving_kernel_size % 2 == 0:
+        moving_kernel_size += 1
+    _, _, moving_idx_raw = _compute_moving_epochs(
+        speed=speed_arr,
+        frame_rate=float(frame_rate),
+        kernel_size=int(moving_kernel_size),
+        filter_type="median",
+        speed_threshold=float(moving_speed_threshold),
+        min_duration_s=float(max(0.0, moving_min_duration_s)),
+        merge_gap_s=float(max(0.0, moving_merge_gap_s)),
+    )
+    moving_mask = np.zeros(n_frames, dtype=bool)
+    moving_idx_raw = np.asarray(moving_idx_raw, dtype=int)
+    moving_idx_raw = moving_idx_raw[(moving_idx_raw >= 0) & (moving_idx_raw < n_frames)]
+    moving_mask[moving_idx_raw] = True
+    moving_mask &= valid_frame_mask
+
+    dist_to_peak = np.full(n_frames, np.nan, dtype=float)
+    valid_xy = np.isfinite(x_arr) & np.isfinite(y_arr)
+    dist_to_peak[valid_xy] = np.sqrt(
+        (x_arr[valid_xy] - float(pf_x)) ** 2 + (y_arr[valid_xy] - float(pf_y)) ** 2
+    )
+
+    trials = _find_distance_defined_trials_iterative_for_pf_filter(
+        dist_to_peak=dist_to_peak,
+        valid_mask=valid_frame_mask,
+        moving_mask=moving_mask,
+        trial_span_cm=float(distance_window_eff),
+        detection_span_cm=float(detection_window_eff),
+        vicinity_min_cm=int(center_vicinity_min_cm),
+        vicinity_max_cm=int(center_vicinity_max_cm),
+    )
+    if len(trials) == 0:
+        return {"n_trials": 0, "n_firing_traversals": 0, "reliability": np.nan}
+
+    event_spikes = np.unique(np.asarray(event_spikes, dtype=int))
+    event_spikes = event_spikes[(event_spikes >= 0) & (event_spikes < n_frames)]
+    if bad_mask is not None and event_spikes.size > 0:
+        event_spikes = event_spikes[~bad_mask[event_spikes]]
+    event_spikes = np.sort(event_spikes)
+
+    n_trials = 0
+    n_firing = 0
+    seen_epochs = set()
+    for tr in trials:
+        trial_start = int(tr["epoch_start"])
+        trial_end = int(tr["epoch_end"])
+        center_idx = int(tr["center_idx"])
+        if trial_end <= trial_start or center_idx < trial_start or center_idx >= trial_end:
+            continue
+        if bool(exclude_trials_with_bad_frames) and bad_mask is not None and np.any(bad_mask[trial_start:trial_end]):
+            continue
+
+        x_seg_full = x_arr[trial_start:trial_end]
+        y_seg_full = y_arr[trial_start:trial_end]
+        center_local_full = int(center_idx - trial_start)
+        signed_distance_full = _compute_signed_distance_from_center_for_pf_filter(
+            x_seg_full,
+            y_seg_full,
+            center_local=center_local_full,
+            pf_peak_xy=pf_peak_xy,
+            distance_mode=distance_mode,
+        )
+        if (
+            signed_distance_full is None
+            or signed_distance_full.size == 0
+            or not np.all(np.isfinite(signed_distance_full))
+        ):
+            continue
+        left_candidates = np.where(signed_distance_full[:center_local_full + 1] <= -distance_window_eff)[0]
+        right_candidates = np.where(signed_distance_full[center_local_full:] >= distance_window_eff)[0]
+        if left_candidates.size == 0 or right_candidates.size == 0:
+            continue
+        start_local = int(left_candidates[-1])
+        end_local = int(center_local_full + right_candidates[0])
+        if end_local <= start_local:
+            continue
+        start = int(trial_start + start_local)
+        end = int(start + (end_local - start_local + 1))
+        center_local = int(center_local_full - start_local)
+        signed_distance = np.asarray(signed_distance_full[start_local:end_local + 1], dtype=float)
+        if end <= start or center_local < 0 or center_local >= signed_distance.size:
+            continue
+
+        speed_seg = speed_arr[start:end]
+        rest_mask = np.isfinite(speed_seg) & (speed_seg < float(resting_speed_threshold))
+        valid_local = valid_frame_mask[start:end] & np.isfinite(signed_distance)
+        x_seg = x_arr[start:end]
+        y_seg = y_arr[start:end]
+        in_pf_local = _positions_in_place_field(x_seg, y_seg, pf_bins, pf_mask)
+        if not np.any(in_pf_local & valid_local):
+            continue
+        bin_idx = np.digitize(signed_distance, bin_edges) - 1
+        bin_valid = (bin_idx >= 0) & (bin_idx < int(distance_rel.size))
+        include_local = valid_local & bin_valid & (~rest_mask)
+        if not np.any(include_local):
+            continue
+        display_epoch_key = (int(start), int(end))
+        if display_epoch_key in seen_epochs:
+            continue
+        seen_epochs.add(display_epoch_key)
+
+        # Trial discovery mirrors generate_distance_defined_trials_and_dataset,
+        # while the PF gate counts firing during the actual PF occupancy frames.
+        firing_local = include_local & in_pf_local
+        frame_to_bin = np.full(end - start, -1, dtype=int)
+        frame_to_bin[firing_local] = bin_idx[firing_local]
+        n_trials += 1
+        if event_spikes.size > 0:
+            left = int(np.searchsorted(event_spikes, start, side="left"))
+            right = int(np.searchsorted(event_spikes, end, side="left"))
+            spike_local = event_spikes[left:right] - start
+            spike_local = spike_local[(spike_local >= 0) & (spike_local < (end - start))]
+            if spike_local.size > 0 and np.any(frame_to_bin[spike_local] >= 0):
+                n_firing += 1
+
+    reliability = (float(n_firing) / float(n_trials)) if n_trials > 0 else np.nan
+    return {
+        "n_trials": int(n_trials),
+        "n_firing_traversals": int(n_firing),
+        "reliability": reliability,
+        "distance_window_cm_requested": float(distance_window_req),
+        "distance_window_cm_effective": float(distance_window_eff),
+        "detection_window_cm_effective": float(detection_window_eff),
+    }
 
 
 def _positions_in_place_field(x_vals, y_vals, pf_bins, place_field_mask):
