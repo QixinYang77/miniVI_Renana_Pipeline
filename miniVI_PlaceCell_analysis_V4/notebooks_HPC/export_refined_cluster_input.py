@@ -37,6 +37,26 @@ from utils.placecell_pipeline import (
     build_refined_analysis_data_from_manual_sidecar,
 )
 
+SLIM_DROP_KEYS = (
+    "spike_heights_interpolated",
+    "manual_refined_manual_exclusion_masks",
+    "manual_refined_snr_cutoff_masks",
+)
+SLIM_FLOAT32_KEYS = (
+    "x_neural",
+    "y_neural",
+    "speed",
+    "hd_angles_neural",
+    "ts_neural",
+)
+SLIM_EVENT_TRACE_KEYS = (
+    "trace",
+    "trace_bl_subtracted",
+    "trace_mf",
+    "trace_lp",
+    "fitted_baseline",
+)
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -92,6 +112,73 @@ def _build_refined_payload(animal_dir: Path, *, rebuild_refined: bool) -> dict[s
     return _load_sidecar_refined(animal_dir)
 
 
+def _array_nbytes_recursive(value: Any, seen: set[int] | None = None) -> int:
+    if seen is None:
+        seen = set()
+    oid = id(value)
+    if oid in seen:
+        return 0
+    seen.add(oid)
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if isinstance(value, dict):
+        return sum(_array_nbytes_recursive(k, seen) + _array_nbytes_recursive(v, seen) for k, v in value.items())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return sum(_array_nbytes_recursive(v, seen) for v in value)
+    return 0
+
+
+def _strip_event_trace_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: v for k, v in value.items() if str(k) not in SLIM_EVENT_TRACE_KEYS}
+    if isinstance(value, list):
+        return [_strip_event_trace_fields(v) if isinstance(v, dict) else v for v in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_event_trace_fields(v) if isinstance(v, dict) else v for v in value)
+    return value
+
+
+def slim_refined_payload_for_cluster(refined: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Remove duplicated/nonessential arrays from a refined payload for cluster transfer."""
+    before_bytes = _array_nbytes_recursive(refined)
+    slimmed = dict(refined)
+    dropped: dict[str, int] = {}
+
+    for key in SLIM_DROP_KEYS:
+        if key in slimmed:
+            dropped[key] = _array_nbytes_recursive(slimmed[key])
+            slimmed.pop(key, None)
+
+    converted_to_float32: list[str] = []
+    for key in SLIM_FLOAT32_KEYS:
+        if key not in slimmed:
+            continue
+        arr = np.asarray(slimmed[key], dtype=np.float32).reshape(-1)
+        slimmed[key] = arr
+        converted_to_float32.append(key)
+
+    stripped_event_dicts: list[str] = []
+    for key in ("complex_bursts_dicts", "plateaus_dicts"):
+        if key in slimmed:
+            slimmed[key] = _strip_event_trace_fields(slimmed[key])
+            stripped_event_dicts.append(key)
+
+    after_bytes = _array_nbytes_recursive(slimmed)
+    report = {
+        "enabled": True,
+        "profile": "refined_cluster_slim_v1",
+        "array_bytes_before": int(before_bytes),
+        "array_bytes_after": int(after_bytes),
+        "array_bytes_saved": int(before_bytes - after_bytes),
+        "dropped_keys": dropped,
+        "float32_keys": converted_to_float32,
+        "event_trace_keys_removed": list(SLIM_EVENT_TRACE_KEYS),
+        "event_dict_keys_slimmed": stripped_event_dicts,
+    }
+    slimmed["cluster_export_slimming"] = report
+    return slimmed, report
+
+
 def _validate_refined_payload(animal_id: str, refined: dict[str, Any]) -> dict[str, Any]:
     source_filename = str(refined.get("hydration_source_filename", ""))
     if source_filename != REFINED_BEHAVIOR_FILENAME:
@@ -124,17 +211,31 @@ def build_bundle(
     animals: list[str],
     rebuild_refined: bool,
     include_data: bool,
+    slim: bool,
 ) -> dict[str, Any]:
     animal_payloads: dict[str, dict[str, Any]] = {}
     source_files: dict[str, dict[str, Any]] = {}
     validation: dict[str, dict[str, Any]] = {}
+    slimming: dict[str, dict[str, Any]] = {}
 
     for animal_id in animals:
         animal_dir = data_root / animal_id
         if not animal_dir.exists():
             raise FileNotFoundError(f"Missing animal directory: {animal_dir}")
         refined = _build_refined_payload(animal_dir, rebuild_refined=rebuild_refined)
+        if slim:
+            refined, slimming[animal_id] = slim_refined_payload_for_cluster(refined)
+        else:
+            slimming[animal_id] = {
+                "enabled": False,
+                "array_bytes_before": int(_array_nbytes_recursive(refined)),
+                "array_bytes_after": int(_array_nbytes_recursive(refined)),
+                "array_bytes_saved": 0,
+            }
         validation[animal_id] = _validate_refined_payload(animal_id, refined)
+        validation[animal_id]["cluster_export_slim"] = bool(slim)
+        validation[animal_id]["array_bytes_after_slim"] = int(slimming[animal_id]["array_bytes_after"])
+        validation[animal_id]["array_bytes_saved_by_slim"] = int(slimming[animal_id]["array_bytes_saved"])
         source_files[animal_id] = {
             MANUAL_REFINED_SIDECAR_FILENAME: _file_record(animal_dir / MANUAL_REFINED_SIDECAR_FILENAME),
             REFINED_BEHAVIOR_FILENAME: _file_record(animal_dir / REFINED_BEHAVIOR_FILENAME),
@@ -149,10 +250,12 @@ def build_bundle(
             "script": str(Path(__file__).resolve()),
             "data_root": str(data_root),
             "rebuild_refined": bool(rebuild_refined),
+            "slim": bool(slim),
         },
         "parameter_snapshot": refined_parameter_snapshot(),
         "source_files": source_files,
         "validation": validation,
+        "slimming": slimming,
         "animals": animal_payloads,
     }
 
@@ -173,6 +276,11 @@ def main() -> None:
         action="store_true",
         help="Rebuild refined payloads in memory from manual sidecars and merged_aligned_data_new.pkl",
     )
+    parser.add_argument(
+        "--no-slim",
+        action="store_true",
+        help="Write the full refined payload without cluster-transfer slimming",
+    )
     args = parser.parse_args()
 
     output = args.output
@@ -184,6 +292,7 @@ def main() -> None:
         animals=[str(a) for a in args.animals],
         rebuild_refined=bool(args.rebuild_refined),
         include_data=not bool(args.dry_run),
+        slim=not bool(args.no_slim),
     )
 
     print(json.dumps(bundle["validation"], indent=2, sort_keys=True))
