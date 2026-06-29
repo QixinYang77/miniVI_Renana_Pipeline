@@ -48,14 +48,14 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 import utils.placecell_core as core
+from notebooks_HPC.egocentric_refined_config import (
+    ANIMALS,
+    MANUAL_REFINED_SIDECAR_FILENAME,
+    build_refined_config,
+)
 from utils.placecell_pipeline import (
-    AnalysisParams,
-    PlaceCellParams,
-    PFTraversalParams,
-    PooledParams,
-    CachePolicy,
-    PipelineConfig,
     EgocentricSummaryPlotParams,
+    _resolve_merged_data_path,
     _load_merged_data,
     _prepare_native_analysis_context,
     _load_spatial_analysis_by_idx,
@@ -74,68 +74,23 @@ from utils.placecell_pipeline import (
 from utils.spatial_heatmaps import classify_spatial_cells
 
 
-ANIMALS = [
-    'CKII_pAce21_PR_20250806',
-    'CKII_pAce38_PX_20251126',
-    'CKII_pAce45_PX_20260118',
-    'CKII_pAce47_PX_20260128',
-    'CKII_pAce46_PR_20260222',
-    'CKII_pAce50_PRL_20260317',
-]
-
-
-def build_config(data_root, figures_root):
-    return PipelineConfig(
-        project_root=HERE,
-        data_root=Path(data_root),
-        figures_root=Path(figures_root),
-        notebooks_root=HERE / 'notebooks_PCs',
-        animals=ANIMALS,
-        analysis=AnalysisParams(
-            speed_threshold=3.0, speed_threshold_quiet=0.5, min_duration_s=0.25,
-            merge_gap_s=0.0, kernel_size=51, snr_threshold=3.0, min_good_minutes=5.0,
-            theta_freqs=(4.0, 8.0), slow_freqs=2.0,
-        ),
-        place_cell=PlaceCellParams(
-            bin_size=1.5, place_field_threshold=0.35, min_component_peak_ratio=0.45,
-            split_multi_peak_fields=True, split_secondary_peak_ratio=0.6,
-            split_secondary_peak_min_separation_cm=6.0, min_peak_rate=0.5,
-            max_field_area_ratio=0.5, min_field_bins=10, min_pf_firing_traversals=5,
-            pf_firing_traversal_distance_window_cm=15.0,
-            pf_firing_traversal_detection_window_cm=8.0,
-            pf_firing_traversal_distance_bin_cm=1.5,
-            pf_firing_traversal_distance_mode='euclidean_to_peak',
-            pf_firing_traversal_center_vicinity_min_cm=1,
-            pf_firing_traversal_center_vicinity_max_cm=5,
-            pf_firing_traversal_resting_speed_threshold=0.5,
-            pf_firing_traversal_merge_gap_s=2.0,
-            pf_firing_traversal_exclude_trials_with_bad_frames=True,
-            pf_reliability_dilation_bins=3,
-            pf_reliability_dilation_shape='disk', smooth_sigma=1.5, min_occupancy_s=0.001,
-            occ_smooth_sigma=1.5, num_shuffles=1000, random_seed=42,
-            ss_shape_min_separation_ms=14.0, trim_sparse_top_row_for_analysis=True,
-            trim_sparse_top_row_for_plotting=True, sparse_top_row_nonocc_frac_threshold=0.8,
-        ),
-        traversal=PFTraversalParams(
-            center_by_pf_position=True, pf_component_selection='peak_rate',
-            min_duration_ms=100.0, min_distance_cm=5.0, traversal_merge_gap_s=2.0,
-            clear_traversal=False, session_indices=(0, 1), pf_center_window_sec=10.0,
-            min_traversals=10, firing_rate_bin_ms=100.0, firing_rate_smooth_ms=50.0,
-            subtract_pre_traversal_baseline=False, mask_non_traversal_pf=True,
-            max_pf_distance_cm=8.0, plateau_min_duration_ms=100.0,
-        ),
-        pooled=PooledParams(
-            cb_num_threshold=5, cs_peak_rate_threshold=0.5, cs_plc_definition_mode='cs_place_field',
-            run_psd_sections=True,
-            cs_plc_only=True, psd_speed_threshold=3, psd_chunk_s=2.0, psd_nperseg_s=1.0,
-            psd_noverlap_frac=0.5, simple_event_window_ms=80.0, simple_event_min_gap_ms=50.0,
-            min_chunk_valid_fraction=1.0, max_freq=100.0, normalize_psd=True,
-            norm_freq_range=(20.0, 100.0),
-        ),
-        cache=CachePolicy(
-            force_recompute=False, validate_only=False, save_executed_notebooks=False,
-        ),
+def build_config(data_root, figures_root, merged_data_filename=MANUAL_REFINED_SIDECAR_FILENAME):
+    config = build_refined_config(
+        HERE,
+        data_root,
+        figures_root,
+        force_recompute=False,
     )
+    config.merged_data_filename = str(merged_data_filename)
+    return config
+
+
+def _ordered_categories_from_manifest(manifest):
+    preferred = ('CSplus', 'CSminus', 'all-nonPLC')
+    present = [str(m.get('category', '')) for m in manifest if str(m.get('category', ''))]
+    out = [cat for cat in preferred if cat in set(present)]
+    out.extend(cat for cat in sorted(set(present)) if cat not in set(out))
+    return tuple(out)
 
 
 def _coerce_bool(v):
@@ -2160,6 +2115,16 @@ def main(argv=None):
     parser.add_argument('--ss-run', type=str, default='head_simple_spike')
     parser.add_argument('--cs-run', type=str, default='head_complex_spike')
     parser.add_argument('--data-root', type=str, default=str(HERE / 'data'))
+    parser.add_argument(
+        '--merged-data-filename',
+        type=str,
+        default=MANUAL_REFINED_SIDECAR_FILENAME,
+        help=(
+            'Per-animal runtime data pickle for local figure generation. '
+            f'Defaults to {MANUAL_REFINED_SIDECAR_FILENAME}; use '
+            'cluster_refined_analysis_data.pkl only if you copied/unpacked that compact payload locally.'
+        ),
+    )
     parser.add_argument('--spatial-cache-root', type=str, default=None,
                         help='Root containing per-animal spatial_analysis_full.pkl files. '
                              'Defaults to --data-root')
@@ -2296,20 +2261,21 @@ def main(argv=None):
         if not p.exists():
             raise FileNotFoundError(f'Missing run folder: {p}')
 
-    config = build_config(args.data_root, args.figures_root)
+    config = build_config(args.data_root, args.figures_root, args.merged_data_filename)
     spatial_cache_root = Path(args.spatial_cache_root) if args.spatial_cache_root else Path(args.data_root)
 
     manifest_path = manifest_dir / 'manifest.json'
     with open(manifest_path) as f:
         manifest = json.load(f)
     print(f'Loaded manifest: {len(manifest)} cells')
+    print(f'Refined config animals: {len(config.animals)} ({", ".join(config.animals)})')
 
     lookup_all = load_npz_summary_lookup(run_all / 'per_cell_results', manifest)
     lookup_ss = load_npz_summary_lookup(run_ss / 'per_cell_results', manifest)
     lookup_cs = load_npz_summary_lookup(run_cs / 'per_cell_results', manifest)
 
     params = EgocentricSummaryPlotParams(
-        categories=tuple(sorted(set(m['category'] for m in manifest))),
+        categories=_ordered_categories_from_manifest(manifest),
         first_n_minutes=args.first_n_minutes,
         direction_mode=args.direction_mode,
         time_bin_s=0.1,
@@ -2333,24 +2299,24 @@ def main(argv=None):
         split_preferred_half_width_deg=float(args.split_preferred_half_width_deg),
         pf_overlay_area_threshold=float(args.pf_overlay_area_threshold),
         split_map_bin_size_cm=float(args.split_map_bin_size_cm),
-        pc_bin_size_cm=1.5,
-        pc_smooth_sigma=2.5,
-        pc_occ_smooth_sigma=2.5,
+        pc_bin_size_cm=float(config.place_cell.bin_size),
+        pc_smooth_sigma=float(config.place_cell.smooth_sigma),
+        pc_occ_smooth_sigma=float(config.place_cell.occ_smooth_sigma),
         pc_min_occupancy_s=float(occupancy_threshold_s),
         pc_use_smoothed_occ_mask=False,
-        pc_kernel_size=51,
+        pc_kernel_size=int(config.analysis.kernel_size),
         pc_filter_type='boxcar',
-        pc_speed_threshold_cm_s=3.0,
-        pc_min_duration_s=0.25,
-        pc_merge_gap_s=0.0,
+        pc_speed_threshold_cm_s=float(config.analysis.speed_threshold),
+        pc_min_duration_s=float(config.analysis.min_duration_s),
+        pc_merge_gap_s=float(config.analysis.merge_gap_s),
         travel_smooth_window=5,
         travel_min_step=0.0,
-        theta_freqs=(4.0, 8.0),
-        slow_freqs=2.0,
-        theta_slow_speed_threshold=3.0,
-        theta_slow_kernel_size=51,
-        theta_slow_min_duration_s=0.25,
-        theta_slow_merge_gap_s=0.0,
+        theta_freqs=tuple(config.analysis.theta_freqs),
+        slow_freqs=float(config.analysis.slow_freqs),
+        theta_slow_speed_threshold=float(config.analysis.speed_threshold),
+        theta_slow_kernel_size=int(config.analysis.kernel_size),
+        theta_slow_min_duration_s=float(config.analysis.min_duration_s),
+        theta_slow_merge_gap_s=float(config.analysis.merge_gap_s),
         hd_vel_corr_method=str(args.hd_vel_corr_method),
         col3_emp_arrow_length_scale=float(col3_emp_arrow_length_scale),
         binpolar_render_style=str(binpolar_render_style),
@@ -2376,6 +2342,7 @@ def main(argv=None):
         snr_threshold=config.analysis.snr_threshold,
     )
     print(f'Using spatial cache root: {spatial_cache_root}')
+    print(f'Using runtime merged data filename: {config.merged_data_filename}')
     current_category_by_cell = _current_category_lookup_from_spatial_data(spatial_data)
     print(
         'Using current cached spatial classifications for category labels '
@@ -2417,8 +2384,11 @@ def main(argv=None):
         spatial_cache_animal_dir = spatial_cache_root / animal_id
 
         try:
-            merged = _load_merged_data(animal_dir)
-            ctx = _prepare_native_analysis_context(merged, config)
+            resolved_data_path = _resolve_merged_data_path(animal_dir, config)
+            print(f'  Runtime merged data: {resolved_data_path}')
+            print(f'  Spatial analysis:    {spatial_cache_animal_dir / "spatial_analysis_full.pkl"}')
+            merged = _load_merged_data(animal_dir, config)
+            ctx = _prepare_native_analysis_context(merged, config, require_traces=False)
             spatial_by_idx = _load_spatial_analysis_by_idx(spatial_cache_animal_dir)
         except Exception as exc:
             print(f'  [ERROR] Failed to load data: {exc}')
