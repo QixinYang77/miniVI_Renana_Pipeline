@@ -2253,7 +2253,7 @@ def main(argv=None):
         binpolar_render_style = 'fan'
     any_pass_key = f'pass_{any_pass_threshold}'
     any_pass_suffix = f'any{any_pass_threshold}'
-    min_all_real_mrl = 0.15
+    min_all_real_mrl = 0.10
     min_green_rings = 2
 
     run_all = base_dir / args.all_run
@@ -2591,7 +2591,7 @@ def main(argv=None):
                         'category': category,
                         'animal_id': animal_id,
                         'cell_idx': cell_idx,
-                        'reason': f'low_real_mrl_all_lt0p15(real_mrl_all={real_mrl_all:.3f})',
+                        'reason': f'low_real_mrl_all_lt0p10(real_mrl_all={real_mrl_all:.3f})',
                     })
                     counts['filtered_low_real_mrl_all'] += 1
                     counts['skipped'] += 1
