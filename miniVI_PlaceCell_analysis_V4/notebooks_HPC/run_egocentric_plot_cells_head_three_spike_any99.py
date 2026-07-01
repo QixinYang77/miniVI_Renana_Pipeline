@@ -2253,6 +2253,8 @@ def main(argv=None):
         binpolar_render_style = 'fan'
     any_pass_key = f'pass_{any_pass_threshold}'
     any_pass_suffix = f'any{any_pass_threshold}'
+    min_all_real_mrl = 0.15
+    min_green_rings = 2
 
     run_all = base_dir / args.all_run
     run_ss = base_dir / args.ss_run
@@ -2584,18 +2586,18 @@ def main(argv=None):
                         continue
                 else:
                     counts['selected_any_threshold'] += 1
-                if bool(pass_thr_any) and np.isfinite(real_mrl_all) and (real_mrl_all < 0.2):
+                if bool(pass_thr_any) and np.isfinite(real_mrl_all) and (real_mrl_all < min_all_real_mrl):
                     skip_rows.append({
                         'category': category,
                         'animal_id': animal_id,
                         'cell_idx': cell_idx,
-                        'reason': f'low_real_mrl_all_lt0p2(real_mrl_all={real_mrl_all:.3f})',
+                        'reason': f'low_real_mrl_all_lt0p15(real_mrl_all={real_mrl_all:.3f})',
                     })
                     counts['filtered_low_real_mrl_all'] += 1
                     counts['skipped'] += 1
                     print(
                         f'  [SKIP] {category} / cell {cell_idx + 1}: '
-                        f'low real_mrl_all ({real_mrl_all:.3f} < 0.200)'
+                        f'low real_mrl_all ({real_mrl_all:.3f} < {min_all_real_mrl:.3f})'
                     )
                     continue
                 row_primary['pass_95'] = bool(pass95_any)
@@ -2651,7 +2653,7 @@ def main(argv=None):
                 green_all = int(plot_meta.get('green_ring_count_all', 0))
                 green_ss = int(plot_meta.get('green_ring_count_ss', 0))
                 green_cs = int(plot_meta.get('green_ring_count_cs', 0))
-                if bool(pass_thr_any) and max(green_all, green_ss, green_cs) < 3:
+                if bool(pass_thr_any) and max(green_all, green_ss, green_cs) < min_green_rings:
                     for saved in list(plot_meta.get('saved_paths', [])):
                         try:
                             Path(saved).unlink(missing_ok=True)
@@ -2661,7 +2663,7 @@ def main(argv=None):
                         'category': category,
                         'animal_id': animal_id,
                         'cell_idx': cell_idx,
-                        'reason': f'false_positive_green_rings_lt3(all={green_all},ss={green_ss},cs={green_cs})',
+                        'reason': f'false_positive_green_rings_lt2(all={green_all},ss={green_ss},cs={green_cs})',
                     })
                     counts['filtered_false_positive'] += 1
                     counts['skipped'] += 1
@@ -2827,8 +2829,8 @@ def main(argv=None):
     print(f'\n{"=" * 60}')
     print(f'Attempted manifest cells:          {counts["attempted"]}')
     print(f'Selected by any {any_pass_key} (3 runs): {counts["selected_any_threshold"]}')
-    print(f'Filtered low all real_mrl<0.2:    {counts["filtered_low_real_mrl_all"]}')
-    print(f'Filtered false positives:         {counts["filtered_false_positive"]}')
+    print(f'Filtered low all real_mrl<{min_all_real_mrl:.2f}: {counts["filtered_low_real_mrl_all"]}')
+    print(f'Filtered green rings<{min_green_rings}:          {counts["filtered_false_positive"]}')
     print(f'Plotted:                          {counts["plotted"]}')
     print(f'  pass group plotted:             {counts["plotted_pass"]}')
     print(f'  fail group plotted:             {counts["plotted_fail"]}')
