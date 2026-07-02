@@ -38,6 +38,7 @@ from notebooks_HPC.egocentric_refined_config import (
 from utils.placecell_pipeline import (
     REFINED_ANALYSIS_DATA_KEY,
     build_refined_analysis_data_from_manual_sidecar,
+    derive_complex_burst_event_list,
     _compute_bad_masks,
 )
 
@@ -82,6 +83,7 @@ EGOCENTRIC_KEEP_KEYS = (
     "all_spikes",
     "refined_SS",
     "all_CS_spikes",
+    "complex_burst_events",
 )
 
 EGOCENTRIC_FLOAT32_KEYS = (
@@ -299,6 +301,19 @@ def egocentric_refined_payload_for_cluster(refined: dict[str, Any]) -> tuple[dic
     slimmed["all_spikes"] = _as_int_spike_list(refined.get("all_spikes", refined.get("spikes", [])), n_cells, n_frames)
     slimmed["refined_SS"] = _as_int_spike_list(refined.get("refined_SS", []), n_cells, n_frames)
     slimmed["all_CS_spikes"] = _as_int_spike_list(refined.get("all_CS_spikes", []), n_cells, n_frames)
+    slimmed["complex_burst_events"] = _as_int_spike_list(
+        refined.get(
+            "complex_burst_events",
+            derive_complex_burst_event_list(
+                refined.get("complex_bursts_dicts", []),
+                refined.get("all_CS_spikes", []),
+                n_cells,
+                n_frames,
+            ),
+        ),
+        n_cells,
+        n_frames,
+    )
     slimmed["cluster_precomputed_bad_masks"] = np.asarray(bad_masks, dtype=bool)
     slimmed["cluster_precomputed_bad_mask_stats"] = list(bad_mask_stats)
     slimmed["cluster_precomputed_bad_mask_params"] = {
@@ -386,11 +401,17 @@ def _validate_refined_payload(animal_id: str, refined: dict[str, Any]) -> dict[s
         raise ValueError(f"{animal_id}: hd_angles_neural size {hd.size} does not match n_frames {n_frames}")
     if n_cells <= 0:
         raise ValueError(f"{animal_id}: refined payload has no cells")
+    complex_burst_events = refined.get("complex_burst_events", [])
+    complex_burst_event_count = 0
+    if isinstance(complex_burst_events, (list, tuple)):
+        for events in complex_burst_events:
+            complex_burst_event_count += int(np.asarray(events, dtype=np.int64).reshape(-1).size)
     return {
         "n_frames": n_frames,
         "n_cells": n_cells,
         "hydration_source_filename": source_filename,
         "hd_nan_frames": int(np.sum(~np.isfinite(hd))),
+        "complex_burst_event_count": int(complex_burst_event_count),
         "manual_refined_source": bool(refined.get("manual_refined_source", False)),
         "schema_version": int(refined.get("schema_version", 0)),
     }

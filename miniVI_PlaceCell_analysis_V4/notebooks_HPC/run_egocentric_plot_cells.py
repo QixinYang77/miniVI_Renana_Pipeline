@@ -123,6 +123,9 @@ def main():
     parser.add_argument('--data-root', type=str, default=str(HERE / 'data'))
     parser.add_argument('--figures-root', type=str, default=str(HERE / 'figures'))
     parser.add_argument('--direction-mode', type=str, default=DEFAULT_DIRECTION_MODE, choices=['head', 'travel'])
+    parser.add_argument('--spike-type', type=str, default='all_spike',
+                        choices=['all_spike', 'simple_spike', 'complex_spike', 'complex_burst'],
+                        help='Primary spike source for tuning filters and row-1 summary panels')
     parser.add_argument('--first-n-minutes', type=float, default=DEFAULT_FIRST_N_MINUTES)
     parser.add_argument('--save-formats', nargs='+', default=['svg', 'png'])
     args = parser.parse_args()
@@ -267,6 +270,7 @@ def main():
                     bad_mask=bad_mask,
                     analysis=analysis,
                     params=params,
+                    spike_type=args.spike_type,
                 )
                 summary_row = _filter_egocentric_summary_row_for_tuning_decision(
                     summary_row,

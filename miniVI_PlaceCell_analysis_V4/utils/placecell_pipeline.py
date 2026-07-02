@@ -1235,6 +1235,85 @@ def _manual_spike_array(value: Any, n_frames: int) -> np.ndarray:
     return np.sort(np.unique(arr.astype(np.int64)))
 
 
+def _per_cell_source_entry(source: Any, cell_idx: int, default: Any = None) -> Any:
+    if isinstance(source, (list, tuple)):
+        if 0 <= int(cell_idx) < len(source):
+            return source[int(cell_idx)]
+        return default
+    if isinstance(source, np.ndarray):
+        if source.dtype == object and 0 <= int(cell_idx) < source.size:
+            return source[int(cell_idx)]
+        if source.ndim == 1 and int(cell_idx) == 0:
+            return source
+        return default
+    if isinstance(source, dict):
+        for key in (int(cell_idx), str(int(cell_idx))):
+            if key in source:
+                return source[key]
+        if any(k in source for k in ("starts", "ends", "locs", "complex_bursts")):
+            return source
+    return default
+
+
+def _complex_burst_events_for_cell(
+    complex_bursts: Any,
+    complex_spikes: Any,
+    n_frames: int,
+) -> np.ndarray:
+    """Return one event per complex burst, anchored to the first CS in that burst."""
+    n_frames_i = int(n_frames)
+    if n_frames_i <= 0:
+        return np.array([], dtype=np.int64)
+    if not isinstance(complex_bursts, dict):
+        return np.array([], dtype=np.int64)
+
+    starts = _manual_event_array(complex_bursts, "starts", np.int64)
+    ends = _manual_event_array(complex_bursts, "ends", np.int64)
+    n_windows = int(min(starts.size, ends.size))
+
+    cs_available = complex_spikes is not None
+    cs_spikes = _manual_spike_array(complex_spikes, n_frames_i) if cs_available else np.array([], dtype=np.int64)
+    event_frames: list[int] = []
+
+    if cs_spikes.size > 0 and n_windows > 0:
+        for start, end in zip(starts[:n_windows], ends[:n_windows]):
+            s = int(min(int(start), int(end)))
+            e = int(max(int(start), int(end)))
+            if e < 0 or s >= n_frames_i:
+                continue
+            s = int(max(0, s))
+            e = int(min(n_frames_i - 1, e))
+            in_burst = cs_spikes[(cs_spikes >= s) & (cs_spikes <= e)]
+            if in_burst.size > 0:
+                event_frames.append(int(in_burst[0]))
+    elif not cs_available:
+        locs = _manual_event_array(complex_bursts, "locs", np.int64)
+        if locs.size == 0:
+            locs = _manual_event_array(complex_bursts, "complex_bursts", np.int64)
+        event_frames.extend(int(v) for v in locs.reshape(-1))
+
+    if len(event_frames) == 0:
+        return np.array([], dtype=np.int64)
+    arr = np.asarray(event_frames, dtype=np.int64).reshape(-1)
+    arr = arr[(arr >= 0) & (arr < n_frames_i)]
+    return np.sort(np.unique(arr.astype(np.int64)))
+
+
+def derive_complex_burst_event_list(
+    complex_bursts_dicts: Any,
+    all_cs_spikes: Any,
+    n_cells: int,
+    n_frames: int,
+) -> list[np.ndarray]:
+    """Derive compact per-cell complex-burst event frames from burst windows."""
+    out: list[np.ndarray] = []
+    for cell_idx in range(int(n_cells)):
+        bursts = _per_cell_source_entry(complex_bursts_dicts, cell_idx, default={})
+        cs_entry = _per_cell_source_entry(all_cs_spikes, cell_idx, default=None)
+        out.append(_complex_burst_events_for_cell(bursts, cs_entry, int(n_frames)))
+    return out
+
+
 def _manual_trace_for_cell(source: Any, cell_idx: int, n_frames: int) -> np.ndarray:
     if isinstance(source, (list, tuple)):
         if 0 <= int(cell_idx) < len(source):
@@ -3237,9 +3316,7 @@ def _filter_spike_list_with_bad_masks(
 ) -> list[np.ndarray]:
     out: list[np.ndarray] = []
     for cell_idx in range(n_cells):
-        src = []
-        if isinstance(spike_list, (list, tuple)) and cell_idx < len(spike_list):
-            src = spike_list[cell_idx]
+        src = _per_cell_source_entry(spike_list, cell_idx, default=[])
         arr = np.asarray(src, dtype=int)
         if arr.size == 0:
             out.append(np.array([], dtype=int))
@@ -3316,13 +3393,27 @@ def _prepare_native_analysis_context(
     all_spikes_raw = merged.get("all_spikes", merged["spikes"])
     refined_ss_raw = merged.get("refined_SS", [np.array([], dtype=int) for _ in range(n_cells)])
     all_cs_raw = merged.get("all_CS_spikes", [np.array([], dtype=int) for _ in range(n_cells)])
+    complex_bursts_dicts = merged.get("complex_bursts_dicts", [dict() for _ in range(n_cells)])
+    complex_burst_events_raw = merged.get("complex_burst_events")
+    if complex_burst_events_raw is None:
+        complex_burst_events_raw = derive_complex_burst_event_list(
+            complex_bursts_dicts,
+            all_cs_raw,
+            n_cells,
+            n_frames,
+        )
 
     all_spikes = _filter_spike_list_with_bad_masks(all_spikes_raw, bad_masks, n_frames, n_cells)
     refined_ss = _filter_spike_list_with_bad_masks(refined_ss_raw, bad_masks, n_frames, n_cells)
     all_cs_spikes = _filter_spike_list_with_bad_masks(all_cs_raw, bad_masks, n_frames, n_cells)
+    complex_burst_events = _filter_spike_list_with_bad_masks(
+        complex_burst_events_raw,
+        bad_masks,
+        n_frames,
+        n_cells,
+    )
     spikes_for_analysis = list(all_spikes)
 
-    complex_bursts_dicts = merged.get("complex_bursts_dicts", [dict() for _ in range(n_cells)])
     burst_metrics = _normalize_burst_metrics_for_core(merged.get("burst_metrics"))
     plateaus_dicts = merged.get("plateaus_dicts", None)
     session_start_frames = merged.get("session_start_frames", [0])
@@ -3346,6 +3437,7 @@ def _prepare_native_analysis_context(
         "all_spikes": all_spikes,
         "refined_ss": refined_ss,
         "all_cs_spikes": all_cs_spikes,
+        "complex_burst_events": complex_burst_events,
         "complex_bursts_dicts": complex_bursts_dicts,
         "burst_metrics": burst_metrics,
         "plateaus_dicts": plateaus_dicts,
@@ -36401,6 +36493,7 @@ def _extract_egocentric_plot_timeseries(
     bad_mask: np.ndarray,
     analysis: dict[str, Any] | None,
     params: EgocentricSummaryPlotParams,
+    spike_type: str = "all_spike",
 ) -> dict[str, Any]:
     x_frames = np.asarray(ctx["x_neural"], dtype=float).reshape(-1)
     y_frames = np.asarray(ctx["y_neural"], dtype=float).reshape(-1)
@@ -36448,6 +36541,7 @@ def _extract_egocentric_plot_timeseries(
     raw_all = _raw_spikes_from_ctx("all_spikes")
     raw_cs = _raw_spikes_from_ctx("all_cs_spikes")
     raw_ss = _raw_spikes_from_ctx("refined_ss")
+    raw_cb = _raw_spikes_from_ctx("complex_burst_events")
 
     def _build_binned_and_local_for_raw(raw_frames: np.ndarray) -> tuple[dict[str, Any], dict[str, Any]]:
         binned_local = _build_binned_behavior_and_spikes(
@@ -36480,6 +36574,18 @@ def _extract_egocentric_plot_timeseries(
     binned_all, local_all = _build_binned_and_local_for_raw(raw_all)
     binned_ss, local_ss = _build_binned_and_local_for_raw(raw_ss)
     binned_cs, local_cs = _build_binned_and_local_for_raw(raw_cs)
+    binned_cb, local_cb = _build_binned_and_local_for_raw(raw_cb)
+
+    spike_type_norm = str(spike_type or "all_spike").strip().lower()
+    selected_sources = {
+        "all_spike": (raw_all, binned_all, local_all, "all spikes"),
+        "simple_spike": (raw_ss, binned_ss, local_ss, "simple spikes"),
+        "complex_spike": (raw_cs, binned_cs, local_cs, "complex spikes"),
+        "complex_burst": (raw_cb, binned_cb, local_cb, "complex bursts"),
+    }
+    if spike_type_norm not in selected_sources:
+        spike_type_norm = "all_spike"
+    raw_primary, binned_primary, local_primary, primary_label = selected_sources[spike_type_norm]
     placecell_map_params = _resolve_placecell_style_plot_params(
         analysis=analysis,
         params=params,
@@ -36609,8 +36715,8 @@ def _extract_egocentric_plot_timeseries(
     # Match firing-rate heatmap temporal mask exactly: use the same frame_valid mask.
     theta_slow_frame_mask = np.asarray(frame_valid, dtype=bool)
 
-    theta_amp_bin = _bin_framewise_signal(theta_amp_frames, binned_all, theta_slow_frame_mask)
-    slow_vm_bin = _bin_framewise_signal(slow_vm_frames, binned_all, theta_slow_frame_mask)
+    theta_amp_bin = _bin_framewise_signal(theta_amp_frames, binned_primary, theta_slow_frame_mask)
+    slow_vm_bin = _bin_framewise_signal(slow_vm_frames, binned_primary, theta_slow_frame_mask)
 
     def _filter_spikes_for_plot(raw_frames: np.ndarray, local: dict[str, Any]) -> dict[str, Any]:
         sf = np.asarray(raw_frames, dtype=int).reshape(-1)
@@ -36660,9 +36766,13 @@ def _extract_egocentric_plot_timeseries(
     all_plot = _filter_spikes_for_plot(raw_all, local_all)
     ss_plot = _filter_spikes_for_plot(raw_ss, local_ss)
     cs_plot = _filter_spikes_for_plot(raw_cs, local_cs)
-    n_valid_spatial_bins_for_plot = float(all_plot["n_valid_spatial_bins"])
+    cb_plot = _filter_spikes_for_plot(raw_cb, local_cb)
+    primary_plot = _filter_spikes_for_plot(raw_primary, local_primary)
+    n_valid_spatial_bins_for_plot = float(primary_plot["n_valid_spatial_bins"])
 
     return {
+        "selected_spike_type": str(spike_type_norm),
+        "primary_spike_label": str(primary_label),
         "frame_rate": float(frame_rate),
         "frame_valid_mask": np.asarray(frame_valid, dtype=bool),
         "theta_slow_frame_mask": np.asarray(theta_slow_frame_mask, dtype=bool),
@@ -36675,10 +36785,10 @@ def _extract_egocentric_plot_timeseries(
         "slow_vm_frames": np.asarray(slow_vm_frames, dtype=float),
         "traj_x": np.asarray(traj_x, dtype=float),
         "traj_y": np.asarray(traj_y, dtype=float),
-        "spike_x": np.asarray(all_plot["x"], dtype=float),
-        "spike_y": np.asarray(all_plot["y"], dtype=float),
-        "spike_dir": _wrap_angle_to_pi(np.asarray(all_plot["dir"], dtype=float)),
-        "spike_hd": _wrap_angle_to_pi(np.asarray(all_plot["hd"], dtype=float)),
+        "spike_x": np.asarray(primary_plot["x"], dtype=float),
+        "spike_y": np.asarray(primary_plot["y"], dtype=float),
+        "spike_dir": _wrap_angle_to_pi(np.asarray(primary_plot["dir"], dtype=float)),
+        "spike_hd": _wrap_angle_to_pi(np.asarray(primary_plot["hd"], dtype=float)),
         "ss_spike_x": np.asarray(ss_plot["x"], dtype=float),
         "ss_spike_y": np.asarray(ss_plot["y"], dtype=float),
         "ss_spike_dir": _wrap_angle_to_pi(np.asarray(ss_plot["dir"], dtype=float)),
@@ -36687,16 +36797,26 @@ def _extract_egocentric_plot_timeseries(
         "cs_spike_y": np.asarray(cs_plot["y"], dtype=float),
         "cs_spike_dir": _wrap_angle_to_pi(np.asarray(cs_plot["dir"], dtype=float)),
         "cs_spike_hd": _wrap_angle_to_pi(np.asarray(cs_plot["hd"], dtype=float)),
-        "local_tuning": local_all,
-        "local_tuning_all": local_all,
+        "cb_spike_x": np.asarray(cb_plot["x"], dtype=float),
+        "cb_spike_y": np.asarray(cb_plot["y"], dtype=float),
+        "cb_spike_dir": _wrap_angle_to_pi(np.asarray(cb_plot["dir"], dtype=float)),
+        "cb_spike_hd": _wrap_angle_to_pi(np.asarray(cb_plot["hd"], dtype=float)),
+        "local_tuning": local_primary,
+        "local_tuning_all": local_primary,
+        "local_tuning_all_spikes": local_all,
         "local_tuning_ss": local_ss,
         "local_tuning_cs": local_cs,
-        "binned_all": binned_all,
+        "local_tuning_complex_burst": local_cb,
+        "binned_all": binned_primary,
+        "binned_all_spikes": binned_all,
         "binned_ss": binned_ss,
         "binned_cs": binned_cs,
+        "binned_complex_burst": binned_cb,
         "raw_all_spike_frames": np.asarray(raw_all, dtype=int),
         "raw_ss_spike_frames": np.asarray(raw_ss, dtype=int),
         "raw_cs_spike_frames": np.asarray(raw_cs, dtype=int),
+        "raw_complex_burst_frames": np.asarray(raw_cb, dtype=int),
+        "raw_primary_spike_frames": np.asarray(raw_primary, dtype=int),
         "placecell_map_params": dict(placecell_map_params),
         "place_field_mask_ref": (
             np.asarray(pf_mask_ref, dtype=bool) if isinstance(pf_mask_ref, np.ndarray) else None
@@ -36704,11 +36824,12 @@ def _extract_egocentric_plot_timeseries(
         "place_field_components_ref": [np.asarray(m, dtype=bool) for m in pf_components_ref],
         "theta_amp_bin": np.asarray(theta_amp_bin, dtype=float),
         "slow_vm_bin": np.asarray(slow_vm_bin, dtype=float),
-        "n_valid_spikes_before_spatial_filter": int(all_plot["n_before_spatial"]),
+        "n_valid_spikes_before_spatial_filter": int(primary_plot["n_before_spatial"]),
         "n_valid_frames": int(valid_idx.size),
-        "n_valid_spikes": int(all_plot["n_after_spatial"]),
+        "n_valid_spikes": int(primary_plot["n_after_spatial"]),
         "n_valid_ss_spikes": int(ss_plot["n_after_spatial"]),
         "n_valid_cs_spikes": int(cs_plot["n_after_spatial"]),
+        "n_valid_complex_burst_events": int(cb_plot["n_after_spatial"]),
         "n_valid_spatial_bins_for_plot": (
             int(n_valid_spatial_bins_for_plot)
             if np.isfinite(n_valid_spatial_bins_for_plot)
@@ -37351,7 +37472,10 @@ def _compute_placecell_style_preferred_nonpreferred_maps(
     bad_arr = np.asarray(data.get("bad_mask_frames", np.array([])), dtype=bool).reshape(-1)
     theta_vals = np.asarray(data.get("theta_amp_frames", np.array([])), dtype=float).reshape(-1)
     slow_vals = np.asarray(data.get("slow_vm_frames", np.array([])), dtype=float).reshape(-1)
-    raw_all = np.asarray(data.get("raw_all_spike_frames", np.array([])), dtype=int).reshape(-1)
+    raw_all = np.asarray(
+        data.get("raw_primary_spike_frames", data.get("raw_all_spike_frames", np.array([]))),
+        dtype=int,
+    ).reshape(-1)
     raw_ss = np.asarray(data.get("raw_ss_spike_frames", np.array([])), dtype=int).reshape(-1)
     raw_cs = np.asarray(data.get("raw_cs_spike_frames", np.array([])), dtype=int).reshape(-1)
 
@@ -38672,6 +38796,8 @@ def _plot_egocentric_per_cell_summary_figure(
     local_all = data.get("local_tuning_all")
     local_ss = data.get("local_tuning_ss")
     local_cs = data.get("local_tuning_cs")
+    primary_label = str(data.get("primary_spike_label", "all spikes")).strip() or "all spikes"
+    primary_label_title = primary_label[:1].upper() + primary_label[1:]
     if local_all is None:
         local_all = data.get("local_tuning")
     if local_ss is None:
@@ -39070,7 +39196,7 @@ def _plot_egocentric_per_cell_summary_figure(
         spike_x_all,
         spike_y_all,
         spike_hd_all,
-        "Trajectory + all spikes (head direction)",
+        f"Trajectory + {primary_label} (head direction)",
         arrow_fields_all,
     )
     _plot_traj_panel(
@@ -39403,7 +39529,7 @@ def _plot_egocentric_per_cell_summary_figure(
 
     if show_curve:
         if use_multispike_curve_panels:
-            _plot_curve_panel(ax_curve_all, local_all, plot_fit_all, "All empirical vs fitted")
+            _plot_curve_panel(ax_curve_all, local_all, plot_fit_all, f"{primary_label_title} empirical vs fitted")
             _plot_curve_panel(ax_curve_ss, local_ss, plot_fit_ss, "SS empirical vs fitted")
             _plot_curve_panel(ax_curve_cs, local_cs, plot_fit_cs, "CS empirical vs fitted")
         else:
@@ -40254,7 +40380,7 @@ def _plot_egocentric_per_cell_summary_figure(
                     )
 
     if show_spatial_map:
-        _plot_spatial_map_panel(ax_map_all, local_all, arrow_fields_all, plot_fit_all, "Spatial FR + arrows (All)")
+        _plot_spatial_map_panel(ax_map_all, local_all, arrow_fields_all, plot_fit_all, f"Spatial FR + arrows ({primary_label_title})")
         _plot_spatial_map_panel(ax_map_ss, local_ss, arrow_fields_ss, plot_fit_ss, "SS rate + arrows")
         _plot_spatial_map_panel(ax_map_cs, local_cs, arrow_fields_cs, plot_fit_cs, "CS rate + arrows")
     hd_vel_corr_all, hd_vel_corr_n_all = _compute_hd_velocity_correlation(
@@ -40283,7 +40409,7 @@ def _plot_egocentric_per_cell_summary_figure(
         parent_ax=ax_binpolar_emp_all,
         local_tuning=local_all,
         arrow_fields=arrow_fields_all,
-        title="Bin polar emp-only (All)",
+        title=f"Bin polar emp-only ({primary_label_title})",
         variant="empirical_only_pm45",
         preferred_half_width_deg=float(split_half_width_deg),
         render_style=str(getattr(params, "binpolar_render_style", "fan")),
@@ -40313,7 +40439,7 @@ def _plot_egocentric_per_cell_summary_figure(
         parent_ax=ax_binpolar_emp2_all,
         local_tuning=local_all,
         arrow_fields=arrow_fields_all,
-        title="Bin polar emp-only no-fit/no-green (All)",
+        title=f"Bin polar emp-only no-fit/no-green ({primary_label_title})",
         variant="empirical_only_no_fit_no_green",
         preferred_half_width_deg=float(split_half_width_deg),
         render_style=str(getattr(params, "binpolar_render_style", "fan")),

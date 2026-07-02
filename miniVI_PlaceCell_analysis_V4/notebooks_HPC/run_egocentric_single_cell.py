@@ -81,7 +81,7 @@ def main():
                         help='Index into manifest. Defaults to $SLURM_ARRAY_TASK_ID env var.')
     parser.add_argument('--direction-mode', type=str, default=DEFAULT_DIRECTION_MODE, choices=['head', 'travel'])
     parser.add_argument('--spike-type', type=str, default='all_spike',
-                        choices=['all_spike', 'simple_spike', 'complex_spike'],
+                        choices=['all_spike', 'simple_spike', 'complex_spike', 'complex_burst'],
                         help='Which spike type to use for egocentric analysis')
     parser.add_argument('--n-surrogates', type=int, default=1000)
     parser.add_argument('--n-jobs', type=int, default=max(1, (os.cpu_count() or 2) - 1))
@@ -187,6 +187,7 @@ def main():
         'all_spike': 'all_spikes',
         'simple_spike': 'refined_ss',
         'complex_spike': 'all_cs_spikes',
+        'complex_burst': 'complex_burst_events',
     }
     spike_key = SPIKE_TYPE_MAP[args.spike_type]
     spike_frames = np.asarray(ctx[spike_key][cell_idx], dtype=int)
