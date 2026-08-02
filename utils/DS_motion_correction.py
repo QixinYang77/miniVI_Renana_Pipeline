@@ -173,6 +173,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep CaImAn-generated .mmap files (default: auto-delete after outputs are saved).",
     )
+    parser.add_argument(
+        "--niter-rig",
+        type=int,
+        default=1,
+        help=(
+            "Number of rigid NoRMCorre template-refinement iterations "
+            "(default: 1; the full-session ALI notebook requests 2)."
+        ),
+    )
     parser.add_argument("--n-processes", type=int, default=None, help="Processes for CaImAn cluster (default: auto).")
     return parser.parse_args()
 
@@ -868,6 +877,7 @@ def main() -> None:
         "motion_reg_chunk_size": int(args.motion_reg_chunk_size),
         "motion_regression_enabled": bool(args.enable_motion_regression)
         and not (args.preserve_sub1hz or args.disable_motion_regression),
+        "normcorre_niter_rig": int(args.niter_rig),
     }
 
     del ROIs
@@ -966,6 +976,7 @@ def main() -> None:
         "overlaps": (24, 24),
         "max_deviation_rigid": 3,
         "border_nan": "copy",
+        "niter_rig": int(args.niter_rig),
     }
 
     opts = volparams(params_dict=opts_dict)

@@ -21,6 +21,8 @@ TRACE_KEYS_ALL = [
     "weighted_mc_traces",
     "weighted_mc_denoised_traces",
     "weighted_mc_denoised_traces_cleaned",
+    "ali_trace",
+    "ali_detection_trace",
     "volpy_trace",
     "volpy_sub_trace",
 ]
@@ -296,6 +298,16 @@ def load_stitched_bundle(paths=None, main_folder=None, frame_rate_override=None)
         sv = stitched_spikes if has_stitched_spikes else None
     else:
         sv = base0.get("spikes_verified_array", None)
+    if sv is None and n_sessions == 1:
+        native_spikes = base0.get("spikes", None)
+        if (
+            isinstance(native_spikes, (list, tuple, np.ndarray))
+            and len(native_spikes) == n_cells
+        ):
+            sv = [
+                np.asarray(cell_spikes, dtype=int).reshape(-1).tolist()
+                for cell_spikes in native_spikes
+            ]
     if sv is None:
         sv_dict = base0.get("spikes_verified", {})
         sv = [[] for _ in range(n_cells)]
@@ -312,6 +324,21 @@ def load_stitched_bundle(paths=None, main_folder=None, frame_rate_override=None)
     baseline_cfg = base0.get("baseline_correction_params", None)
     if not isinstance(baseline_cfg, dict):
         baseline_cfg = {"enabled": False}
+
+    default_image_labels = {
+        "raw": "Mean Image - Raw",
+        "mc": "Mean Image - MC",
+        "mc_denoised": "MC Denoised",
+        "weights": "Max Weight Map",
+    }
+    saved_image_labels = base0.get("image_labels", {})
+    if isinstance(saved_image_labels, dict):
+        image_labels = {
+            key: str(saved_image_labels.get(key, value))
+            for key, value in default_image_labels.items()
+        }
+    else:
+        image_labels = default_image_labels
 
     return {
         "results_list": results_list,
@@ -342,6 +369,14 @@ def load_stitched_bundle(paths=None, main_folder=None, frame_rate_override=None)
         "initial_spikes_verified_array": spikes_verified_array,
         "initial_params_per_cell": saved_params,
         "initial_baseline_cfg": baseline_cfg,
+        "preferred_trace_source": base0.get(
+            "preferred_trace_source",
+            None,
+        ),
+        "initial_show_spikes": bool(
+            base0.get("show_spikes_by_default", False)
+        ),
+        "image_labels": image_labels,
     }
 
 

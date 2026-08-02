@@ -249,11 +249,15 @@ def create_app(bundle):
     total_span = max(1.0, t1 - t0)
     default_window_s = max(1.0, total_span / 3.0)
     n_segments = max(1, math.ceil(total_span / default_window_s))
-    default_source = (
-        "weighted_mc_denoised_traces"
-        if "weighted_mc_denoised_traces" in bundle["sources_raw"]
-        else list(bundle["sources_raw"].keys())[0]
-    )
+    preferred_source = bundle.get("preferred_trace_source", None)
+    if preferred_source in bundle["sources_raw"]:
+        default_source = preferred_source
+    else:
+        default_source = (
+            "weighted_mc_denoised_traces"
+            if "weighted_mc_denoised_traces" in bundle["sources_raw"]
+            else list(bundle["sources_raw"].keys())[0]
+        )
     img_h, img_w = bundle["mean_img_mc_list"][0].shape
     roi_centroids_xy = []
     for mask in bundle["ROIs"]:
@@ -288,7 +292,10 @@ def create_app(bundle):
             dcc.Store(id="sync-highlight-held-store", data=False),
             dcc.Store(id="roi-centroids-store", data=roi_centroids_xy),
             dcc.Store(id="image-shape-store", data={"h": int(img_h), "w": int(img_w)}),
-            dcc.Store(id="show-spikes-store", data=False),
+            dcc.Store(
+                id="show-spikes-store",
+                data=bool(bundle.get("initial_show_spikes", False)),
+            ),
             dcc.Store(
                 id="spikes-store",
                 data=[list(map(int, s)) for s in (bundle["initial_spikes_verified_array"] or [])],
@@ -357,10 +364,22 @@ def create_app(bundle):
                                     dcc.Dropdown(
                                         id="image-kind-dropdown",
                                         options=[
-                                            {"label": "Mean Image - Raw", "value": "raw"},
-                                            {"label": "Mean Image - MC", "value": "mc"},
-                                            {"label": "MC Denoised", "value": "mc_denoised"},
-                                            {"label": "Max Weight Map", "value": "weights"},
+                                            {
+                                                "label": bundle["image_labels"]["raw"],
+                                                "value": "raw",
+                                            },
+                                            {
+                                                "label": bundle["image_labels"]["mc"],
+                                                "value": "mc",
+                                            },
+                                            {
+                                                "label": bundle["image_labels"]["mc_denoised"],
+                                                "value": "mc_denoised",
+                                            },
+                                            {
+                                                "label": bundle["image_labels"]["weights"],
+                                                "value": "weights",
+                                            },
                                         ],
                                         value="weights",
                                         clearable=False,
@@ -678,7 +697,11 @@ def create_app(bundle):
                                 style={"width": "100%", "marginTop": "6px"},
                             ),
                             html.Button(
-                                "Display spikes: OFF",
+                                (
+                                    "Display spikes: ON"
+                                    if bundle.get("initial_show_spikes", False)
+                                    else "Display spikes: OFF"
+                                ),
                                 id="clear-spikes-btn",
                                 n_clicks=0,
                                 style={"width": "100%", "marginTop": "6px"},
